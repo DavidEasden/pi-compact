@@ -1,0 +1,6 @@
+node_modules/
+resource/
+.DS_Store
+.pi/
+*.tgz
+coverage/

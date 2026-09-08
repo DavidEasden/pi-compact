@@ -1,0 +1,19 @@
+{
+  "name": "pi-compact",
+  "version": "0.1.0",
+  "description": "不依赖 LLM 的 Pi 自动压缩、精确历史召回与上下文增强扩展",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  }
+}
