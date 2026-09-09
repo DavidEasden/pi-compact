@@ -20,7 +20,7 @@
 
 ## 安装
 
-需要已安装 Pi；当前验证版本为 `0.85.1`，该版本要求 Node.js `>=22.19.0`。以下内容假设你已经把这个仓库推送到 GitHub；请把 `<your-user>` 替换为你的 GitHub 用户名，仓库名 `pi-compact` 保持默认（或按实际仓库名修改）。
+需要已安装 Pi；当前验证版本为 `0.85.1`，该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。
 
 Pi package 会执行扩展代码，请在安装前审查源代码。
 
@@ -29,31 +29,31 @@ Pi package 会执行扩展代码，请在安装前审查源代码。
 推荐固定到发布 tag（固定后的 ref 不会被 `pi update --extensions` 或 `pi update --all` 移动）：
 
 ```bash
-pi install git:github.com/<your-user>/pi-compact@v0.1.0
+pi install git:github.com/DavidEasden/pi-compact@v0.1.0
 ```
 
 或者不固定 ref，直接跟踪默认分支：
 
 ```bash
-pi install git:github.com/<your-user>/pi-compact
+pi install git:github.com/DavidEasden/pi-compact
 ```
 
 也支持 SSH 简写与原始 HTTPS URL：
 
 ```bash
-pi install git:git@github.com:<your-user>/pi-compact@v0.1.0
-pi install https://github.com/<your-user>/pi-compact@v0.1.0
+pi install git:git@github.com:DavidEasden/pi-compact@v0.1.0
+pi install https://github.com/DavidEasden/pi-compact@v0.1.0
 ```
 
 说明：
 
 - `git:` 前缀启用 `host/user/repo` 与 `git@host:user/repo` 简写；不带前缀时只接受协议 URL（`https://`、`http://`、`ssh://`、`git://`）。
-- `v0.1.0` 必须是已存在的 tag 或 commit（首次可用 `git tag v0.1.0 && git push origin v0.1.0` 创建并推送）。以后升级到新 tag，重新执行 `pi install git:github.com/<your-user>/pi-compact@<新tag>`。
-- 全局安装会克隆到 `~/.pi/agent/git/github.com/<your-user>/pi-compact`；使用 `-l`（项目 settings）时克隆位于 `.pi/git/github.com/<your-user>/pi-compact`，项目信任后启动时会自动安装缺失的 package。
+- `v0.1.0` 必须是已存在的 tag 或 commit（首次可用 `git tag v0.1.0 && git push origin v0.1.0` 创建并推送）。以后升级到新 tag，重新执行 `pi install git:github.com/DavidEasden/pi-compact@<新tag>`。
+- 全局安装会克隆到 `~/.pi/agent/git/github.com/DavidEasden/pi-compact`；使用 `-l`（项目 settings）时克隆位于 `.pi/git/github.com/DavidEasden/pi-compact`，项目信任后启动时会自动安装缺失的 package。
 - 不安装也可以临时试用：
 
 ```bash
-pi -e git:github.com/<your-user>/pi-compact
+pi -e git:github.com/DavidEasden/pi-compact
 ```
 
 ### 临时加载本地版本
