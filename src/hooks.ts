@@ -3,6 +3,7 @@ import { loadConfig } from "./config.ts";
 import { clip, estimateTokensFromChars, messageText, toolCallIds } from "./core/content.ts";
 import { deriveFacts } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
+import { analyzeAutoRecallQuery } from "./core/auto-recall.ts";
 import { contextEntryIds, hashRecords, recordsFromEntries, searchRecords } from "./core/session.ts";
 import { appendMemoryEvent, loadMemories, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest, windowHeaderLines } from "./core/window.ts";
@@ -343,11 +344,13 @@ export const registerHooks = (pi: ExtensionAPI): void => {
 
     if (config.autoRecallMode !== "off" && !messages.some((message: any) => message.customType === AUTO_RECALL_TYPE)) {
       const current = latestUser(event.messages);
-      if (current.text.trim().length >= 3 && currentBranch) {
+      const autoQuery = analyzeAutoRecallQuery(current.text);
+      // 自动召回只使用高置信词/短语；长度>=3 不再作为唯一门槛。手动召回不走此门控。
+      if (autoQuery.eligible && currentBranch) {
         const latestUserId = latestUserEntry?.id;
         const latestUserIndex = latestUserEntry?.index ?? -1;
         if (typeof latestUserId === "string" && latestUserIndex >= 0) {
-          const cacheKey = `${sessionId}\u0000${latestUserId}\u0000${current.text}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}\u0000${config.autoRecallMode}\u0000${config.history.autoRecallPrimaryOnly}\u0000${config.history.excludeInContext}`;
+          const cacheKey = `${sessionId}\u0000${latestUserId}\u0000${current.text}\u0000${autoQuery.terms.join("\u0001")}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}\u0000${config.autoRecallMode}\u0000${config.history.autoRecallPrimaryOnly}\u0000${config.history.excludeInContext}`;
           if (autoRecallCache?.key !== cacheKey) {
             const historyEntries = currentBranch.slice(0, latestUserIndex);
             let records = recordsFromEntries(historyEntries);
@@ -356,7 +359,11 @@ export const registerHooks = (pi: ExtensionAPI): void => {
               const inContext = contextEntryIds(ctx.sessionManager);
               if (inContext.size > 0) records = records.filter((record) => !inContext.has(record.entryId));
             }
-            const hits = searchRecords(records, current.text, { maxResults: config.recallMaxResults, sourceClass: config.history.autoRecallPrimaryOnly ? "primary" : "all" });
+            const hits = searchRecords(records, current.text, {
+              maxResults: config.recallMaxResults,
+              sourceClass: config.history.autoRecallPrimaryOnly ? "primary" : "all",
+              terms: autoQuery.terms,
+            });
             autoRecallCache = hits.length === 0
               ? { key: cacheKey, content: "", ids: [], injectionCount: 0 }
               : { key: cacheKey, content: renderRecall(hits, config.autoRecallMaxChars, config.autoRecallMode), ids: hits.map((hit) => hit.entryId), injectionCount: 0 };

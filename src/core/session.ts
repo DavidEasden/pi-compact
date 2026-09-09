@@ -104,8 +104,12 @@ export const searchRecords = (records: HistoryRecord[], query: string, options: 
   maxResults?: number;
   page?: number;
   sourceClass?: SourceClass | "all";
+  /** 已规范化的检索词；提供时跳过 queryTerms，供自动召回高置信门控使用。手动检索不要传此字段。 */
+  terms?: string[];
 } = {}): SearchHit[] => {
-  const terms = queryTerms(query);
+  const terms = options.terms?.length
+    ? [...new Set(options.terms.map((term) => term.toLocaleLowerCase()).filter((term) => term.length > 0))]
+    : queryTerms(query);
   if (terms.length === 0 && !options.file) return [];
   const candidates = records.filter((record) => {
     if (options.sourceClass && options.sourceClass !== "all" && record.sourceClass !== options.sourceClass) return false;

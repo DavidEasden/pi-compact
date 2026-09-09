@@ -264,6 +264,48 @@ test("自动召回 hint 模式只注入短提示，off 模式不注入", () => {
   }
 });
 
+test("泛词/礼貌用语不会自动注入历史正文，具体 token/错误码/路径仍会", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const genericHistory = [
+      messageEntry("old-user", "user", "请继续处理，不要停下来"),
+      messageEntry("old-assistant", "assistant", "好的，我会继续 src 以外的普通回复", "old-user"),
+    ];
+    const specificHistory = [
+      messageEntry("old-user", "user", "修复 token 刷新，失败 ECONNREFUSED，文件 src/auth/session.ts"),
+      messageEntry("old-assistant", "assistant", "refreshToken 需要重试 npm test", "old-user"),
+    ];
+    const handler = harness.handlers.get("context")![0];
+    const recallOf = (result: any) => result?.messages?.find((message: any) => message.customType === "pi-compact-auto-recall");
+    const run = (history: ReturnType<typeof messageEntry>[], userId: string, text: string) => {
+      const entries = [...history, messageEntry(userId, "user", text, history.at(-1)?.id ?? null)];
+      return handler({ type: "context", messages: [{ role: "user", content: text }] }, {
+        cwd: harness.cwd,
+        sessionManager: { getEntries: () => entries, getBranch: () => entries },
+      });
+    };
+
+    for (const text of ["continue", "请继续", "ok", "好的", "谢谢", "上一步", "再试一次"]) {
+      assert.equal(recallOf(run(genericHistory, `generic-${text}`, text)), undefined, text);
+    }
+
+    const tokenRecall = recallOf(run(specificHistory, "q-token", "请继续 token 刷新"));
+    assert.ok(tokenRecall);
+    assert.match(tokenRecall.content, /old-user|old-assistant/);
+
+    const errorRecall = recallOf(run(specificHistory, "q-error", "ECONNREFUSED"));
+    assert.ok(errorRecall);
+    assert.match(errorRecall.content, /old-user/);
+
+    const pathRecall = recallOf(run(specificHistory, "q-path", "src/auth/session.ts"));
+    assert.ok(pathRecall);
+    assert.match(pathRecall.content, /old-user|old-assistant/);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
 test("自动召回默认排除 derived 以及已在上下文中的 entry", () => {
   const harness = createHarness();
   try {

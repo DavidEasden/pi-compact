@@ -178,7 +178,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 长期记忆存放在项目目录 `.pi/pi-compact/memory.jsonl`（append-only 事件日志）。当前状态由纯函数 projector 重放得到。用户写入是权威来源；模型提议默认且始终为 provisional，必须由用户 `/remember` 确认后才成为 active/pinned。扩展不能保证模型一定遵守这些记忆。
 
-`memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。锁有有限超时，可恢复崩溃进程遗留的锁（无法解析、持有进程已死或已过期），进程内可重入，事务结束时必然释放；锁文件不会永久阻塞后续写入。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
+`memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。锁有有限超时，可恢复崩溃进程遗留的锁（无法解析、持有进程已死或已过期），进程内可重入，事务结束时必然释放；锁文件不会永久阻塞后续写入。释放与回收必须核对锁文件中的 owner token，并在存在 pid/startTime 时一并核对；metadata 不匹配时不会删除他人的新锁。在 macOS/Linux 上，若能读到进程启动时间会写入锁内，避免 PID 复用被误判为原持有者仍存活。若无法读取启动时间，则把持有者视为仍存活直到锁过期——证明不了过期时不会删除锁。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
 
 读取任一日志时，事件必须构成完整链：`seq` 从 1 起严格连续递增，`prevHash` 必须等于上一条被接受事件的 hash，且每条事件自身 hash 正确。遇到首个非法、重复、跳号或被篡改的事件即停止，只重放可信前缀。一旦存在这样的事件，该日志的后续追加会被拒绝并报出明确错误：用户必须先人工修复日志才能继续写入，扩展不会通过截断或重写日志来掩盖问题。EOF 处无法解析的半行仍被容忍——读取时跳过，下次追加前补齐换行，因此写入中途崩溃仍可恢复。
 
@@ -273,12 +273,14 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 每次 context 请求（在记忆启用且 `pinnedInjection` 为 true 时）都会注入 `pi-compact-memory-hint`。即使没有 pinned 记忆，也会告诉模型如何使用 `/remember`、`pi_memory_search` 和 `pi_compact_recall`。pinned 项优先占用 `memory.hintMaxChars`，不会被普通历史召回挤掉。工作记忆注入与自动历史召回是两条独立消息、两套预算。
 
-自动召回默认模式为 `full`（当前完整片段注入），由 `enabled && autoRecallMode !== "off"` 控制。满足以下条件时生效：
+自动召回默认模式为 `full`（当前完整片段注入），由 `enabled && autoRecallMode !== "off"` 控制。自动召回现在是高置信门控：像 `continue`、`ok`、`thanks`、`请继续`、`好的`、`谢谢`、`上一步`、`再试一次` 这类会话控制/礼貌/泛词，不能单独触发历史正文注入。手动 `pi_compact_recall` 不受影响，仍可按这些词做精确检索。自动召回不以查询长度 `>= 3` 作为唯一门槛，也不使用 LLM、embedding 或网络服务。
 
-- 当前请求的最新 user 文本去除首尾空白后，长度至少为 3。
+满足以下条件时生效：
+
+- 当前请求的最新 user 文本经过确定性规范化、停用词/停用短语过滤和匹配信号分级后，仍含有高置信词（文件路径、错误码、函数名/标识符、命令）或多词主题。
 - 当前 session 可以取得有效的 active branch。
 - 当前 branch 中存在带有效 ID 的 user entry。
-- 当前 user entry 之前的历史记录中存在匹配结果。
+- 当前 user entry 之前的历史记录中存在对这些高置信词的匹配结果。
 - 默认只搜索 primary 记录，并排除 `buildContextEntries()` 中已经存在于当前请求上下文的 entry。
 
 自动召回只修改当前 provider 请求的 messages，不写入 session，也不会生成新的 session entry。同一 user turn 的多次 provider 请求会复用召回结果；新的 user entry 会重新计算。当前 turn 新产生的工具结果不会被混入该 turn 的自动召回范围。
@@ -343,6 +345,8 @@ src/hooks.ts             compaction、context、工作记忆注入和 session ho
 src/recall.ts            召回工具与 /pi-compact-recall 命令
 src/memory.ts            记忆命令与记忆/新窗口工具
 src/core/content.ts      消息文本、文件、thinking 分离和片段边界
+src/core/auto-recall.ts  自动历史召回的确定性高置信门控
+src/core/lock.ts         同步日志锁、owner-token 回收、PID 启动时间校验
 src/core/ledger.ts       确定性 checkpoint 与 details
 src/core/session.ts      session entry 转换、sourceClass、搜索和原文回放
 src/core/jsonl.ts        损坏安全的 JSONL 读写
@@ -367,6 +371,8 @@ tests/                   单元测试
 - 配置初始化与非法配置归一化，包括 memory/history/window。
 - 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
 - 空 active lineage 不扩大搜索范围；自动召回的同轮复用、新 user 更新、去重和 branch 查询异常处理。
+- 自动召回高置信门控会拒绝 continue/ok 等泛词，同时仍注入具体 token、错误码和路径；手动召回仍能命中这些泛词。
+- 日志锁回收在 token/metadata 不匹配时不删除；PID 复用与读不到启动时间的保守降级均有不依赖真实 PID 复用的单测。
 - 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
 
 尚未作为完整端到端场景验证：真实模型响应、overflow retry 的完整运行过程，以及跨 session 或 branch 切换下的长时间运行行为。

@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { MemoryEvent, MemoryRecord, WindowEvent, WindowManifest } from "../types.ts";
 import { appendJsonl, ensureDir, hashText, readJsonl, stableHash } from "./jsonl.ts";
+import { withLogLock } from "./lock.ts";
 import { isMemoryEvent, projectMemories } from "./projector.ts";
+
+export { withLogLock } from "./lock.ts";
 
 export const storeDir = (cwd: string): string => join(cwd, ".pi", "pi-compact");
 export const memoryLogPath = (cwd: string): string => join(storeDir(cwd), "memory.jsonl");
@@ -51,138 +53,6 @@ const windowForHash = (event: WindowEvent): unknown => ({
 });
 
 export const hashWindowEvent = (event: Omit<WindowEvent, "hash"> | WindowEvent): string => stableHash(windowForHash(event as WindowEvent));
-
-/* ------------------------------------------------------------------ */
-/* 同步文件锁：保护 append 事务（读末条 -> 算 seq/prevHash -> append）的跨进程原子性。 */
-/* ------------------------------------------------------------------ */
-
-/** 获取锁的最长等待；可用 PI_COMPACT_LOCK_TIMEOUT_MS 覆盖（主要供测试）。 */
-const lockTimeoutMs = (): number => {
-  const parsed = Number(process.env.PI_COMPACT_LOCK_TIMEOUT_MS);
-  return Number.isFinite(parsed) && parsed >= 100 ? parsed : 5000;
-};
-/** 持锁进程仍存活但超过该时长视为死锁/过期，可被回收。 */
-const lockStaleMs = (): number => Math.max(1000, lockTimeoutMs() * 2);
-const LOCK_POLL_MS = 10;
-
-interface HeldLock {
-  token: string;
-  depth: number;
-}
-
-/** 进程内重入计数：同一路径重复获取只增加深度，嵌套事务不会自锁。 */
-const heldLocks = new Map<string, HeldLock>();
-
-const sleepSync = (ms: number): void => {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-};
-
-const processAlive = (pid: number): boolean => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-};
-
-interface LockInfo {
-  pid: number;
-  token: string;
-  ts: number;
-}
-
-const readLockInfo = (path: string): LockInfo | undefined => {
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    const pid = Number(parsed.pid);
-    if (!Number.isSafeInteger(pid) || typeof parsed.token !== "string") return undefined;
-    const ts = Number(parsed.ts);
-    return { pid, token: parsed.token, ts: Number.isFinite(ts) ? ts : 0 };
-  } catch {
-    return undefined;
-  }
-};
-
-const lockAgeMs = (path: string): number => {
-  try {
-    return Date.now() - statSync(path).mtimeMs;
-  } catch {
-    return Number.POSITIVE_INFINITY;
-  }
-};
-
-/** 锁可恢复：内容无法解析（残留垃圾）、持有进程已死、本进程遗留、或持锁超过过期阈值。 */
-const isRecoverableLock = (path: string, info: LockInfo | undefined): boolean => {
-  if (!info) return true;
-  if (info.pid === process.pid) return !heldLocks.has(path);
-  if (!processAlive(info.pid)) return true;
-  return lockAgeMs(path) > lockStaleMs();
-};
-
-/** 仅当锁内容仍是之前读到的 token 时才删除，避免误删他人随后获取的新锁。 */
-const reclaimLock = (path: string, expected: LockInfo | undefined): void => {
-  try {
-    const current = readLockInfo(path);
-    if (current?.token !== expected?.token) return;
-    unlinkSync(path);
-  } catch {
-    // 锁文件已被其他进程回收。
-  }
-};
-
-const acquireLock = (path: string): void => {
-  const held = heldLocks.get(path);
-  if (held) {
-    held.depth += 1;
-    return;
-  }
-  const token = `${process.pid}:${randomUUID()}`;
-  const timeoutMs = lockTimeoutMs();
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    let fd: number | undefined;
-    try {
-      fd = openSync(path, "wx");
-      writeSync(fd, `${JSON.stringify({ pid: process.pid, token, ts: Date.now() })}\n`);
-      heldLocks.set(path, { token, depth: 1 });
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw new Error(`pi-compact: 无法创建日志锁 ${path}：${(error as Error).message}`);
-      }
-      const info = readLockInfo(path);
-      if (isRecoverableLock(path, info)) reclaimLock(path, info);
-    } finally {
-      if (fd !== undefined) closeSync(fd);
-    }
-    if (Date.now() >= deadline) {
-      throw new Error(`pi-compact: 获取日志锁超时（${timeoutMs}ms）：${path}，本次写入未完成`);
-    }
-    sleepSync(LOCK_POLL_MS);
-  }
-};
-
-const releaseLock = (path: string): void => {
-  const held = heldLocks.get(path);
-  if (!held) return;
-  held.depth -= 1;
-  if (held.depth > 0) return;
-  heldLocks.delete(path);
-  reclaimLock(path, { pid: process.pid, token: held.token, ts: 0 });
-};
-
-/** 保护单个日志文件完整事务；finally 释放，异常向上抛出，不静默吞写。 */
-export const withLogLock = <T>(logPath: string, fn: () => T): T => {
-  const lockPath = `${logPath}.lock`;
-  ensureDir(dirname(lockPath));
-  acquireLock(lockPath);
-  try {
-    return fn();
-  } finally {
-    releaseLock(lockPath);
-  }
-};
 
 export const withMemoryLogLock = <T>(cwd: string, fn: () => T): T => withLogLock(memoryLogPath(cwd), fn);
 export const withWindowLogLock = <T>(cwd: string, fn: () => T): T => withLogLock(windowLogPath(cwd), fn);
