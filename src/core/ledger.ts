@@ -1,67 +1,48 @@
 import type { CompactionDetails, CompactReason, HistoryRecord } from "../types.ts";
 import { clip } from "./content.ts";
-import { sourceHash } from "./session.ts";
+import { hashRecords } from "./session.ts";
 
-export interface LedgerInput {
-  records: HistoryRecord[];
-  reason: CompactReason;
-  keptEntryId: string;
-  previousSummary?: string;
-  maxChars: number;
-}
-
-const label = (kind: HistoryRecord["kind"]): string => ({
-  user: "用户",
-  assistant: "助手",
-  tool_call: "工具调用",
-  tool_result: "工具结果",
-  bash: "命令",
-  custom: "自定义消息",
-}[kind]);
-
-export const renderLedger = (input: LedgerInput): string => {
-  const { records, reason, keptEntryId, previousSummary, maxChars } = input;
-  const lines: string[] = [
-    "[pi-compact: deterministic working memory]",
-    `压缩原因: ${reason}`,
-    `历史记录数: ${records.length}`,
-    `保留尾部起点: ${keptEntryId}`,
+export const renderLedger = (records: HistoryRecord[], reason: CompactReason, keptEntryId: string, maxChars: number): { text: string; omitted: number } => {
+  const lines = [
+    "[pi-compact deterministic context checkpoint]",
+    `compaction reason: ${reason}`,
+    `retained context starts at entry: ${keptEntryId}`,
+    "The records below are extracted from the original session entries; they are not LLM-generated claims.",
     "",
-    "[历史操作账本]",
   ];
-  const grouped = new Map<string, HistoryRecord[]>();
-  for (const record of records) {
-    const list = grouped.get(record.kind) ?? [];
-    list.push(record);
-    grouped.set(record.kind, list);
-  }
-  for (const kind of ["user", "assistant", "tool_call", "tool_result", "bash", "custom"] as const) {
-    const items = grouped.get(kind) ?? [];
-    if (items.length === 0) continue;
-    lines.push(`## ${label(kind)} (${items.length})`);
-    for (const item of items) {
-      const files = item.files.length > 0 ? ` 文件: ${item.files.join(", ")}` : "";
-      lines.push(`- [${item.entryId}]${files} ${clip(item.text.replace(/\s+/g, " "), kind === "tool_result" || kind === "bash" ? 280 : 420)}`);
+  const sections: Array<[string, HistoryRecord[]]> = [
+    ["User messages", records.filter((record) => record.kinds.includes("user"))],
+    ["Assistant messages", records.filter((record) => record.kinds.includes("assistant") && !record.kinds.includes("tool_call"))],
+    ["Tool calls", records.filter((record) => record.kinds.includes("tool_call"))],
+    ["Tool results", records.filter((record) => record.kinds.includes("tool_result"))],
+    ["Commands", records.filter((record) => record.kinds.includes("bash"))],
+    ["Other session context", records.filter((record) => record.kinds.includes("custom"))],
+  ];
+  let omitted = 0;
+  for (const [title, section] of sections) {
+    if (section.length === 0) continue;
+    lines.push(`## ${title}`);
+    for (const record of section) {
+      const files = record.files.length > 0 ? ` files=${record.files.join(",")}` : "";
+      const line = `- [${record.entryId}]${files} ${clip(record.text.replace(/\s+/g, " "), title === "User messages" ? 900 : 500)}`;
+      const candidate = `${lines.join("\n")}\n${line}`;
+      if (candidate.length > maxChars - 900) { omitted++; continue; }
+      lines.push(line);
     }
+    lines.push("");
   }
-  if (previousSummary) {
-    lines.push("", "[上一次压缩状态]", clip(previousSummary, 1200));
-  }
-  lines.push(
-    "",
-    "[恢复说明]",
-    "以上内容由 session 原文确定性提取，不是 LLM 摘要。完整历史仍保留在 Pi session JSONL 中。需要旧细节时使用 pi_compact_recall。",
-  );
-  return clip(lines.join("\n"), maxChars);
+  if (omitted > 0) lines.push(`(${omitted} records omitted from this checkpoint text; they remain available through pi_compact_recall.)`, "");
+  lines.push("Use pi_compact_recall with an entry ID, file path, or exact keyword to recover full original entries.");
+  return { text: lines.join("\n").slice(0, maxChars), omitted };
 };
 
-export const buildDetails = (records: HistoryRecord[], reason: CompactReason, keptEntryId: string): CompactionDetails => ({
+export const buildDetails = (records: HistoryRecord[], reason: CompactReason, keptEntryId: string, omittedRecordCount: number): CompactionDetails => ({
   compactor: "pi-compact",
   version: 1,
   reason,
   sourceEntryIds: [...new Set(records.map((record) => record.entryId))],
-  sourceHash: sourceHash(records),
+  sourceHash: hashRecords(records),
   sourceRecordCount: records.length,
   keptEntryId,
-  generatedAt: new Date().toISOString(),
+  omittedRecordCount,
 });
