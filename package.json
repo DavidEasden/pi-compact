@@ -6,6 +6,10 @@
   "keywords": [
     "pi-package"
   ],
+  "files": [
+    "index.ts",
+    "src"
+  ],
   "license": "MIT",
   "pi": {
     "extensions": [
