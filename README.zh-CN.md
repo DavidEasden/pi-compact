@@ -233,7 +233,7 @@ pi install -l /absolute/path/to/pi-compact
 1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界。
 2. 将边界之前的原始 entries 转换成带 ID 的记录。
 3. 生成 checkpoint：先按原始 entry 顺序写出 `## Timeline`（`sourceOrdinal`），再保留现有分类区块（用户消息、assistant 消息、工具调用、工具结果、命令和其他 session context）。Timeline 与分类区块共用字符预算和省略计数。
-4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars` 和 `estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）等 details。压缩结果同时设置 `estimatedTokensAfter`，不会伪造计费 `usage`。
+4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars` 和 `estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）等 details。扩展不会伪造计费 `usage`；Pi 会自行计算包含完整上下文的压缩后估算值。
 5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；不安全或已中止的接管请求返回 `{ cancel: true }`，不落回默认 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
 
 原始 session entries 才是事实来源。checkpoint 会折叠空白、截短长记录，并在预算不足时省略记录；它不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。

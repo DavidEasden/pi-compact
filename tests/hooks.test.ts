@@ -102,8 +102,8 @@ test("session_before_compact 使用 Pi 边界并支持 manual、threshold、over
       assert.deepEqual(result.compaction.details.sourceEntryIds, ["u1"]);
       assert.equal(result.compaction.details.checkpointChars, result.compaction.summary.length);
       assert.equal(result.compaction.details.summaryMaxChars, DEFAULT_CONFIG.summaryMaxChars);
-      assert.equal(result.compaction.estimatedTokensAfter, Math.ceil(result.compaction.summary.length / 4));
-      assert.equal(result.compaction.details.estimatedTokensAfter, result.compaction.estimatedTokensAfter);
+      assert.equal("estimatedTokensAfter" in result.compaction, false);
+      assert.equal(result.compaction.details.estimatedTokensAfter, Math.ceil(result.compaction.summary.length / 4));
       assert.equal(result.compaction.details.version, 1);
       assert.equal("usage" in result.compaction, false);
       assert.match(result.compaction.summary, /## Timeline/);
@@ -180,6 +180,8 @@ test("自动召回只修改当前请求消息，不写入 session，并可避免
     assert.equal(first.messages[1].details.hitCount, first.messages[1].details.entryIds.length);
     assert.equal(first.messages[1].details.mode, "full");
     assert.equal(first.messages[1].details.sameTurnInjectionCount, 1);
+    assert.equal(typeof first.messages[1].timestamp, "number");
+    assert.equal(first.messages[1].content.length <= DEFAULT_CONFIG.autoRecallMaxChars, true);
     assert.equal(first.messages[1].details.estimatedTokens, Math.ceil(first.messages[1].content.length / 4));
     assert.ok(first.messages[1].details.hitCount > 0);
 
@@ -234,6 +236,7 @@ test("自动召回 hint 模式只注入短提示，off 模式不注入", () => {
     assert.match(hint.messages[1].content, /kinds=user/);
     assert.match(hint.messages[1].content, /short hints/);
     assert.equal(hint.messages[1].content.includes("已定位 src/auth.ts"), false);
+    assert.match(hint.messages[1].content, /\[old-user\]/);
 
     const off = offHarness.handlers.get("context")![0]({
       type: "context",

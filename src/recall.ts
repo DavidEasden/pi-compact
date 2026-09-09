@@ -72,6 +72,25 @@ const formatRawHits = (hits: ReturnType<typeof searchRecords>, maxChars: number,
   return { text: header + parts.join("\n\n"), truncated: false };
 };
 
+const formatPrettyHits = (hits: ReturnType<typeof searchRecords>, maxChars: number): FormattedHits => {
+  const blocks = hits.map((hit) => `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`);
+  const header = `pi-compact recall (${hits.length} result(s))\n\n`;
+  const parts: string[] = [];
+  for (let index = 0; index < blocks.length; index++) {
+    const candidate = header + [...parts, blocks[index]].join("\n\n");
+    if (candidate.length <= maxChars) {
+      parts.push(blocks[index]);
+      continue;
+    }
+    if (parts.length === 0) {
+      const fallback = `pi-compact recall (${hits.length} result(s); 0 included)`;
+      return { text: fallback.slice(0, maxChars), truncated: true };
+    }
+    return { text: header + parts.join("\n\n"), truncated: true };
+  }
+  return { text: header + parts.join("\n\n"), truncated: false };
+};
+
 export const formatRecallOutput = (
   hits: ReturnType<typeof searchRecords>,
   raw = false,
@@ -80,10 +99,7 @@ export const formatRecallOutput = (
 ): FormattedHits => {
   if (hits.length === 0) return { text: "pi-compact recall: 未找到匹配的历史记录。", truncated: false };
   if (raw) return formatRawHits(hits, maxChars, allowOversizeSingleRaw);
-  const chunks = hits.map((hit) => `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`);
-  const assembled = `pi-compact recall (${hits.length} result(s))\n\n${chunks.join("\n\n")}`;
-  const text = assembled.slice(0, maxChars);
-  return { text, truncated: text.length < assembled.length };
+  return formatPrettyHits(hits, maxChars);
 };
 
 export const formatHits = (

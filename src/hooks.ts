@@ -122,6 +122,13 @@ const latestUser = (messages: any[]): { text: string } => {
   return { text: "" };
 };
 
+const completeLines = (lines: string[], maxChars: number): string => {
+  const assembled = lines.join("\n");
+  if (assembled.length <= maxChars) return assembled;
+  const boundary = assembled.lastIndexOf("\n", Math.max(0, maxChars));
+  return boundary > 0 ? assembled.slice(0, boundary) : assembled.slice(0, maxChars);
+};
+
 const renderRecall = (hits: ReturnType<typeof searchRecords>, maxChars: number, mode: AutoRecallMode): string => {
   const lines = [
     "[pi-compact automatic exact-history recall]",
@@ -135,9 +142,9 @@ const renderRecall = (hits: ReturnType<typeof searchRecords>, maxChars: number, 
       lines.push(`- [${hit.entryId}] kinds=${hit.kinds.join(",")}${files}`);
       continue;
     }
-    lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")} ${clip(hit.snippet, 650)}`);
+    lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")} ${clip(hit.snippet.replace(/\s+/g, " "), 650)}`);
   }
-  return lines.join("\n").slice(0, maxChars);
+  return completeLines(lines, maxChars);
 };
 
 interface AutoRecallCache {
@@ -173,7 +180,6 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       summary: ledger.text,
       firstKeptEntryId: keptEntryId,
       tokensBefore: event.preparation.tokensBefore,
-      estimatedTokensAfter: details.estimatedTokensAfter,
       details,
     } };
   });
@@ -224,6 +230,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     return { messages: [...event.messages, {
       role: "custom",
       customType: AUTO_RECALL_TYPE,
+      timestamp: Date.now(),
       content: autoRecallCache.content,
       display: false,
       details: {

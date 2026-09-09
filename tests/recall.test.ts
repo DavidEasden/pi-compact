@@ -110,6 +110,7 @@ test("关键词召回仍按字符预算截断，保持兼容", () => {
   assert.ok(formatted.text.length <= 80);
   assert.equal(formatted.truncated, true);
   assert.equal(formatHits(hits, false, 80), formatted.text);
+  assert.equal(formatted.text.includes("[entry"), false);
 });
 
 test("非 entry ID 的单条 raw 命中仍遵守字符预算", () => {
@@ -123,6 +124,18 @@ test("非 entry ID 的单条 raw 命中仍遵守字符预算", () => {
   assert.ok(formatted.text.length <= 400);
   assert.equal(formatted.truncated, true);
   assert.match(formatted.text, /Use a single entry ID/);
+});
+
+test("pretty 召回按完整结果块截断，不切断 entry ID", () => {
+  const hits = toHits([
+    { type: "message", id: "entry-one", message: { role: "user", content: "first result" } },
+    { type: "message", id: "entry-two", message: { role: "user", content: "second result" } },
+  ]);
+  const formatted = formatRecallOutput(hits, false, 180);
+  assert.equal(formatted.truncated, true);
+  assert.match(formatted.text, /\[entry entry-one\]/);
+  assert.equal(formatted.text.includes("[entry entry-two]"), false);
+  assert.equal(formatted.text.endsWith("entry-one"), false);
 });
 
 test("注册的召回工具按单个 entry ID 返回完整 raw JSON 和统计", async () => {

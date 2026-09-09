@@ -61,7 +61,9 @@ test("ledger 不声称不存在的事实，并明确省略可召回", () => {
   const result = renderLedger(records, "threshold", "tail", 800);
   assert.match(result.text, /not LLM-generated claims/);
   assert.match(result.text, /pi_compact_recall/);
-  assert.equal(result.omitted, records.length);
+  assert.ok(result.omitted < records.length);
+  const renderedIds = new Set(records.filter((record) => result.text.includes(`[${record.entryId}]`)).map((record) => record.entryId));
+  assert.equal(result.omitted, records.length - renderedIds.size);
   const details = buildDetails(records, "threshold", "tail", result.omitted, result.text.length, 800);
   assert.equal(details.compactor, "pi-compact");
   assert.equal(details.version, 1);
@@ -70,6 +72,16 @@ test("ledger 不声称不存在的事实，并明确省略可召回", () => {
   assert.equal(details.sourceRecordCount, records.length);
   assert.equal(details.omittedRecordCount, result.omitted);
   assert.equal(details.estimatedTokensAfter, Math.ceil(result.text.length / 4));
+});
+
+test("ledger 在部分预算下按 entry 去重计算省略数量", () => {
+  const records = recordsFromEntries(entries);
+  const result = renderLedger(records, "threshold", "tail", 550);
+  const renderedIds = new Set(records.filter((record) => result.text.includes(`[${record.entryId}]`)).map((record) => record.entryId));
+  assert.ok(renderedIds.size > 0);
+  assert.ok(renderedIds.size < records.length);
+  assert.equal(result.omitted, records.length - renderedIds.size);
+  assert.ok(result.text.length <= 550);
 });
 
 test("ledger Timeline 保留原始 entry 顺序且不移除分类区块", () => {
