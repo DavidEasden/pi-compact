@@ -8,7 +8,7 @@
 
 ## 功能
 
-- 接管 Pi 普通的 `manual`、`threshold` 和 `overflow` compaction。
+- 接管 Pi 原生的 `/compact` 命令，以及普通的 `manual`、`threshold` 和 `overflow` compaction。
 - 使用 Pi 自己计算的压缩边界、token accounting、持久化和恢复流程。
 - 在压缩前检查工具调用与工具结果是否完整配对；发现不安全边界时取消本次接管，避免破坏上下文。
 - 生成确定性的事件 ledger，不把规则提取结果伪装成目标、决策或已完成任务。
@@ -121,7 +121,7 @@ pi install -l /absolute/path/to/pi-compact
 
 | 配置项 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `enabled` | `true` | 是否启用压缩接管和自动召回；不注销手动命令或召回工具 |
+| `enabled` | `true` | 是否启用压缩接管和自动召回；Pi 原生的 `/compact` 命令和召回工具仍然可用 |
 | `overrideDefaultCompaction` | `true` | 是否接管 Pi 的普通 compaction；关闭后保留默认压缩 |
 | `summaryMaxChars` | `12000` | 确定性 checkpoint 文本的最大字符数 |
 | `autoRecall` | `true` | 兼容开关。已配置 `autoRecallMode` 时被忽略；未配置模式时，`false` 映射为 `off`，否则为 `full` |
@@ -139,13 +139,13 @@ pi install -l /absolute/path/to/pi-compact
 
 ### 立即压缩
 
-在 Pi 中执行：
+使用 Pi 原生命令：
 
 ```text
-/pi-compact
+/compact
 ```
 
-该命令调用 Pi 原有的 `ctx.compact()` 流程。压缩完成或失败时，扩展会在 Pi UI 中通知结果。当 `enabled` 或 `overrideDefaultCompaction` 为 `false` 时，命令仍会触发 Pi 的压缩流程，但本扩展不再替换默认摘要。
+Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和 `overrideDefaultCompaction` 都为 `true` 时，本扩展接收 `session_before_compact` 事件，并用确定性 checkpoint 替换 Pi 默认的 LLM 摘要。扩展不再注册单独的压缩命令。当 `enabled` 或 `overrideDefaultCompaction` 为 `false` 时，`/compact` 保留 Pi 默认的摘要行为。
 
 ### 手动召回
 
@@ -273,7 +273,6 @@ npm pack --dry-run
 ```text
 index.ts                 Pi 扩展入口
 src/config.ts            配置读取、归一化和初始化
-src/command.ts           /pi-compact 命令
 src/hooks.ts             compaction、context 和 session hooks
 src/recall.ts            召回工具与 /pi-compact-recall 命令
 src/core/content.ts      消息文本、文件和工具调用提取

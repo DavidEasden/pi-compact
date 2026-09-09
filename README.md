@@ -8,7 +8,7 @@ A deterministic session-compaction and exact-history-recall extension for [Pi](h
 
 ## Features
 
-- Takes over Pi's normal `manual`, `threshold`, and `overflow` compactions.
+- Takes over Pi's native `/compact` command and normal `manual`, `threshold`, and `overflow` compactions.
 - Reuses Pi's own boundary calculation, token accounting, persistence, and recovery flow.
 - Verifies that tool calls and tool results are fully paired before compacting; cancels the takeover on unsafe boundaries to avoid breaking context.
 - Produces a deterministic event ledger and does not disguise rule-extracted records as goals, decisions, or completed tasks.
@@ -121,7 +121,7 @@ Config fields:
 
 | Field | Default | Description |
 | --- | ---: | --- |
-| `enabled` | `true` | Enables compaction takeover and auto recall; does not unregister the manual commands or recall tool |
+| `enabled` | `true` | Enables compaction takeover and auto recall; the native `/compact` command and recall tool remain available |
 | `overrideDefaultCompaction` | `true` | Whether to take over Pi's normal compaction; when disabled, the default compaction is kept |
 | `summaryMaxChars` | `12000` | Maximum character count of the deterministic checkpoint text |
 | `autoRecall` | `true` | Compatibility flag. Ignored when `autoRecallMode` is set; if the mode is unset, `false` maps to `off`, otherwise `full` |
@@ -139,13 +139,13 @@ The automatic compaction threshold and retained-tail size are still controlled b
 
 ### Compact now
 
-Run inside Pi:
+Run Pi's native command:
 
 ```text
-/pi-compact
+/compact
 ```
 
-This command uses Pi's existing `ctx.compact()` flow. The extension notifies the Pi UI when compaction completes or fails. When `enabled` or `overrideDefaultCompaction` is `false`, the command still triggers Pi's compaction flow, but this extension no longer replaces the default summary.
+Pi's native `/compact` command calls its normal compaction flow. When `enabled` and `overrideDefaultCompaction` are both `true`, this extension receives the `session_before_compact` event and replaces Pi's default LLM summary with its deterministic checkpoint. The extension does not register a separate compaction command. When `enabled` or `overrideDefaultCompaction` is `false`, `/compact` keeps Pi's default summary behavior.
 
 ### Manual recall
 
@@ -273,7 +273,6 @@ The published allowlist is `index.ts` and `src/`; npm also automatically include
 ```text
 index.ts                 Pi extension entry
 src/config.ts            Config loading, normalization, and scaffolding
-src/command.ts           /pi-compact command
 src/hooks.ts             Compaction, context, and session hooks
 src/recall.ts            Recall tool and /pi-compact-recall command
 src/core/content.ts      Message text, file, and tool-call extraction
