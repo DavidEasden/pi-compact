@@ -2,7 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { clip } from "./core/content.ts";
-import { activeEntryIds, rawEntryText, recordsForEntryIds, recordsFromEntries, searchRecords } from "./core/session.ts";
+import { activeEntryIds, listRecords, rawEntryText, recordsForEntryIds, recordsFromEntries, searchRecords } from "./core/session.ts";
+import type { HistoryRecord, SearchHit, SourceClass } from "./types.ts";
 
 interface RecallInput {
   query?: string;
@@ -13,6 +14,10 @@ interface RecallInput {
   page?: number;
   limit?: number;
   raw?: boolean;
+  action?: "list" | "search" | "read";
+  offset?: number;
+  rawLimit?: number;
+  sourceClass?: SourceClass | "all";
 }
 
 export interface FormattedHits {
@@ -20,9 +25,11 @@ export interface FormattedHits {
   truncated: boolean;
 }
 
-const serializeRawEntry = (hit: ReturnType<typeof searchRecords>[number]): { entryId: string; body: string; ok: boolean } => {
+type HitLike = SearchHit | (HistoryRecord & { score: number; snippet: string });
+
+const serializeRawEntry = (hit: HitLike, slice?: { offset?: number; limit?: number }): { entryId: string; body: string; ok: boolean } => {
   try {
-    return { entryId: hit.entryId, body: rawEntryText(hit), ok: true };
+    return { entryId: hit.entryId, body: rawEntryText(hit, slice), ok: true };
   } catch (error) {
     return {
       entryId: hit.entryId,
@@ -40,15 +47,20 @@ const omittedNote = (ids: string[]): string => (
   ids.length === 0 ? "" : `\n\n(omitted entry IDs: ${ids.join(", ")}; use a single entry ID to retrieve full JSON)`
 );
 
-const formatRawHits = (hits: ReturnType<typeof searchRecords>, maxChars: number, allowOversizeSingle: boolean): FormattedHits => {
-  if (hits.length === 1 && allowOversizeSingle) {
-    // 按单个 entry ID 请求的 raw entry 必须返回完整 JSON，即使超过字符预算；禁止中途截断。
-    const serialized = serializeRawEntry(hits[0]);
-    return { text: serialized.body, truncated: !serialized.ok };
+const rawSliceOf = (input?: { offset?: number; limit?: number }): { offset?: number; limit?: number } | undefined => {
+  if (!input || (input.offset == null && input.limit == null)) return undefined;
+  return { offset: input.offset, limit: input.limit };
+};
+
+const formatRawHits = (hits: HitLike[], maxChars: number, allowOversizeSingle: boolean, slice?: { offset?: number; limit?: number }): FormattedHits => {
+  if (hits.length === 1 && (allowOversizeSingle || slice)) {
+    // 按单个 entry ID 请求的 raw entry：无分段时必须返回完整 JSON；提供 offset/rawLimit 时按字符窗口读取。
+    const serialized = serializeRawEntry(hits[0], slice);
+    return { text: serialized.body, truncated: !serialized.ok || (slice != null && JSON.parse(serialized.body).truncated === true) };
   }
 
   const blocks = hits.map((hit) => {
-    const serialized = serializeRawEntry(hit);
+    const serialized = serializeRawEntry(hit, slice);
     return { entryId: serialized.entryId, body: `[entry ${serialized.entryId}]\n${serialized.body}` };
   });
   const header = `pi-compact recall (${hits.length} result(s))\n\n`;
@@ -72,8 +84,12 @@ const formatRawHits = (hits: ReturnType<typeof searchRecords>, maxChars: number,
   return { text: header + parts.join("\n\n"), truncated: false };
 };
 
-const formatPrettyHits = (hits: ReturnType<typeof searchRecords>, maxChars: number): FormattedHits => {
-  const blocks = hits.map((hit) => `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`);
+const formatPrettyHits = (hits: HitLike[], maxChars: number): FormattedHits => {
+  const blocks = hits.map((hit) => {
+    const customType = hit.customType ? ` customType=${hit.customType}` : "";
+    const sourceClass = hit.sourceClass === "derived" ? " sourceClass=derived" : "";
+    return `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")}${customType}${sourceClass} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`;
+  });
   const header = `pi-compact recall (${hits.length} result(s))\n\n`;
   const parts: string[] = [];
   for (let index = 0; index < blocks.length; index++) {
@@ -92,31 +108,44 @@ const formatPrettyHits = (hits: ReturnType<typeof searchRecords>, maxChars: numb
 };
 
 export const formatRecallOutput = (
-  hits: ReturnType<typeof searchRecords>,
+  hits: HitLike[],
   raw = false,
   maxChars = 16000,
   allowOversizeSingleRaw = false,
+  rawSlice?: { offset?: number; limit?: number },
 ): FormattedHits => {
   if (hits.length === 0) return { text: "pi-compact recall: 未找到匹配的历史记录。", truncated: false };
-  if (raw) return formatRawHits(hits, maxChars, allowOversizeSingleRaw);
+  if (raw) return formatRawHits(hits, maxChars, allowOversizeSingleRaw, rawSliceOf(rawSlice));
   return formatPrettyHits(hits, maxChars);
 };
 
 export const formatHits = (
-  hits: ReturnType<typeof searchRecords>,
+  hits: HitLike[],
   raw = false,
   maxChars = 16000,
   allowOversizeSingleRaw = false,
-): string => formatRecallOutput(hits, raw, maxChars, allowOversizeSingleRaw).text;
+  rawSlice?: { offset?: number; limit?: number },
+): string => formatRecallOutput(hits, raw, maxChars, allowOversizeSingleRaw, rawSlice).text;
 
-const recallHits = (input: RecallInput, ctx: any) => {
+const recallHits = (input: RecallInput, ctx: any): HitLike[] => {
   const entries = ctx.sessionManager.getEntries?.() ?? [];
   const allowed = input.scope === "all" ? undefined : activeEntryIds(ctx.sessionManager);
-  const records = recordsFromEntries(entries, allowed);
-  if (input.entryIds?.length) {
-    const matched = recordsForEntryIds(records, input.entryIds);
-    // 单个 raw entryId 忽略默认 limit，避免把请求的那一条截掉。
-    const limited = input.raw === true && input.entryIds.length === 1 ? matched : matched.slice(0, input.limit ?? 8);
+  let records = recordsFromEntries(entries, allowed);
+  if (input.sourceClass === "primary" || input.sourceClass === "derived") {
+    records = records.filter((record) => record.sourceClass === input.sourceClass);
+  }
+  if (input.action === "list" && !input.entryIds?.length) {
+    const listed = listRecords(records, {
+      page: input.page,
+      maxResults: input.limit ?? 8,
+      kind: input.kind,
+      sourceClass: input.sourceClass,
+    });
+    return listed.map((record) => ({ ...record, score: 1, snippet: record.text }));
+  }
+  if (input.entryIds?.length || input.action === "read") {
+    const matched = recordsForEntryIds(records, input.entryIds ?? []);
+    const limited = input.raw === true && input.entryIds?.length === 1 ? matched : matched.slice(0, input.limit ?? 8);
     return limited.map((record) => ({ ...record, score: 1, snippet: record.text }));
   }
   return searchRecords(records, input.query ?? "", {
@@ -124,6 +153,7 @@ const recallHits = (input: RecallInput, ctx: any) => {
     kind: input.kind,
     page: input.page,
     maxResults: input.limit ?? 8,
+    sourceClass: input.sourceClass,
   });
 };
 
@@ -135,6 +165,8 @@ export const parseCommand = (args: string): RecallInput => {
     const separator = token.indexOf(":");
     if (separator <= 0) {
       if (token.toLowerCase() === "raw") result.raw = true;
+      else if (token.toLowerCase() === "list") result.action = "list";
+      else if (token.toLowerCase() === "read") result.action = "read";
       else plain.push(token);
       continue;
     }
@@ -147,19 +179,39 @@ export const parseCommand = (args: string): RecallInput => {
     else if (key === "page") result.page = Math.max(1, Number(value) || 1);
     else if (key === "limit") result.limit = Math.min(30, Math.max(1, Number(value) || 8));
     else if (key === "raw" && value === "true") result.raw = true;
+    else if (key === "action" && (value === "list" || value === "search" || value === "read")) result.action = value;
+    else if (key === "offset") result.offset = Math.max(0, Number(value) || 0);
+    else if (key === "rawlimit") result.rawLimit = Math.max(1, Number(value) || 1);
+    else if (key === "sourceclass" && (value === "primary" || value === "derived" || value === "all")) result.sourceClass = value;
     else plain.push(token);
   }
   result.query = plain.join(" ");
   return result;
 };
 
+const outputFor = (input: RecallInput, ctx: any) => {
+  const config = loadConfig(ctx.cwd);
+  const hits = recallHits(input, ctx);
+  const sliced = input.offset != null || input.rawLimit != null;
+  return {
+    hits,
+    formatted: formatRecallOutput(
+      hits,
+      input.raw === true,
+      config.recallMaxChars,
+      input.raw === true && input.entryIds?.length === 1 && !sliced,
+      sliced ? { offset: input.offset, limit: input.rawLimit } : undefined,
+    ),
+  };
+};
+
 export const registerRecall = (pi: ExtensionAPI): void => {
   pi.registerTool({
     name: "pi_compact_recall",
     label: "Recall Pi session history",
-    description: "从当前 Pi session 的原始 entries 精确恢复旧消息、工具调用、工具结果和命令。默认只搜索当前 branch；scope=all 搜索整个 session。",
-    promptSnippet: "按 entry ID、文件路径或关键词精确召回旧 session 原文",
-    promptGuidelines: ["使用 pi_compact_recall 恢复压缩前的具体历史细节，不要假设压缩 checkpoint 包含全部原文。"],
+    description: "从当前 Pi session 的原始 entries 精确恢复旧消息、工具调用、工具结果和命令。支持 list/search/read；长 raw 可用 offset 与 rawLimit 分段读取。默认只搜索当前 branch；scope=all 搜索整个 session。",
+    promptSnippet: "按 entry ID、文件路径或关键词精确召回旧 session 原文；长条目请用 offset/rawLimit 分段读取",
+    promptGuidelines: ["使用 pi_compact_recall 恢复压缩前的具体历史细节，不要假设压缩 checkpoint 包含全部原文。", "长 raw 默认不要整段灌入上下文，使用 offset 与 rawLimit 分段读取。"],
     parameters: Type.Object({
       query: Type.Optional(Type.String()),
       entryIds: Type.Optional(Type.Array(Type.String())),
@@ -169,11 +221,13 @@ export const registerRecall = (pi: ExtensionAPI): void => {
       page: Type.Optional(Type.Integer({ minimum: 1 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
       raw: Type.Optional(Type.Boolean()),
+      action: Type.Optional(Type.Union([Type.Literal("list"), Type.Literal("search"), Type.Literal("read")])),
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
+      rawLimit: Type.Optional(Type.Integer({ minimum: 1 })),
+      sourceClass: Type.Optional(Type.Union([Type.Literal("primary"), Type.Literal("derived"), Type.Literal("all")])),
     }),
     async execute(_toolCallId: string, input: RecallInput, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
-      const config = loadConfig(ctx.cwd);
-      const hits = recallHits(input, ctx);
-      const formatted = formatRecallOutput(hits, input.raw === true, config.recallMaxChars, input.raw === true && input.entryIds?.length === 1);
+      const { hits, formatted } = outputFor(input, ctx);
       return {
         content: [{ type: "text", text: formatted.text }],
         details: { source: "session-entries", count: hits.length, chars: formatted.text.length, truncated: formatted.truncated },
@@ -182,12 +236,10 @@ export const registerRecall = (pi: ExtensionAPI): void => {
   } as any);
 
   pi.registerCommand("pi-compact-recall", {
-    description: "精确召回 Pi session 中的原始历史",
+    description: "精确召回 Pi session 中的原始历史；支持 list/search/read 与 raw 分段读取",
     handler: async (args: string, ctx: any) => {
       const input = parseCommand(args);
-      const config = loadConfig(ctx.cwd);
-      const hits = recallHits(input, ctx);
-      const formatted = formatRecallOutput(hits, input.raw === true, config.recallMaxChars, input.raw === true && input.entryIds?.length === 1);
+      const { hits, formatted } = outputFor(input, ctx);
       pi.sendMessage({
         customType: "pi-compact-recall",
         content: formatted.text,

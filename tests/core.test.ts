@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import type { SessionEntryLike } from "../src/types.ts";
 import test from "node:test";
 import { buildDetails, renderLedger } from "../src/core/ledger.ts";
-import { messageFiles, messageText } from "../src/core/content.ts";
+import { messageFiles, messageText, snippetAround } from "../src/core/content.ts";
 import { isSafeCut } from "../src/hooks.ts";
-import { activeEntryIds, entryToRecord, hashRecords, recordsFromEntries, searchRecords } from "../src/core/session.ts";
+import { activeEntryIds, entryToRecord, hashRecords, listRecords, recordsFromEntries, searchRecords } from "../src/core/session.ts";
 
 const entries: SessionEntryLike[] = [
   { type: "message", id: "u1", parentId: null, timestamp: "2024-01-01T00:00:00Z", message: { role: "user", content: "修复 src/auth/session.ts 的 token 刷新问题" } },
@@ -35,6 +35,12 @@ test("上下文 entry 也可记录，但扩展状态 entry 不进入上下文记
   assert.match(records[5].text, /分支摘要/);
   assert.match(records[6].text, /旧压缩摘要/);
   assert.equal(records.some((record) => record.entryId === "state1"), false);
+  assert.equal(records[4].sourceClass, "primary");
+  assert.equal(records[4].customType, "note");
+  assert.equal(records[5].sourceClass, "derived");
+  assert.equal(records[5].customType, "branch_summary");
+  assert.equal(records[6].sourceClass, "derived");
+  assert.equal(records[6].customType, "compaction");
 });
 
 test("active lineage 为空时不会退化为全量历史", () => {
@@ -106,6 +112,44 @@ test("ledger Timeline 保留原始 entry 顺序且不移除分类区块", () => 
 test("messageText 保留工具结果文本", () => {
   assert.match(messageText(entries[2].message!), /refreshToken/);
   assert.deepEqual(messageFiles({ role: "bashExecution", command: "npm test src/auth/session.ts", output: "" }), ["src/auth/session.ts"]);
+});
+
+test("thinking 保留在 raw 中但不进入默认搜索文本", () => {
+  const entry: SessionEntryLike = {
+    type: "message",
+    id: "think1",
+    message: {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "内部推理秘密", thinkingSignature: "sig" },
+        { type: "text", text: "对外可见的结论" },
+      ],
+    },
+  };
+  const record = entryToRecord(entry, 0)!;
+  assert.match(record.text, /对外可见的结论/);
+  assert.equal(record.text.includes("内部推理秘密"), false);
+  assert.equal(record.thinkingText, "内部推理秘密");
+  assert.match(JSON.stringify(record.raw), /内部推理秘密/);
+  assert.match(JSON.stringify(record.raw), /thinkingSignature/);
+  assert.equal(searchRecords([record], "内部推理秘密").length, 0);
+  assert.equal(searchRecords([record], "对外可见的结论")[0]?.entryId, "think1");
+});
+
+test("derived 记录默认可列出但搜索降权，片段按行边界截取", () => {
+  const records = recordsFromEntries([
+    ...entries,
+    { type: "compaction", id: "cp1", summary: "旧压缩摘要 token 刷新", firstKeptEntryId: "b1", tokensBefore: 1 },
+  ]);
+  const derived = searchRecords(records, "token 刷新", { sourceClass: "derived" });
+  assert.equal(derived[0]?.entryId, "cp1");
+  const primary = searchRecords(records, "token 刷新", { sourceClass: "primary" });
+  assert.equal(primary.some((hit) => hit.entryId === "cp1"), false);
+  const listed = listRecords(records, { maxResults: 2 });
+  assert.equal(listed.length, 2);
+  const snippet = snippetAround("alpha\nsecret line here\nomega", "secret", 20);
+  assert.equal(snippet.includes("alpha"), false);
+  assert.match(snippet, /secret/);
 });
 
 test("压缩边界必须保留完整的工具调用和结果配对", () => {

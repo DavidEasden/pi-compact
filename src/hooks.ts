@@ -1,11 +1,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { clip, estimateTokensFromChars, messageText, toolCallIds } from "./core/content.ts";
+import { deriveFacts } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
-import { recordsFromEntries, searchRecords } from "./core/session.ts";
+import { contextEntryIds, hashRecords, recordsFromEntries, searchRecords } from "./core/session.ts";
+import { appendMemoryEvent, loadMemories, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
+import { buildWindowManifest, persistWindowManifest, windowHeaderLines } from "./core/window.ts";
+import { MEMORY_HINT_TYPE, renderWorkingHint } from "./core/working.ts";
 import type { AutoRecallMode, SessionEntryLike } from "./types.ts";
 
 export const AUTO_RECALL_TYPE = "pi-compact-auto-recall";
+export { MEMORY_HINT_TYPE };
 
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TERMINAL_ASSISTANT_REASONS = new Set(["error", "aborted"]);
@@ -137,25 +142,80 @@ const renderRecall = (hits: ReturnType<typeof searchRecords>, maxChars: number, 
       : "Matched original session records (not an LLM summary):",
   ];
   for (const hit of hits) {
+    const customType = hit.customType ? ` customType=${hit.customType}` : "";
     if (mode === "hint") {
       const files = hit.files.length > 0 ? ` files=${hit.files.join(",")}` : "";
-      lines.push(`- [${hit.entryId}] kinds=${hit.kinds.join(",")}${files}`);
+      lines.push(`- [${hit.entryId}] kinds=${hit.kinds.join(",")}${customType}${files}`);
       continue;
     }
-    lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")} ${clip(hit.snippet.replace(/\s+/g, " "), 650)}`);
+    lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")}${customType} ${clip(hit.snippet.replace(/\s+/g, " "), 650)}`);
   }
   return completeLines(lines, maxChars);
 };
 
-interface AutoRecallCache {
+interface InjectionCache {
   key: string;
   content: string;
-  entryIds: string[];
+  ids: string[];
   injectionCount: number;
 }
 
+const sessionIdOf = (ctx: any): string | undefined => {
+  try {
+    const id = ctx.sessionManager?.getSessionId?.();
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromEntries>, sourceHash: string, sessionId?: string): void => {
+  withMemoryLogLock(cwd, () => {
+    const existing = new Set(loadMemories(cwd).map((record) => record.id));
+    for (const draft of deriveFacts(records, sourceHash)) {
+      if (existing.has(draft.recordId)) continue;
+      appendMemoryEvent(cwd, {
+        type: "create",
+        recordId: draft.recordId,
+        author: "rule",
+        sessionId,
+        payload: draft.payload,
+      });
+      existing.add(draft.recordId);
+    }
+  });
+};
+
+const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: number, summaryMaxChars: number) => ({
+  compaction: {
+    summary: [
+      "[pi-compact deterministic context checkpoint]",
+      `compaction reason: ${reason}`,
+      `retained context starts at entry: ${keptEntryId}`,
+      "Extension compaction recovered from an internal error. Original session entries remain retrievable via pi_compact_recall.",
+      "This checkpoint is a deterministic pointer/audit extract, not primary memory.",
+    ].join("\n"),
+    firstKeptEntryId: keptEntryId,
+    tokensBefore,
+    details: {
+      compactor: "pi-compact" as const,
+      version: 1 as const,
+      reason,
+      sourceEntryIds: [] as string[],
+      sourceHash: "",
+      sourceRecordCount: 0,
+      keptEntryId,
+      omittedRecordCount: 0,
+      checkpointChars: 0,
+      summaryMaxChars,
+      estimatedTokensAfter: 0,
+    },
+  },
+});
+
 export const registerHooks = (pi: ExtensionAPI): void => {
-  let autoRecallCache: AutoRecallCache | null = null;
+  let autoRecallCache: InjectionCache | null = null;
+  let memoryHintCache: InjectionCache | null = null;
 
   pi.on("session_before_compact", async (event: any, ctx: any) => {
     const config = loadConfig(ctx.cwd);
@@ -169,83 +229,177 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       ctx.ui.notify("pi-compact: Pi 给出的压缩边界不是完整消息边界，本次压缩已取消以避免丢失工具调用；请重试或暂时关闭扩展。", "warning");
       return { cancel: true };
     }
-    const cutIndex = branch.findIndex((entry: any) => entry.id === keptEntryId);
-    const records = recordsFromEntries(branch.slice(0, cutIndex));
-    const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
-    const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars);
-    if (config.debug) {
-      console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);
+    try {
+      const cutIndex = branch.findIndex((entry: any) => entry.id === keptEntryId);
+      const records = recordsFromEntries(branch.slice(0, cutIndex));
+      const sourceHash = hashRecords(records);
+      const sessionId = sessionIdOf(ctx);
+      let extraHeaderLines: string[] = ["This checkpoint is a deterministic pointer/audit extract, not primary memory."];
+      let window = undefined;
+      if (config.window.manifest) {
+        try {
+          // build（读末条定 seq/parent）+ persist 必须在同一锁事务内，避免并发压缩写出重复 seq。
+          window = withWindowLogLock(ctx.cwd, () => {
+            const manifest = buildWindowManifest({
+              cwd: ctx.cwd,
+              records,
+              sourceHash,
+              keptEntryId,
+              reason: event.reason,
+              isSplitTurn: preparation?.isSplitTurn === true,
+              sessionId,
+            });
+            persistWindowManifest(ctx.cwd, manifest);
+            return manifest;
+          });
+          extraHeaderLines = [...windowHeaderLines(window), extraHeaderLines[0]];
+        } catch {
+          window = undefined;
+        }
+      }
+      if (config.memory.enabled && config.memory.deriveOnCompact) {
+        try {
+          persistDerived(ctx.cwd, records, sourceHash, sessionId);
+        } catch {
+          // 规则派生失败不得阻断压缩。
+        }
+      }
+      const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars, { extraHeaderLines });
+      const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars, window);
+      if (config.debug) {
+        console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);
+      }
+      return { compaction: {
+        summary: ledger.text,
+        firstKeptEntryId: keptEntryId,
+        tokensBefore: event.preparation.tokensBefore,
+        details,
+      } };
+    } catch {
+      ctx.ui?.notify?.("pi-compact: 压缩处理出错，已降级为指针型 checkpoint，未回退到 LLM 摘要。", "warning");
+      return fallbackCheckpoint(event.reason, keptEntryId, event.preparation?.tokensBefore ?? 0, config.summaryMaxChars);
     }
-    return { compaction: {
-      summary: ledger.text,
-      firstKeptEntryId: keptEntryId,
-      tokensBefore: event.preparation.tokensBefore,
-      details,
-    } };
   });
 
   // `context` 只修改当前 provider 请求；Pi 不会把返回的 custom message 持久化为 session entry。
   pi.on("context", (event: any, ctx: any) => {
     const config = loadConfig(ctx.cwd);
-    if (!config.enabled || config.autoRecallMode === "off") return;
-    if (event.messages.some((message: any) => message.customType === AUTO_RECALL_TYPE)) return;
-    const current = latestUser(event.messages);
-    if (current.text.trim().length < 3) return;
-
-    let currentBranch: SessionEntryLike[];
+    if (!config.enabled) return;
+    const messages = [...event.messages];
+    const sessionId = sessionIdOf(ctx) ?? "";
+    let currentBranch: SessionEntryLike[] | undefined;
     try {
-      const branch = ctx.sessionManager.getBranch?.();
-      if (!Array.isArray(branch)) return;
-      currentBranch = branch;
+      const branch = ctx.sessionManager?.getBranch?.();
+      if (Array.isArray(branch)) currentBranch = branch;
     } catch {
-      return;
+      currentBranch = undefined;
     }
-    let latestUserIndex = -1;
-    for (let index = currentBranch.length - 1; index >= 0; index--) {
-      if (currentBranch[index]?.type === "message" && currentBranch[index]?.message?.role === "user") {
-        latestUserIndex = index;
-        break;
+    // 本回合最新的 user entry：作为工作记忆 hint 的回合键，新回合重置注入计数。
+    let latestUserEntry: { index: number; id?: string } | undefined;
+    if (currentBranch) {
+      for (let index = currentBranch.length - 1; index >= 0; index--) {
+        const entry = currentBranch[index];
+        if (entry?.type === "message" && entry.message?.role === "user") {
+          latestUserEntry = { index, id: typeof entry.id === "string" ? entry.id : undefined };
+          break;
+        }
       }
     }
-    const latestUserId = latestUserIndex >= 0 ? currentBranch[latestUserIndex]?.id : undefined;
-    if (typeof latestUserId !== "string") return;
+    let changed = false;
 
-    const cacheKey = `${latestUserId}\u0000${current.text}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}\u0000${config.autoRecallMode}`;
-    if (autoRecallCache?.key !== cacheKey) {
-      // 只搜索当前 user entry 之前的历史，避免同一 turn 重复请求混入刚生成的工具结果。
-      const historyEntries = currentBranch.slice(0, latestUserIndex);
-      const records = recordsFromEntries(historyEntries);
-      const hits = searchRecords(records, current.text, { maxResults: config.recallMaxResults });
-      autoRecallCache = hits.length === 0
-        ? { key: cacheKey, content: "", entryIds: [], injectionCount: 0 }
-        : { key: cacheKey, content: renderRecall(hits, config.autoRecallMaxChars, config.autoRecallMode), entryIds: hits.map((hit) => hit.entryId), injectionCount: 0 };
+    if (config.memory.enabled && config.memory.pinnedInjection && !messages.some((message: any) => message.customType === MEMORY_HINT_TYPE)) {
+      const memories = loadMemories(ctx.cwd);
+      const liveKey = memories
+        .filter((record) => record.status === "pinned" || record.status === "active")
+        .map((record) => `${record.id}:${record.updatedAt}:${record.status}`)
+        .join(",");
+      // 回合键：本回合最新 user entry id；branch 不可用时退化为当前 user 文本。
+      const turnKey = latestUserEntry?.id ?? latestUser(event.messages).text;
+      const hintKey = `${sessionId}\u0000${turnKey}\u0000${liveKey}\u0000${config.memory.hintMaxChars}`;
+      if (memoryHintCache?.key !== hintKey) {
+        const hint = renderWorkingHint(memories, config.memory.hintMaxChars);
+        memoryHintCache = { key: hintKey, content: hint.content, ids: [...hint.pinnedIds, ...hint.activeIds], injectionCount: 0 };
+      }
+      if (memoryHintCache.content) {
+        memoryHintCache.injectionCount += 1;
+        const chars = memoryHintCache.content.length;
+        messages.push({
+          role: "custom",
+          customType: MEMORY_HINT_TYPE,
+          timestamp: Date.now(),
+          content: memoryHintCache.content,
+          display: false,
+          details: {
+            source: "working-memory",
+            memoryIds: memoryHintCache.ids,
+            chars,
+            estimatedTokens: estimateTokensFromChars(chars),
+            sameTurnInjectionCount: memoryHintCache.injectionCount,
+          },
+        });
+        changed = true;
+      }
     }
-    if (!autoRecallCache.content) return;
-    autoRecallCache.injectionCount += 1;
-    const chars = autoRecallCache.content.length;
-    const estimatedTokens = estimateTokensFromChars(chars);
-    if (config.debug) {
-      console.log(`[pi-compact] auto-recall: hitCount=${autoRecallCache.entryIds.length} chars=${chars} mode=${config.autoRecallMode} sameTurnInjectionCount=${autoRecallCache.injectionCount} estimatedTokens=${estimatedTokens}`);
+
+    if (config.autoRecallMode !== "off" && !messages.some((message: any) => message.customType === AUTO_RECALL_TYPE)) {
+      const current = latestUser(event.messages);
+      if (current.text.trim().length >= 3 && currentBranch) {
+        const latestUserId = latestUserEntry?.id;
+        const latestUserIndex = latestUserEntry?.index ?? -1;
+        if (typeof latestUserId === "string" && latestUserIndex >= 0) {
+          const cacheKey = `${sessionId}\u0000${latestUserId}\u0000${current.text}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}\u0000${config.autoRecallMode}\u0000${config.history.autoRecallPrimaryOnly}\u0000${config.history.excludeInContext}`;
+          if (autoRecallCache?.key !== cacheKey) {
+            const historyEntries = currentBranch.slice(0, latestUserIndex);
+            let records = recordsFromEntries(historyEntries);
+            if (config.history.autoRecallPrimaryOnly) records = records.filter((record) => record.sourceClass === "primary");
+            if (config.history.excludeInContext) {
+              const inContext = contextEntryIds(ctx.sessionManager);
+              if (inContext.size > 0) records = records.filter((record) => !inContext.has(record.entryId));
+            }
+            const hits = searchRecords(records, current.text, { maxResults: config.recallMaxResults, sourceClass: config.history.autoRecallPrimaryOnly ? "primary" : "all" });
+            autoRecallCache = hits.length === 0
+              ? { key: cacheKey, content: "", ids: [], injectionCount: 0 }
+              : { key: cacheKey, content: renderRecall(hits, config.autoRecallMaxChars, config.autoRecallMode), ids: hits.map((hit) => hit.entryId), injectionCount: 0 };
+          }
+          if (autoRecallCache.content) {
+            autoRecallCache.injectionCount += 1;
+            const chars = autoRecallCache.content.length;
+            const estimatedTokens = estimateTokensFromChars(chars);
+            if (config.debug) {
+              console.log(`[pi-compact] auto-recall: hitCount=${autoRecallCache.ids.length} chars=${chars} mode=${config.autoRecallMode} sameTurnInjectionCount=${autoRecallCache.injectionCount} estimatedTokens=${estimatedTokens}`);
+            }
+            messages.push({
+              role: "custom",
+              customType: AUTO_RECALL_TYPE,
+              timestamp: Date.now(),
+              content: autoRecallCache.content,
+              display: false,
+              details: {
+                source: "request-context",
+                entryIds: autoRecallCache.ids,
+                chars,
+                hitCount: autoRecallCache.ids.length,
+                estimatedTokens,
+                mode: config.autoRecallMode,
+                sameTurnInjectionCount: autoRecallCache.injectionCount,
+              },
+            });
+            changed = true;
+          }
+        }
+      }
     }
-    return { messages: [...event.messages, {
-      role: "custom",
-      customType: AUTO_RECALL_TYPE,
-      timestamp: Date.now(),
-      content: autoRecallCache.content,
-      display: false,
-      details: {
-        source: "request-context",
-        entryIds: autoRecallCache.entryIds,
-        chars,
-        hitCount: autoRecallCache.entryIds.length,
-        estimatedTokens,
-        mode: config.autoRecallMode,
-        sameTurnInjectionCount: autoRecallCache.injectionCount,
-      },
-    }] };
+
+    if (!changed) return;
+    return { messages };
   });
 
   pi.on("session_compact", (event: any, ctx: any) => {
     if (event.fromExtension) ctx.ui.notify(`pi-compact: ${event.reason} 确定性压缩完成`, "info");
+  });
+
+  pi.on("session_compact_failed", (event: any, ctx: any) => {
+    const extra = event.errorMessage ? `：${event.errorMessage}` : "";
+    ctx.ui?.notify?.(`pi-compact: 压缩失败或已中止${extra}`, event.aborted ? "warning" : "error");
   });
 };

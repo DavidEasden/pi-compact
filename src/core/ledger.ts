@@ -4,9 +4,16 @@ import { hashRecords } from "./session.ts";
 
 const recordFiles = (record: HistoryRecord): string => (record.files.length > 0 ? ` files=${record.files.join(",")}` : "");
 
-export const renderLedger = (records: HistoryRecord[], reason: CompactReason, keptEntryId: string, maxChars: number): { text: string; omitted: number } => {
+export const renderLedger = (
+  records: HistoryRecord[],
+  reason: CompactReason,
+  keptEntryId: string,
+  maxChars: number,
+  options?: { extraHeaderLines?: string[] },
+): { text: string; omitted: number } => {
   const lines = [
     "[pi-compact deterministic context checkpoint]",
+    ...(options?.extraHeaderLines ?? []),
     `compaction reason: ${reason}`,
     `retained context starts at entry: ${keptEntryId}`,
     "The records below are extracted from the original session entries; they are not LLM-generated claims.",
@@ -84,6 +91,7 @@ export const buildDetails = (
   omittedRecordCount: number,
   checkpointChars: number,
   summaryMaxChars: number,
+  window?: CompactionDetails["window"],
 ): CompactionDetails => ({
   compactor: "pi-compact",
   version: 1,
@@ -96,4 +104,5 @@ export const buildDetails = (
   checkpointChars,
   summaryMaxChars,
   estimatedTokensAfter: estimateTokensFromChars(checkpointChars),
+  ...(window ? { window } : {}),
 });

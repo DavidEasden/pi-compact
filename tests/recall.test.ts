@@ -35,6 +35,9 @@ test("parseCommand 识别 ids 与 raw", () => {
   });
   assert.equal(parseCommand("raw:true file:src/auth.ts").raw, true);
   assert.equal(parseCommand("token refresh").query, "token refresh");
+  assert.equal(parseCommand("list offset:10 rawLimit:20").action, "list");
+  assert.equal(parseCommand("list offset:10 rawLimit:20").offset, 10);
+  assert.equal(parseCommand("list offset:10 rawLimit:20").rawLimit, 20);
 });
 
 test("formatHits 单条 raw 返回可解析的完整 entry JSON", () => {
@@ -136,6 +139,51 @@ test("pretty 召回按完整结果块截断，不切断 entry ID", () => {
   assert.match(formatted.text, /\[entry entry-one\]/);
   assert.equal(formatted.text.includes("[entry entry-two]"), false);
   assert.equal(formatted.text.endsWith("entry-one"), false);
+});
+
+test("list 动作按最近记录做有界列出", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-compact-recall-list-"));
+  try {
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify(DEFAULT_CONFIG));
+    let tool: any;
+    const pi = { registerTool(definition: any) { tool = definition; }, registerCommand() {} };
+    registerRecall(pi as any);
+    const listed = await tool.execute("call-list", { action: "list", limit: 1 }, new AbortController().signal, undefined, {
+      cwd,
+      sessionManager: {
+        getEntries: () => [
+          { type: "message", id: "older", message: { role: "user", content: "old" } },
+          { type: "message", id: "newer", message: { role: "user", content: "new" } },
+        ],
+        getBranch: () => [
+          { type: "message", id: "older", message: { role: "user", content: "old" } },
+          { type: "message", id: "newer", message: { role: "user", content: "new" } },
+        ],
+      },
+    });
+    assert.match(listed.content[0].text, /newer/);
+    assert.equal(listed.content[0].text.includes("older"), false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("长 raw 支持 offset/limit 分段读取", () => {
+  const raw: SessionEntryLike = {
+    type: "message",
+    id: "slice-me",
+    message: { role: "user", content: "abcdefghijklmnopqrstuvwxyz" },
+  };
+  const [hit] = toHits([raw]);
+  const formatted = formatRecallOutput([hit], true, 16000, false, { offset: 0, limit: 12 });
+  const parsed = JSON.parse(formatted.text);
+  assert.equal(parsed.entryId, "slice-me");
+  assert.equal(parsed.offset, 0);
+  assert.equal(parsed.limit, 12);
+  assert.equal(parsed.body.length, 12);
+  assert.equal(parsed.truncated, true);
+  assert.ok(parsed.totalChars > 12);
 });
 
 test("注册的召回工具按单个 entry ID 返回完整 raw JSON 和统计", async () => {
