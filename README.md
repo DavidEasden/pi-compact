@@ -178,7 +178,7 @@ Pi's native `/compact` command calls its normal compaction flow. When `enabled` 
 
 Durable memory lives in the project directory `.pi/pi-compact/memory.jsonl` (an append-only event log). Current state is rebuilt by a pure projector. User writes are authoritative; model proposals are always provisional and become active/pinned only after the user confirms them with `/remember`. The extension cannot guarantee that the model will obey these memories.
 
-Appends to `memory.jsonl` (and `windows.jsonl`) are guarded by a per-log synchronous file lock (`.pi/pi-compact/memory.jsonl.lock`, `windows.jsonl.lock`) so concurrent Pi processes cannot interleave the read-last → compute-seq → append sequence and lose events. The lock has a bounded timeout, recovers locks left behind by crashed processes (unparsable, dead-owner, or expired), is reentrant within a process, and is always released when the transaction ends; lock files never permanently block future writes. Write failures throw explicit errors that surface to the user or model — a write is never reported as successful after a failure.
+Appends to `memory.jsonl` (and `windows.jsonl`) are guarded by a per-log synchronous file lock (`.pi/pi-compact/memory.jsonl.lock`, `windows.jsonl.lock`) so concurrent Pi processes cannot interleave the read-last → compute-seq → append sequence and lose events. The lock has a bounded timeout, recovers locks left behind by crashed processes (unparsable, dead-owner, or expired), is reentrant within a process, and is always released when the transaction ends; lock files never permanently block future writes. Release and reclaim require the lock file's owner token to match, and also the pid/startTime when those fields are present; a metadata mismatch never deletes another owner's lock. On macOS/Linux the lock stores process start time when it can be read, so a reused PID is not treated as the original live owner. If start time cannot be read, the owner is treated as still live until the lock expires — the extension never deletes a lock it cannot prove is stale. Write failures throw explicit errors that surface to the user or model — a write is never reported as successful after a failure.
 
 When reading either log, events must form an unbroken chain: `seq` starts at 1 and increases by exactly one, `prevHash` must equal the previous accepted event's hash, and each event's own hash must be correct. Reading stops at the first invalid, duplicated, skipped, or tampered event and only replays the trusted prefix. Once such an event exists, further appends to that log are rejected with an explicit error: the user must repair the log by hand before writing again, and the extension never truncates or rewrites the log to hide the problem. An unparsable half-line at EOF is still tolerated — it is skipped on read and the next append seals it, so a crash mid-write remains recoverable.
 
@@ -273,12 +273,14 @@ Available fields mirror the `/pi-compact-recall` arguments: `query`, `entryIds`,
 
 Every context request injects `pi-compact-memory-hint` when memory is enabled and `pinnedInjection` is true. Even with no pinned memories, the hint tells the model how to use `/remember`, `pi_memory_search`, and `pi_compact_recall`. Pinned items take priority in `memory.hintMaxChars` and cannot be squeezed out by ordinary history recall. Working-memory injection and automatic history recall are two separate messages with two budgets.
 
-Auto recall defaults to `full` (the current full-snippet injection) and is gated by `enabled && autoRecallMode !== "off"`. It triggers only when:
+Auto recall defaults to `full` (the current full-snippet injection) and is gated by `enabled && autoRecallMode !== "off"`. It is high-confidence gated: session-control, politeness, and generic words such as `continue`, `ok`, `thanks`, `请继续`, `好的`, `谢谢`, `上一步`, and `再试一次` do not by themselves inject history body. Manual `pi_compact_recall` is unchanged and still does exact keyword search, including those words. Auto recall does not use query length `>= 3` as the only threshold, and it does not call an LLM, embedding model, or network service.
 
-- The latest user text of the current request, trimmed, is at least 3 characters long.
+It triggers only when:
+
+- The latest user text, after deterministic normalization, stopword/stop-phrase filtering, and match-signal grading, still contains a high-confidence term (file path, error code, function name/identifier, command) or a multi-word topic.
 - The current session provides a valid active branch.
 - The current branch contains a user entry with a valid ID.
-- The history before that user entry contains matching records.
+- The history before that user entry contains matching records for those high-confidence terms.
 - By default only primary records are searched, and entries already present in `buildContextEntries()` are excluded.
 
 Auto recall only modifies the current provider request's messages; it does not write to the session and does not create a session entry. Multiple provider requests in the same user turn reuse the recall result; a new user entry recomputes it. Tool results produced during the current turn are not mixed into that turn's auto-recall scope.
@@ -343,6 +345,8 @@ src/hooks.ts             Compaction, context, working-memory injection, and sess
 src/recall.ts            Recall tool and /pi-compact-recall command
 src/memory.ts            Memory commands and memory/new-window tools
 src/core/content.ts      Message text, files, thinking separation, and snippet boundaries
+src/core/auto-recall.ts  Deterministic high-confidence gate for automatic history recall
+src/core/lock.ts         Synchronous log lock, owner-token reclaim, PID start-time checks
 src/core/ledger.ts       Deterministic checkpoint and details
 src/core/session.ts      Session entry conversion, sourceClass, search, and raw replay
 src/core/jsonl.ts        Corruption-safe JSONL I/O
@@ -367,6 +371,8 @@ Verified so far:
 - Config scaffolding and normalization of invalid configs, including memory/history/window.
 - `manual`, `threshold`, and `overflow` compaction reasons plus aborted requests, via simulated hook events.
 - Empty active lineage does not widen the search; auto-recall same-turn reuse, new-user updates, deduplication, and branch-query error handling.
+- Auto-recall high-confidence gating rejects generic continue/ok phrases while still injecting concrete tokens, error codes, and paths; manual recall still matches those generic words.
+- Log-lock reclaim refuses token/metadata mismatches; PID reuse vs conservative missing-start-time fallback is unit-tested without real PID recycling.
 - Clean dependency installation, TypeScript type checking, and real Pi CLI extension loading.
 
 Not yet verified as full end-to-end scenarios: real model responses, the complete overflow-retry run, and long-running behavior across session or branch switches.
