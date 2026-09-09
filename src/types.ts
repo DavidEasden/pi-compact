@@ -1,12 +1,15 @@
 export type CompactReason = "manual" | "threshold" | "overflow";
 export type RecallScope = "active-lineage" | "all";
 export type RecordKind = "user" | "assistant" | "tool_call" | "tool_result" | "bash" | "custom";
+/** full=当前完整片段；hint=短提示；off=关闭。合法 autoRecallMode 优先于 autoRecall 布尔值。 */
+export type AutoRecallMode = "full" | "hint" | "off";
 
 export interface PiCompactConfig {
   enabled: boolean;
   overrideDefaultCompaction: boolean;
   summaryMaxChars: number;
   autoRecall: boolean;
+  autoRecallMode: AutoRecallMode;
   autoRecallMaxChars: number;
   recallMaxResults: number;
   recallMaxChars: number;
@@ -39,6 +42,11 @@ export interface CompactionDetails {
   sourceRecordCount: number;
   keptEntryId: string;
   omittedRecordCount: number;
+  /** checkpoint 文本字符数，不是 token。 */
+  checkpointChars: number;
+  summaryMaxChars: number;
+  /** chars/4 向上取整，不是 provider usage。 */
+  estimatedTokensAfter: number;
 }
 
 export interface SessionEntryLike {

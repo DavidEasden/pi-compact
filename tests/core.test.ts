@@ -61,9 +61,34 @@ test("ledger 不声称不存在的事实，并明确省略可召回", () => {
   const result = renderLedger(records, "threshold", "tail", 800);
   assert.match(result.text, /not LLM-generated claims/);
   assert.match(result.text, /pi_compact_recall/);
-  assert.ok(result.omitted > 0);
-  const details = buildDetails(records, "threshold", "tail", result.omitted);
+  assert.equal(result.omitted, records.length);
+  const details = buildDetails(records, "threshold", "tail", result.omitted, result.text.length, 800);
   assert.equal(details.compactor, "pi-compact");
+  assert.equal(details.version, 1);
+  assert.equal(details.checkpointChars, result.text.length);
+  assert.equal(details.summaryMaxChars, 800);
+  assert.equal(details.sourceRecordCount, records.length);
+  assert.equal(details.omittedRecordCount, result.omitted);
+  assert.equal(details.estimatedTokensAfter, Math.ceil(result.text.length / 4));
+});
+
+test("ledger Timeline 保留原始 entry 顺序且不移除分类区块", () => {
+  const records = recordsFromEntries(entries);
+  const result = renderLedger(records, "threshold", "tail", 12000);
+  assert.match(result.text, /## Timeline/);
+  assert.match(result.text, /## User messages/);
+  assert.match(result.text, /## Tool calls/);
+  assert.match(result.text, /## Tool results/);
+  assert.match(result.text, /## Commands/);
+  const timelineStart = result.text.indexOf("## Timeline");
+  const groupsStart = result.text.indexOf("## User messages");
+  assert.ok(timelineStart >= 0 && groupsStart > timelineStart);
+  const timeline = result.text.slice(timelineStart, groupsStart);
+  assert.match(timeline, /\[u1\][\s\S]*\[a1\][\s\S]*\[t1\][\s\S]*\[b1\]/);
+  assert.match(timeline, /\[a1\] kinds=assistant,tool_call/);
+  assert.equal((timeline.match(/\[a1\]/g) ?? []).length, 1);
+  const toolCalls = result.text.slice(result.text.indexOf("## Tool calls"));
+  assert.match(toolCalls, /\[a1\]/);
 });
 
 test("messageText 保留工具结果文本", () => {

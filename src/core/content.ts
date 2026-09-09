@@ -56,6 +56,9 @@ export const messageKinds = (message: MessageLike): string[] => {
   return ["custom"];
 };
 
+/** Pi estimateTokens 启发式：字符数 / 4 向上取整。这不是 provider usage。 */
+export const estimateTokensFromChars = (charCount: number): number => Math.ceil(Math.max(0, charCount) / 4);
+
 export const clip = (text: string, maxChars: number): string => {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 48))}\n[…已省略 ${text.length - maxChars} 个字符；可用 entry ID 召回原文]`;

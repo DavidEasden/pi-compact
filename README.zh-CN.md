@@ -109,6 +109,7 @@ pi install -l /absolute/path/to/pi-compact
   "overrideDefaultCompaction": true,
   "summaryMaxChars": 12000,
   "autoRecall": true,
+  "autoRecallMode": "full",
   "autoRecallMaxChars": 5000,
   "recallMaxResults": 8,
   "recallMaxChars": 16000,
@@ -123,11 +124,12 @@ pi install -l /absolute/path/to/pi-compact
 | `enabled` | `true` | 是否启用压缩接管和自动召回；不注销手动命令或召回工具 |
 | `overrideDefaultCompaction` | `true` | 是否接管 Pi 的普通 compaction；关闭后保留默认压缩 |
 | `summaryMaxChars` | `12000` | 确定性 checkpoint 文本的最大字符数 |
-| `autoRecall` | `true` | 是否在 provider 请求前自动召回历史 |
+| `autoRecall` | `true` | 兼容开关。已配置 `autoRecallMode` 时被忽略；未配置模式时，`false` 映射为 `off`，否则为 `full` |
+| `autoRecallMode` | `full` | 自动召回模式：`full`（当前完整片段）、`hint`（短 ID/kind 提示）或 `off`（关闭）。合法模式优先于 `autoRecall` |
 | `autoRecallMaxChars` | `5000` | 单次自动召回文本的最大字符数 |
 | `recallMaxResults` | `8` | 自动召回最多返回的记录数 |
-| `recallMaxChars` | `16000` | 手动召回结果的最大字符数 |
-| `debug` | `false` | 是否输出扩展调试日志 |
+| `recallMaxChars` | `16000` | 手动召回结果的最大字符数；按单个 entry ID 的 `raw` 回放会返回完整 JSON，即使超过该预算 |
+| `debug` | `false` | 是否输出扩展调试日志（只输出计数和字符数，不输出原文） |
 
 数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。
 
@@ -203,11 +205,11 @@ pi install -l /absolute/path/to/pi-compact
 
 可用字段与 `/pi-compact-recall` 参数对应：`query`、`entryIds`、`file`、`kind`、`scope`、`page`、`limit` 和 `raw`。
 
-使用 `raw: true` 时，输出原始 session entry 的 JSON 文本，包含该 entry 存有的工具参数、工具输出、时间戳和父子 entry 关系。但结果仍受 `recallMaxChars` 限制，超长输出会被截断，甚至可能不是完整可解析的 JSON；分页只划分记录，不划分单条 entry 内容。可缩小 `limit` 或提高字符预算；超过预算上限的完整内容需从 Pi 原始 session 文件读取。
+使用 `raw: true` 且只召回单个 entry ID 时，输出该原始 session entry 的完整 JSON，包含该 entry 存有的工具参数、工具输出、时间戳和父子 entry 关系。这条 JSON 不会被截断，即使超过 `recallMaxChars`；序列化失败时返回结构化错误对象，而不是截断的 JSON。多个 raw 命中时，只返回字符预算内的完整 entry，并附带 `omitted entry IDs` 提示，绝不会从 JSON 中间截断。关键词和 pretty（非 raw）输出仍受 `recallMaxChars` 限制。分页只划分记录，不划分单条 entry 内容。按单个 raw entry ID 查询时忽略默认 `limit` 8，避免丢掉请求的那一条。
 
 ## 自动召回行为
 
-自动召回默认开启，满足以下条件时生效：
+自动召回默认模式为 `full`（当前完整片段注入），由 `enabled && autoRecallMode !== "off"` 控制。满足以下条件时生效：
 
 - 当前请求的最新 user 文本去除首尾空白后，长度至少为 3。
 - 当前 session 可以取得有效的 active branch。
@@ -218,7 +220,9 @@ pi install -l /absolute/path/to/pi-compact
 
 如果 branch 查询失败、没有合法 user entry 或没有命中，扩展会安静跳过自动召回。手动召回在无法取得 active lineage 时也不会扩大为整个 session；只有显式指定 `scope:all` 才跨 branch 检索。
 
-自动召回不要求已发生压缩，因此可能与当前上下文中的历史重复，并增加请求 token 用量。召回内容会发送给当前模型提供方，可能包含原始工具输出或其他敏感文本；`raw` 不做脱敏，`scope:all` 还会包含其他分支的匹配记录。
+`full` 注入匹配记录的截短片段。`hint` 只注入紧凑的 `- [id] kinds=…` 行（若有已提取路径则附带 files），不含长片段。`off` 完全跳过注入，即使 `autoRecall` 仍为 `true`。搜索范围不变：只搜索当前 branch 中最新 user entry 之前的历史；自动召回不会扩大到其他 branch。
+
+自动召回不要求已发生压缩，因此 `full` 可能与当前上下文中的历史重复，并增加请求 token 用量。注入的 custom message 会带成本统计（`chars`、`hitCount`、`estimatedTokens`、`mode`、`sameTurnInjectionCount`），`details` 不复制原文。同一 turn 的后续 provider 请求会复用缓存文本并增加 `sameTurnInjectionCount`；若请求中已有自动召回消息，则不再重复注入。召回内容会发送给当前模型提供方，可能包含原始工具输出或其他敏感文本；`raw` 不做脱敏，`scope:all` 还会包含其他分支的匹配记录。
 
 ## 压缩与数据边界
 
@@ -228,8 +232,8 @@ pi install -l /absolute/path/to/pi-compact
 
 1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界。
 2. 将边界之前的原始 entries 转换成带 ID 的记录。
-3. 按用户消息、assistant 消息、工具调用、工具结果、命令和其他 session context 生成 checkpoint。
-4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId` 和 `omittedRecordCount` 等 details。
+3. 生成 checkpoint：先按原始 entry 顺序写出 `## Timeline`（`sourceOrdinal`），再保留现有分类区块（用户消息、assistant 消息、工具调用、工具结果、命令和其他 session context）。Timeline 与分类区块共用字符预算和省略计数。
+4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars` 和 `estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）等 details。压缩结果同时设置 `estimatedTokensAfter`，不会伪造计费 `usage`。
 5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；不安全或已中止的接管请求返回 `{ cancel: true }`，不落回默认 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
 
 原始 session entries 才是事实来源。checkpoint 会折叠空白、截短长记录，并在预算不足时省略记录；它不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。

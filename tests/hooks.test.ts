@@ -41,6 +41,20 @@ test("配置初始化会递归创建项目级 .pi 配置", () => {
       recallMaxResults: 30,
       recallMaxChars: 20_000,
     });
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify({ autoRecall: false }));
+    assert.equal(loadConfig(cwd).autoRecall, false);
+    assert.equal(loadConfig(cwd).autoRecallMode, "off");
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify({ autoRecallMode: "hint" }));
+    assert.equal(loadConfig(cwd).autoRecallMode, "hint");
+    assert.equal(loadConfig(cwd).autoRecall, true);
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify({ autoRecall: false, autoRecallMode: "full" }));
+    assert.equal(loadConfig(cwd).autoRecallMode, "full");
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify({ autoRecall: true, autoRecallMode: "off" }));
+    assert.equal(loadConfig(cwd).autoRecallMode, "off");
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify({ autoRecallMode: "nope", autoRecall: false }));
+    assert.equal(loadConfig(cwd).autoRecallMode, "off");
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify({ autoRecallMode: "after-compact" }));
+    assert.equal(loadConfig(cwd).autoRecallMode, "full");
     scaffoldConfig(cwd);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -86,6 +100,13 @@ test("session_before_compact 使用 Pi 边界并支持 manual、threshold、over
       assert.equal(result.compaction.firstKeptEntryId, "a1");
       assert.equal(result.compaction.details.reason, reason);
       assert.deepEqual(result.compaction.details.sourceEntryIds, ["u1"]);
+      assert.equal(result.compaction.details.checkpointChars, result.compaction.summary.length);
+      assert.equal(result.compaction.details.summaryMaxChars, DEFAULT_CONFIG.summaryMaxChars);
+      assert.equal(result.compaction.estimatedTokensAfter, Math.ceil(result.compaction.summary.length / 4));
+      assert.equal(result.compaction.details.estimatedTokensAfter, result.compaction.estimatedTokensAfter);
+      assert.equal(result.compaction.details.version, 1);
+      assert.equal("usage" in result.compaction, false);
+      assert.match(result.compaction.summary, /## Timeline/);
     }
     const aborted = await handler({
       reason: "manual",
@@ -155,6 +176,12 @@ test("自动召回只修改当前请求消息，不写入 session，并可避免
     assert.equal(first.messages[1].customType, "pi-compact-auto-recall");
     assert.match(first.messages[1].content, /old-user|old-assistant/);
     assert.equal(entries.length, 3);
+    assert.equal(first.messages[1].details.chars, first.messages[1].content.length);
+    assert.equal(first.messages[1].details.hitCount, first.messages[1].details.entryIds.length);
+    assert.equal(first.messages[1].details.mode, "full");
+    assert.equal(first.messages[1].details.sameTurnInjectionCount, 1);
+    assert.equal(first.messages[1].details.estimatedTokens, Math.ceil(first.messages[1].content.length / 4));
+    assert.ok(first.messages[1].details.hitCount > 0);
 
     const repeatedRequest = handler({
       type: "context",
@@ -162,6 +189,7 @@ test("自动召回只修改当前请求消息，不写入 session，并可避免
     }, ctx);
     assert.equal(repeatedRequest.messages.length, 2);
     assert.equal(repeatedRequest.messages[1].content, first.messages[1].content);
+    assert.equal(repeatedRequest.messages[1].details.sameTurnInjectionCount, 2);
 
     const second = handler({ type: "context", messages: first.messages }, ctx);
     assert.equal(second, undefined);
@@ -180,5 +208,40 @@ test("自动召回只修改当前请求消息，不写入 session，并可避免
     }, ctx), undefined);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("自动召回 hint 模式只注入短提示，off 模式不注入", () => {
+  const hintHarness = createHarness();
+  const offHarness = createHarness();
+  try {
+    writeFileSync(join(hintHarness.cwd, ".pi", "pi-compact.json"), `${JSON.stringify({ ...DEFAULT_CONFIG, autoRecallMode: "hint" })}\n`);
+    writeFileSync(join(offHarness.cwd, ".pi", "pi-compact.json"), `${JSON.stringify({ ...DEFAULT_CONFIG, autoRecall: true, autoRecallMode: "off" })}\n`);
+    registerHooks(hintHarness.pi as any);
+    registerHooks(offHarness.pi as any);
+    const entries = [
+      messageEntry("old-user", "user", "修复 token 刷新"),
+      messageEntry("old-assistant", "assistant", "已定位 src/auth.ts", "old-user"),
+      messageEntry("current-user", "user", "请继续 token 刷新", "old-assistant"),
+    ];
+    const sessionManager = { getEntries: () => entries, getBranch: () => entries };
+    const hint = hintHarness.handlers.get("context")![0]({
+      type: "context",
+      messages: [{ role: "user", content: "请继续 token 刷新" }],
+    }, { cwd: hintHarness.cwd, sessionManager });
+    assert.equal(hint.messages[1].customType, "pi-compact-auto-recall");
+    assert.equal(hint.messages[1].details.mode, "hint");
+    assert.match(hint.messages[1].content, /kinds=user/);
+    assert.match(hint.messages[1].content, /short hints/);
+    assert.equal(hint.messages[1].content.includes("已定位 src/auth.ts"), false);
+
+    const off = offHarness.handlers.get("context")![0]({
+      type: "context",
+      messages: [{ role: "user", content: "请继续 token 刷新" }],
+    }, { cwd: offHarness.cwd, sessionManager });
+    assert.equal(off, undefined);
+  } finally {
+    rmSync(hintHarness.cwd, { recursive: true, force: true });
+    rmSync(offHarness.cwd, { recursive: true, force: true });
   }
 });

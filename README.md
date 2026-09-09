@@ -109,6 +109,7 @@ Default config:
   "overrideDefaultCompaction": true,
   "summaryMaxChars": 12000,
   "autoRecall": true,
+  "autoRecallMode": "full",
   "autoRecallMaxChars": 5000,
   "recallMaxResults": 8,
   "recallMaxChars": 16000,
@@ -123,11 +124,12 @@ Config fields:
 | `enabled` | `true` | Enables compaction takeover and auto recall; does not unregister the manual commands or recall tool |
 | `overrideDefaultCompaction` | `true` | Whether to take over Pi's normal compaction; when disabled, the default compaction is kept |
 | `summaryMaxChars` | `12000` | Maximum character count of the deterministic checkpoint text |
-| `autoRecall` | `true` | Whether to recall history before provider requests |
+| `autoRecall` | `true` | Compatibility flag. Ignored when `autoRecallMode` is set; if the mode is unset, `false` maps to `off`, otherwise `full` |
+| `autoRecallMode` | `full` | Auto-recall mode: `full` (current full snippets), `hint` (short ID/kind lines), or `off` (disabled). A valid mode wins over `autoRecall` |
 | `autoRecallMaxChars` | `5000` | Maximum character count of a single auto-recall payload |
 | `recallMaxResults` | `8` | Maximum number of records returned by auto recall |
-| `recallMaxChars` | `16000` | Maximum character count of manual recall output |
-| `debug` | `false` | Whether to print extension debug logs |
+| `recallMaxChars` | `16000` | Maximum character count of manual recall output; a single `raw` entry ID is returned as complete JSON even if it exceeds this budget |
+| `debug` | `false` | Whether to print extension debug logs (counts and character totals only; never original text) |
 
 Numeric fields must be positive safe integers. The caps for `summaryMaxChars`, `autoRecallMaxChars`, `recallMaxResults`, and `recallMaxChars` are `100000`, `50000`, `30`, and `100000` respectively; legal values above a cap are clamped, invalid values fall back to defaults, and unknown fields are ignored. Char budgets are not token budgets.
 
@@ -203,11 +205,11 @@ The model can call it directly:
 
 Available fields mirror the `/pi-compact-recall` arguments: `query`, `entryIds`, `file`, `kind`, `scope`, `page`, `limit`, and `raw`.
 
-With `raw: true`, the output is the JSON text of the original session entries, including whatever tool arguments, tool output, timestamps, and parent/child entry relationships the entry holds. The output is still limited by `recallMaxChars`, so very long entries may be truncated and might not even be fully parseable JSON; pagination divides records, not the content of a single entry. Reduce `limit` or raise the char budget; content that exceeds the cap must be read from Pi's original session files.
+With `raw: true` and a single entry ID, the output is the complete JSON of that original session entry, including whatever tool arguments, tool output, timestamps, and parent/child entry relationships the entry holds. That single-entry JSON is not sliced, even if it exceeds `recallMaxChars`; if serialization fails, the tool returns a structured error object instead of truncated JSON. With `raw: true` and multiple hits, only complete entries that fit the character budget are included, followed by an `omitted entry IDs` note; JSON is never cut in the middle. Keyword and pretty (non-raw) output is still limited by `recallMaxChars`. Pagination divides records, not the content of a single entry. For a single raw entry ID, the default result `limit` of 8 is ignored so the requested ID is not dropped.
 
 ## Auto-recall behavior
 
-Auto recall is on by default and triggers only when:
+Auto recall defaults to `full` (the current full-snippet injection) and is gated by `enabled && autoRecallMode !== "off"`. It triggers only when:
 
 - The latest user text of the current request, trimmed, is at least 3 characters long.
 - The current session provides a valid active branch.
@@ -218,7 +220,9 @@ Auto recall only modifies the current provider request's messages; it does not w
 
 If the branch query fails, no valid user entry exists, or nothing matches, the extension silently skips auto recall. Manual recall does not expand to the whole session when the active lineage is unavailable either; only an explicit `scope:all` searches across branches.
 
-Auto recall does not require a prior compaction, so it may duplicate history already present in context and adds to request token usage. Recall content is sent to the current model provider and may contain raw tool output or other sensitive text; `raw` does not redact anything, and `scope:all` also includes matching records from other branches.
+`full` injects clipped snippets of matched records. `hint` injects only compact `- [id] kinds=…` lines (plus extracted file paths when present) without the long snippets. `off` skips injection entirely, including when `autoRecall` is still `true`. Search scope is unchanged: only history before the latest user entry on the current branch; auto recall never widens to other branches.
+
+Auto recall does not require a prior compaction, so `full` may duplicate history already present in context and adds to request token usage. Injected custom messages include cost stats (`chars`, `hitCount`, `estimatedTokens`, `mode`, `sameTurnInjectionCount`) without copying original entry bodies into `details`. Same-turn provider retries reuse the cached recall text and increment `sameTurnInjectionCount`; if an auto-recall message is already in the request, it is not injected again. Recall content is sent to the current model provider and may contain raw tool output or other sensitive text; `raw` does not redact anything, and `scope:all` also includes matching records from other branches.
 
 ## Compaction and data boundaries
 
@@ -228,8 +232,8 @@ During compaction:
 
 1. Uses Pi's `firstKeptEntryId` as the retained boundary.
 2. Converts original entries before the boundary into records with IDs.
-3. Generates a checkpoint grouped by user messages, assistant messages, tool calls, tool results, commands, and other session context.
-4. Stores details such as `sourceEntryIds`, `sourceHash`, `sourceRecordCount`, `keptEntryId`, and `omittedRecordCount`.
+3. Generates a checkpoint that starts with a chronological `## Timeline` (original entry order via `sourceOrdinal`), then keeps the existing groups: user messages, assistant messages, tool calls, tool results, commands, and other session context. Timeline and groups share the same character budget and omitted-line count.
+4. Stores details such as `sourceEntryIds`, `sourceHash`, `sourceRecordCount`, `keptEntryId`, `omittedRecordCount`, `checkpointChars`, `summaryMaxChars`, and `estimatedTokensAfter` (character count / 4, rounded up; not provider usage). The compaction result also sets `estimatedTokensAfter` and does not invent billed `usage`.
 5. Validates the boundary relationships of tool calls and results, and the pairing order in the retained tail; unsafe or already-aborted takeover requests return `{ cancel: true }` and do not fall back to the default LLM summary. Pi's `error` and `aborted` terminal assistant states allow tool calls without results; this does not apply to ordinary incomplete calls.
 
 Original session entries remain the source of truth. The checkpoint collapses whitespace, truncates long records, and omits records when the budget runs out; it is not a backup of the raw text and does not verify whether statements in history are correct. Non-text content such as images shows only placeholder information in the text extraction.

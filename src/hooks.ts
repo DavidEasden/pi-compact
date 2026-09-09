@@ -1,9 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
-import { clip, messageText, toolCallIds } from "./core/content.ts";
+import { clip, estimateTokensFromChars, messageText, toolCallIds } from "./core/content.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
 import { recordsFromEntries, searchRecords } from "./core/session.ts";
-import type { SessionEntryLike } from "./types.ts";
+import type { AutoRecallMode, SessionEntryLike } from "./types.ts";
 
 export const AUTO_RECALL_TYPE = "pi-compact-auto-recall";
 
@@ -122,9 +122,21 @@ const latestUser = (messages: any[]): { text: string } => {
   return { text: "" };
 };
 
-const renderRecall = (hits: ReturnType<typeof searchRecords>, maxChars: number): string => {
-  const lines = ["[pi-compact automatic exact-history recall]", "Matched original session records (not an LLM summary):"];
-  for (const hit of hits) lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")} ${clip(hit.snippet, 650)}`);
+const renderRecall = (hits: ReturnType<typeof searchRecords>, maxChars: number, mode: AutoRecallMode): string => {
+  const lines = [
+    "[pi-compact automatic exact-history recall]",
+    mode === "hint"
+      ? "Matched original session records (short hints, not an LLM summary):"
+      : "Matched original session records (not an LLM summary):",
+  ];
+  for (const hit of hits) {
+    if (mode === "hint") {
+      const files = hit.files.length > 0 ? ` files=${hit.files.join(",")}` : "";
+      lines.push(`- [${hit.entryId}] kinds=${hit.kinds.join(",")}${files}`);
+      continue;
+    }
+    lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")} ${clip(hit.snippet, 650)}`);
+  }
   return lines.join("\n").slice(0, maxChars);
 };
 
@@ -132,6 +144,7 @@ interface AutoRecallCache {
   key: string;
   content: string;
   entryIds: string[];
+  injectionCount: number;
 }
 
 export const registerHooks = (pi: ExtensionAPI): void => {
@@ -152,12 +165,15 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const cutIndex = branch.findIndex((entry: any) => entry.id === keptEntryId);
     const records = recordsFromEntries(branch.slice(0, cutIndex));
     const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
-    const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted);
-    if (config.debug) console.log(`[pi-compact] ${event.reason}: ${records.length} source records, kept=${keptEntryId}`);
+    const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars);
+    if (config.debug) {
+      console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);
+    }
     return { compaction: {
       summary: ledger.text,
       firstKeptEntryId: keptEntryId,
       tokensBefore: event.preparation.tokensBefore,
+      estimatedTokensAfter: details.estimatedTokensAfter,
       details,
     } };
   });
@@ -165,7 +181,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
   // `context` 只修改当前 provider 请求；Pi 不会把返回的 custom message 持久化为 session entry。
   pi.on("context", (event: any, ctx: any) => {
     const config = loadConfig(ctx.cwd);
-    if (!config.enabled || !config.autoRecall) return;
+    if (!config.enabled || config.autoRecallMode === "off") return;
     if (event.messages.some((message: any) => message.customType === AUTO_RECALL_TYPE)) return;
     const current = latestUser(event.messages);
     if (current.text.trim().length < 3) return;
@@ -188,23 +204,37 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const latestUserId = latestUserIndex >= 0 ? currentBranch[latestUserIndex]?.id : undefined;
     if (typeof latestUserId !== "string") return;
 
-    const cacheKey = `${latestUserId}\u0000${current.text}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}`;
+    const cacheKey = `${latestUserId}\u0000${current.text}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}\u0000${config.autoRecallMode}`;
     if (autoRecallCache?.key !== cacheKey) {
       // 只搜索当前 user entry 之前的历史，避免同一 turn 重复请求混入刚生成的工具结果。
       const historyEntries = currentBranch.slice(0, latestUserIndex);
       const records = recordsFromEntries(historyEntries);
       const hits = searchRecords(records, current.text, { maxResults: config.recallMaxResults });
       autoRecallCache = hits.length === 0
-        ? { key: cacheKey, content: "", entryIds: [] }
-        : { key: cacheKey, content: renderRecall(hits, config.autoRecallMaxChars), entryIds: hits.map((hit) => hit.entryId) };
+        ? { key: cacheKey, content: "", entryIds: [], injectionCount: 0 }
+        : { key: cacheKey, content: renderRecall(hits, config.autoRecallMaxChars, config.autoRecallMode), entryIds: hits.map((hit) => hit.entryId), injectionCount: 0 };
     }
     if (!autoRecallCache.content) return;
+    autoRecallCache.injectionCount += 1;
+    const chars = autoRecallCache.content.length;
+    const estimatedTokens = estimateTokensFromChars(chars);
+    if (config.debug) {
+      console.log(`[pi-compact] auto-recall: hitCount=${autoRecallCache.entryIds.length} chars=${chars} mode=${config.autoRecallMode} sameTurnInjectionCount=${autoRecallCache.injectionCount} estimatedTokens=${estimatedTokens}`);
+    }
     return { messages: [...event.messages, {
       role: "custom",
       customType: AUTO_RECALL_TYPE,
       content: autoRecallCache.content,
       display: false,
-      details: { source: "request-context", entryIds: autoRecallCache.entryIds },
+      details: {
+        source: "request-context",
+        entryIds: autoRecallCache.entryIds,
+        chars,
+        hitCount: autoRecallCache.entryIds.length,
+        estimatedTokens,
+        mode: config.autoRecallMode,
+        sameTurnInjectionCount: autoRecallCache.injectionCount,
+      },
     }] };
   });
 
