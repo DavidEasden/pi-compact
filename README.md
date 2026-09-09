@@ -20,9 +20,41 @@ A deterministic session-compaction and exact-history-recall extension for [Pi](h
 
 ## Installation
 
-Pi must already be installed; the verified version is `0.85.1`, which requires Node.js `>=22.19.0`. The instructions below install from the local source tree and do not assume this package has been published to npm.
+Pi must already be installed; the verified version is `0.85.1`, which requires Node.js `>=22.19.0`. The instructions below assume you have pushed this repository to GitHub; replace `<your-user>` with your GitHub username and keep `pi-compact` as the repository name (or change it to match your actual repository).
 
 Pi packages execute extension code, so review the source before installing.
+
+### Install from GitHub
+
+Pin to a release tag (recommended — pinned refs are not moved by `pi update --extensions` or `pi update --all`):
+
+```bash
+pi install git:github.com/<your-user>/pi-compact@v0.1.0
+```
+
+Or track the default branch without pinning:
+
+```bash
+pi install git:github.com/<your-user>/pi-compact
+```
+
+SSH shorthand and raw HTTPS URLs work too:
+
+```bash
+pi install git:git@github.com:<your-user>/pi-compact@v0.1.0
+pi install https://github.com/<your-user>/pi-compact@v0.1.0
+```
+
+Notes:
+
+- The `git:` prefix enables `host/user/repo` and `git@host:user/repo` shorthands; without it, only protocol URLs (`https://`, `http://`, `ssh://`, `git://`) are accepted.
+- `v0.1.0` must be an existing tag or commit (create and push it once with `git tag v0.1.0 && git push origin v0.1.0`). To move to a newer tag later, re-run `pi install git:github.com/<your-user>/pi-compact@<new-tag>`.
+- Global installs are cloned to `~/.pi/agent/git/github.com/<your-user>/pi-compact`; with `-l` (project settings), the clone lives at `.pi/git/github.com/<your-user>/pi-compact` and the project auto-installs any missing packages on startup after being trusted.
+- Try the package without installing it:
+
+```bash
+pi -e git:github.com/<your-user>/pi-compact
+```
 
 ### Try locally
 
