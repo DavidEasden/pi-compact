@@ -1,80 +1,99 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import type { SessionRecord, HistoryRecord, RecallScope, SearchHit } from "../types.ts";
-import { normalizeMessage, normalizeQueryTerms, clip } from "./content.ts";
+import type { HistoryRecord, MessageLike, SearchHit, SessionEntryLike } from "../types.ts";
+import { messageFiles, messageKinds, messageText, queryTerms, toolCallIds } from "./content.ts";
 
-export const readSessionRecords = (sessionFile: string): SessionRecord[] => {
-  let text: string;
-  try {
-    text = readFileSync(sessionFile, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
+const entryMessage = (entry: SessionEntryLike): MessageLike | undefined => {
+  if (entry.type === "message" && entry.message) return entry.message as MessageLike;
+  if (entry.type === "custom_message") {
+    return { role: "custom", customType: String(entry.customType ?? "custom"), content: entry.content };
   }
-  const records: SessionRecord[] = [];
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    try { records.push(JSON.parse(line) as SessionRecord); } catch { /* 损坏的行不影响其余历史 */ }
+  if (entry.type === "branch_summary" && typeof entry.summary === "string") {
+    return { role: "custom", customType: "branch_summary", content: entry.summary };
   }
-  return records;
+  if (entry.type === "compaction" && typeof entry.summary === "string") {
+    return { role: "custom", customType: "compaction", content: entry.summary };
+  }
+  return undefined;
 };
 
-export const activeEntryIds = (sessionManager: any): Set<string> => {
-  try {
-    const branch = sessionManager.getBranch?.() ?? [];
-    const ids = new Set(branch.map((entry: any) => entry.id).filter(Boolean));
-    if (ids.size > 0) return ids;
-  } catch { /* 使用全量 fallback */ }
-  try {
-    return new Set((sessionManager.getEntries?.() ?? []).map((entry: any) => entry.id).filter(Boolean));
-  } catch {
-    return new Set();
-  }
+export const entryToRecord = (entry: SessionEntryLike, sourceOrdinal: number): HistoryRecord | undefined => {
+  if (!entry.id) return undefined;
+  const message = entryMessage(entry);
+  if (!message) return undefined;
+  return {
+    entryId: entry.id,
+    parentId: entry.parentId,
+    timestamp: entry.timestamp,
+    kinds: messageKinds(message) as HistoryRecord["kinds"],
+    text: messageText(message),
+    files: messageFiles(message),
+    toolCallIds: toolCallIds(message),
+    sourceOrdinal,
+    raw: entry,
+  };
 };
 
-export const historyRecords = (records: SessionRecord[], allowedIds?: Set<string>): HistoryRecord[] => {
+export const recordsFromEntries = (entries: SessionEntryLike[], allowedIds?: Set<string>): HistoryRecord[] => {
   const result: HistoryRecord[] = [];
-  let messageIndex = 0;
-  for (const record of records) {
-    if (record.type !== "message" || !record.message || !record.id) continue;
-    const sourceIndex = messageIndex++;
-    if (allowedIds && allowedIds.size > 0 && !allowedIds.has(record.id)) continue;
-    result.push(...normalizeMessage(record.message, record.id, sourceIndex, record.timestamp));
+  let ordinal = 0;
+  for (const entry of entries) {
+    const record = entryToRecord(entry, ordinal);
+    if (!record) continue;
+    ordinal++;
+    if (allowedIds && !allowedIds.has(record.entryId)) continue;
+    result.push(record);
   }
   return result;
 };
 
-export const sourceHash = (records: HistoryRecord[]): string => {
-  const value = records.map(({ entryId, kind, text, toolName, files }) => ({ entryId, kind, text, toolName, files }));
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-};
-
-const safeRegex = (query: string): RegExp | null => {
-  try { return new RegExp(query, "i"); } catch { return null; }
-};
-
-export const searchHistory = (records: HistoryRecord[], query: string, options: { kind?: string; file?: string; maxResults?: number } = {}): SearchHit[] => {
-  const terms = normalizeQueryTerms(query);
-  const regex = /[|()[\]{}*+?^$\\]/.test(query) ? safeRegex(query) : null;
-  const maxResults = options.maxResults ?? 8;
-  const hits: SearchHit[] = [];
-  for (const record of records) {
-    if (options.kind && record.kind !== options.kind) continue;
-    if (options.file && !record.files.some((file) => file.includes(options.file!))) continue;
-    const haystack = `${record.text}\n${record.files.join(" ")}\n${record.toolName ?? ""}`;
-    const lower = haystack.toLowerCase();
-    const matched = regex ? regex.test(haystack) : terms.length > 0 && terms.some((term) => lower.includes(term));
-    if (!matched) continue;
-    const score = regex ? 1 : terms.reduce((sum, term) => sum + (lower.includes(term) ? (term.includes("/") || term.length > 7 ? 3 : 1) : 0), 0);
-    const firstTerm = terms.find((term) => lower.includes(term));
-    const position = firstTerm ? lower.indexOf(firstTerm) : 0;
-    const start = Math.max(0, position - 120);
-    hits.push({ ...record, score, snippet: clip(haystack.slice(start, start + 500), 500) });
+export const activeEntryIds = (sessionManager: any): Set<string> => {
+  try {
+    const branch = sessionManager.getBranch?.();
+    if (!Array.isArray(branch)) return new Set<string>();
+    return new Set<string>(branch.map((entry: any) => entry.id).filter((id: unknown): id is string => typeof id === "string"));
+  } catch {
+    // 查询 active lineage 失败时宁可不召回，也不扩大到兄弟分支。
+    return new Set<string>();
   }
-  return hits.sort((a, b) => b.score - a.score || b.sourceIndex - a.sourceIndex).slice(0, maxResults);
 };
 
-export const parseEntryIds = (records: SessionRecord[], ids: string[]): HistoryRecord[] => {
-  const wanted = new Set(ids);
-  return historyRecords(records).filter((record) => wanted.has(record.entryId));
+const stableEntryProjection = (record: HistoryRecord) => ({
+  id: record.entryId,
+  parentId: record.parentId ?? null,
+  timestamp: record.timestamp ?? null,
+  raw: record.raw,
+});
+
+export const hashRecords = (records: HistoryRecord[]): string => createHash("sha256").update(JSON.stringify(records.map(stableEntryProjection))).digest("hex");
+
+export const searchRecords = (records: HistoryRecord[], query: string, options: { file?: string; kind?: string; maxResults?: number; page?: number } = {}): SearchHit[] => {
+  const terms = queryTerms(query);
+  if (terms.length === 0 && !options.file) return [];
+  const documentFrequency = new Map<string, number>();
+  const tokenSets = records.map((record) => new Set(queryTerms(`${record.text}\n${record.files.join(" ")}`)));
+  for (const tokens of tokenSets) for (const token of tokens) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+  const hits: SearchHit[] = [];
+  records.forEach((record) => {
+    if (options.file && !record.files.some((file) => file.includes(options.file!))) return;
+    if (options.kind && !record.kinds.includes(options.kind as any)) return;
+    const haystack = `${record.text}\n${record.files.join(" ")}`;
+    const lower = haystack.toLocaleLowerCase();
+    const matched = terms.filter((term) => lower.includes(term));
+    if (terms.length > 0 && matched.length === 0) return;
+    const score = matched.reduce((total, term) => total + 1 + 4 / (documentFrequency.get(term) ?? 1), 0) + (options.file ? 8 : 0);
+    const first = matched[0] ?? options.file ?? "";
+    const position = lower.indexOf(first.toLocaleLowerCase());
+    const start = Math.max(0, position - 180);
+    hits.push({ ...record, score, snippet: haystack.slice(start, start + 700) });
+  });
+  const page = Math.max(1, options.page ?? 1);
+  const size = Math.max(1, options.maxResults ?? 8);
+  return hits.sort((a, b) => b.score - a.score || b.sourceOrdinal - a.sourceOrdinal).slice((page - 1) * size, page * size);
 };
+
+export const recordsForEntryIds = (records: HistoryRecord[], ids: string[]): HistoryRecord[] => {
+  const wanted = new Set(ids);
+  return records.filter((record) => wanted.has(record.entryId));
+};
+
+export const rawEntryText = (record: HistoryRecord): string => JSON.stringify(record.raw, null, 2);

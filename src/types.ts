@@ -1,5 +1,3 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-
 export type CompactReason = "manual" | "threshold" | "overflow";
 export type RecallScope = "active-lineage" | "all";
 export type RecordKind = "user" | "assistant" | "tool_call" | "tool_result" | "bash" | "custom";
@@ -7,23 +5,24 @@ export type RecordKind = "user" | "assistant" | "tool_call" | "tool_result" | "b
 export interface PiCompactConfig {
   enabled: boolean;
   overrideDefaultCompaction: boolean;
-  keepRecentTokens: number;
   summaryMaxChars: number;
-  recentUserTurns: number;
   autoRecall: boolean;
   autoRecallMaxChars: number;
   recallMaxResults: number;
+  recallMaxChars: number;
   debug: boolean;
 }
 
 export interface HistoryRecord {
   entryId: string;
-  kind: RecordKind;
-  text: string;
-  toolName?: string;
-  files: string[];
+  parentId?: string | null;
   timestamp?: string;
-  sourceIndex: number;
+  kinds: RecordKind[];
+  text: string;
+  files: string[];
+  toolCallIds: string[];
+  sourceOrdinal: number;
+  raw: unknown;
 }
 
 export interface SearchHit extends HistoryRecord {
@@ -39,13 +38,28 @@ export interface CompactionDetails {
   sourceHash: string;
   sourceRecordCount: number;
   keptEntryId: string;
-  generatedAt: string;
+  omittedRecordCount: number;
 }
 
-export interface SessionRecord {
+export interface SessionEntryLike {
   id?: string;
+  parentId?: string | null;
   type?: string;
   timestamp?: string;
-  message?: AgentMessage;
+  message?: MessageLike;
+  [key: string]: unknown;
+}
+
+export interface MessageLike {
+  role?: string;
+  content?: unknown;
+  toolName?: string;
+  toolCallId?: string;
+  stopReason?: string;
+  command?: string;
+  output?: string;
+  exitCode?: number;
+  isError?: boolean;
+  customType?: string;
   [key: string]: unknown;
 }

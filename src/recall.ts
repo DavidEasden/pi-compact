@@ -2,69 +2,97 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { clip } from "./core/content.ts";
-import { activeEntryIds, historyRecords, parseEntryIds, readSessionRecords, searchHistory } from "./core/session.ts";
+import { activeEntryIds, rawEntryText, recordsForEntryIds, recordsFromEntries, searchRecords } from "./core/session.ts";
 
-export const formatHits = (hits: ReturnType<typeof searchHistory>, title = "pi-compact 历史召回"): string => {
-  if (hits.length === 0) return `${title}\n未找到匹配的历史记录。`;
-  return [title, ...hits.map((hit) => {
-    const files = hit.files.length > 0 ? `\n文件: ${hit.files.join(", ")}` : "";
-    return `\n[${hit.entryId}] ${hit.kind}${hit.toolName ? `:${hit.toolName}` : ""}${files}\n${clip(hit.text, 1400)}\n片段: ${clip(hit.snippet, 500)}`;
-  })].join("\n");
+interface RecallInput {
+  query?: string;
+  entryIds?: string[];
+  file?: string;
+  kind?: string;
+  scope?: "active-lineage" | "all";
+  page?: number;
+  limit?: number;
+  raw?: boolean;
+}
+
+export const formatHits = (hits: ReturnType<typeof searchRecords>, raw = false, maxChars = 16000): string => {
+  if (hits.length === 0) return "pi-compact recall: 未找到匹配的历史记录。";
+  const chunks = hits.map((hit) => raw
+    ? `[entry ${hit.entryId}]\n${rawEntryText(hit)}`
+    : `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`);
+  return `pi-compact recall (${hits.length} result(s))\n\n${chunks.join("\n\n")}`.slice(0, maxChars);
 };
 
-const parseArgs = (args: string): { query: string; file?: string; kind?: string; scope: "active-lineage" | "all"; ids?: string[] } => {
-  let query = args.trim();
-  let file: string | undefined;
-  let kind: string | undefined;
-  let scope: "active-lineage" | "all" = "active-lineage";
-  let ids: string[] | undefined;
-  const fileMatch = query.match(/(?:^|\s)file:([^\s]+)/i);
-  if (fileMatch) { file = fileMatch[1]; query = query.replace(fileMatch[0], " "); }
-  const kindMatch = query.match(/(?:^|\s)kind:(user|assistant|tool_call|tool_result|bash|custom)(?:\s|$)/i);
-  if (kindMatch) { kind = kindMatch[1]; query = query.replace(kindMatch[0], " "); }
-  const scopeMatch = query.match(/(?:^|\s)scope:(all|active-lineage)(?:\s|$)/i);
-  if (scopeMatch) { scope = scopeMatch[1] as "all" | "active-lineage"; query = query.replace(scopeMatch[0], " "); }
-  const idsMatch = query.match(/(?:^|\s)ids:([^\s]+)/i);
-  if (idsMatch) { ids = idsMatch[1].split(",").filter(Boolean); query = query.replace(idsMatch[0], " "); }
-  return { query: query.trim(), file, kind, scope, ids };
+const recallHits = (input: RecallInput, ctx: any) => {
+  const entries = ctx.sessionManager.getEntries?.() ?? [];
+  const allowed = input.scope === "all" ? undefined : activeEntryIds(ctx.sessionManager);
+  const records = recordsFromEntries(entries, allowed);
+  if (input.entryIds?.length) return recordsForEntryIds(records, input.entryIds).slice(0, input.limit ?? 8).map((record) => ({ ...record, score: 1, snippet: record.text }));
+  return searchRecords(records, input.query ?? "", {
+    file: input.file,
+    kind: input.kind,
+    page: input.page,
+    maxResults: input.limit ?? 8,
+  });
 };
 
-const getHits = (args: { query?: string; file?: string; kind?: string; scope?: "active-lineage" | "all"; entryIds?: string[] }, ctx: any) => {
-  const sessionFile = ctx.sessionManager.getSessionFile?.();
-  if (!sessionFile) return [];
-  const raw = readSessionRecords(sessionFile);
-  const allowed = args.scope === "all" ? undefined : activeEntryIds(ctx.sessionManager);
-  const records = historyRecords(raw, allowed);
-  if (args.entryIds && args.entryIds.length > 0) return parseEntryIds(raw, args.entryIds).slice(0, args.limit ?? 8).map((record) => ({ ...record, score: 1, snippet: clip(record.text, 500) }));
-  return searchHistory(records, args.query ?? "", { file: args.file, kind: args.kind, maxResults: args.limit ?? 8 });
+const parseCommand = (args: string): RecallInput => {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  const plain: string[] = [];
+  const result: RecallInput = {};
+  for (const token of tokens) {
+    const separator = token.indexOf(":");
+    if (separator <= 0) {
+      if (token.toLowerCase() === "raw") result.raw = true;
+      else plain.push(token);
+      continue;
+    }
+    const key = token.slice(0, separator).toLowerCase();
+    const value = token.slice(separator + 1);
+    if (key === "file") result.file = value;
+    else if (key === "kind") result.kind = value;
+    else if (key === "scope" && (value === "all" || value === "active-lineage")) result.scope = value;
+    else if (key === "ids") result.entryIds = value.split(",");
+    else if (key === "page") result.page = Math.max(1, Number(value) || 1);
+    else if (key === "limit") result.limit = Math.min(30, Math.max(1, Number(value) || 8));
+    else if (key === "raw" && value === "true") result.raw = true;
+    else plain.push(token);
+  }
+  result.query = plain.join(" ");
+  return result;
 };
 
 export const registerRecall = (pi: ExtensionAPI): void => {
   pi.registerTool({
     name: "pi_compact_recall",
-    label: "Recall Pi history",
-    description: "从未删除的 Pi session 原文中精确检索旧消息、工具调用、工具结果、命令和文件操作。不会调用 LLM 做二次摘要。",
+    label: "Recall Pi session history",
+    description: "从当前 Pi session 的原始 entries 精确恢复旧消息、工具调用、工具结果和命令。默认只搜索当前 branch；scope=all 搜索整个 session。",
+    promptSnippet: "按 entry ID、文件路径或关键词精确召回旧 session 原文",
+    promptGuidelines: ["使用 pi_compact_recall 恢复压缩前的具体历史细节，不要假设压缩 checkpoint 包含全部原文。"],
     parameters: Type.Object({
-      query: Type.Optional(Type.String({ description: "关键词或正则表达式" })),
+      query: Type.Optional(Type.String()),
       entryIds: Type.Optional(Type.Array(Type.String())),
       file: Type.Optional(Type.String()),
       kind: Type.Optional(Type.String()),
       scope: Type.Optional(Type.Union([Type.Literal("active-lineage"), Type.Literal("all")])),
+      page: Type.Optional(Type.Integer({ minimum: 1 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
+      raw: Type.Optional(Type.Boolean()),
     }),
-    async execute(_toolCallId: string, input: any, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
-      const hits = getHits(input, ctx);
-      return { content: [{ type: "text", text: formatHits(hits) }], details: { count: hits.length, source: "session-jsonl" } };
+    async execute(_toolCallId: string, input: RecallInput, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
+      const config = loadConfig(ctx.cwd);
+      const hits = recallHits(input, ctx);
+      return { content: [{ type: "text", text: formatHits(hits, input.raw === true, config.recallMaxChars) }], details: { source: "session-entries", count: hits.length } };
     },
   } as any);
 
   pi.registerCommand("pi-compact-recall", {
-    description: "从 Pi session 原文中精确召回历史细节",
+    description: "精确召回 Pi session 中的原始历史",
     handler: async (args: string, ctx: any) => {
-      const parsed = parseArgs(args);
-      const hits = getHits({ query: parsed.query, file: parsed.file, kind: parsed.kind, scope: parsed.scope, entryIds: parsed.ids }, ctx);
-      const text = formatHits(hits);
-      pi.sendMessage({ customType: "pi-compact-recall", content: text, display: true, details: { count: hits.length } }, { triggerTurn: true, deliverAs: "followUp" });
+      const input = parseCommand(args);
+      const config = loadConfig(ctx.cwd);
+      const hits = recallHits(input, ctx);
+      pi.sendMessage({ customType: "pi-compact-recall", content: formatHits(hits, input.raw === true, config.recallMaxChars), display: true, details: { count: hits.length } }, { triggerTurn: true, deliverAs: "followUp" });
     },
   });
 };
