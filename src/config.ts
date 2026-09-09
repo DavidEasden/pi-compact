@@ -1,24 +1,36 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { PiCompactConfig } from "./types.ts";
+import type { AutoRecallMode, PiCompactConfig } from "./types.ts";
 
 export const DEFAULT_CONFIG: PiCompactConfig = {
   enabled: true,
   overrideDefaultCompaction: true,
   summaryMaxChars: 12000,
   autoRecall: true,
+  autoRecallMode: "full",
   autoRecallMaxChars: 5000,
   recallMaxResults: 8,
   recallMaxChars: 16000,
   debug: false,
 };
 
+const AUTO_RECALL_MODES = new Set<AutoRecallMode>(["full", "hint", "off"]);
+
 const configPath = (cwd: string): string => join(cwd, ".pi", "pi-compact.json");
 
 const positiveInteger = (value: unknown, fallback: number, maximum: number): number => {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) return fallback;
   return Math.min(value, maximum);
+};
+
+const normalizeAutoRecallMode = (parsed: Record<string, unknown>): AutoRecallMode => {
+  // 合法 autoRecallMode 优先；未配置时 autoRecall === false 映射为 off，否则为 full。
+  if (typeof parsed.autoRecallMode === "string" && AUTO_RECALL_MODES.has(parsed.autoRecallMode as AutoRecallMode)) {
+    return parsed.autoRecallMode as AutoRecallMode;
+  }
+  if (parsed.autoRecall === false) return "off";
+  return DEFAULT_CONFIG.autoRecallMode;
 };
 
 const normalizeConfig = (value: unknown): PiCompactConfig => {
@@ -31,6 +43,7 @@ const normalizeConfig = (value: unknown): PiCompactConfig => {
       : DEFAULT_CONFIG.overrideDefaultCompaction,
     summaryMaxChars: positiveInteger(parsed.summaryMaxChars, DEFAULT_CONFIG.summaryMaxChars, 100_000),
     autoRecall: typeof parsed.autoRecall === "boolean" ? parsed.autoRecall : DEFAULT_CONFIG.autoRecall,
+    autoRecallMode: normalizeAutoRecallMode(parsed),
     autoRecallMaxChars: positiveInteger(parsed.autoRecallMaxChars, DEFAULT_CONFIG.autoRecallMaxChars, 50_000),
     recallMaxResults: positiveInteger(parsed.recallMaxResults, DEFAULT_CONFIG.recallMaxResults, 30),
     recallMaxChars: positiveInteger(parsed.recallMaxChars, DEFAULT_CONFIG.recallMaxChars, 100_000),

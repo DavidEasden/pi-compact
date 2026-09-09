@@ -15,19 +15,94 @@ interface RecallInput {
   raw?: boolean;
 }
 
-export const formatHits = (hits: ReturnType<typeof searchRecords>, raw = false, maxChars = 16000): string => {
-  if (hits.length === 0) return "pi-compact recall: 未找到匹配的历史记录。";
-  const chunks = hits.map((hit) => raw
-    ? `[entry ${hit.entryId}]\n${rawEntryText(hit)}`
-    : `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`);
-  return `pi-compact recall (${hits.length} result(s))\n\n${chunks.join("\n\n")}`.slice(0, maxChars);
+export interface FormattedHits {
+  text: string;
+  truncated: boolean;
+}
+
+const serializeRawEntry = (hit: ReturnType<typeof searchRecords>[number]): { entryId: string; body: string; ok: boolean } => {
+  try {
+    return { entryId: hit.entryId, body: rawEntryText(hit), ok: true };
+  } catch (error) {
+    return {
+      entryId: hit.entryId,
+      ok: false,
+      body: JSON.stringify({
+        error: "pi-compact recall: failed to serialize entry",
+        entryId: hit.entryId,
+        message: error instanceof Error ? error.message : String(error),
+      }, null, 2),
+    };
+  }
 };
+
+const omittedNote = (ids: string[]): string => (
+  ids.length === 0 ? "" : `\n\n(omitted entry IDs: ${ids.join(", ")}; use a single entry ID to retrieve full JSON)`
+);
+
+const formatRawHits = (hits: ReturnType<typeof searchRecords>, maxChars: number, allowOversizeSingle: boolean): FormattedHits => {
+  if (hits.length === 1 && allowOversizeSingle) {
+    // 按单个 entry ID 请求的 raw entry 必须返回完整 JSON，即使超过字符预算；禁止中途截断。
+    const serialized = serializeRawEntry(hits[0]);
+    return { text: serialized.body, truncated: !serialized.ok };
+  }
+
+  const blocks = hits.map((hit) => {
+    const serialized = serializeRawEntry(hit);
+    return { entryId: serialized.entryId, body: `[entry ${serialized.entryId}]\n${serialized.body}` };
+  });
+  const header = `pi-compact recall (${hits.length} result(s))\n\n`;
+  const parts: string[] = [];
+  for (let index = 0; index < blocks.length; index++) {
+    const afterIds = blocks.slice(index + 1).map((block) => block.entryId);
+    const candidate = header + [...parts, blocks[index].body].join("\n\n") + omittedNote(afterIds);
+    if (candidate.length <= maxChars) {
+      parts.push(blocks[index].body);
+      continue;
+    }
+    const omittedIds = blocks.slice(index).map((block) => block.entryId);
+    if (parts.length === 0) {
+      return {
+        text: `pi-compact recall (${hits.length} result(s); 0 included)\n\nNo complete raw entry fit in the ${maxChars}-char budget. Use a single entry ID to retrieve full JSON.\nomitted entry IDs: ${omittedIds.join(", ")}`,
+        truncated: true,
+      };
+    }
+    return { text: header + parts.join("\n\n") + omittedNote(omittedIds), truncated: true };
+  }
+  return { text: header + parts.join("\n\n"), truncated: false };
+};
+
+export const formatRecallOutput = (
+  hits: ReturnType<typeof searchRecords>,
+  raw = false,
+  maxChars = 16000,
+  allowOversizeSingleRaw = false,
+): FormattedHits => {
+  if (hits.length === 0) return { text: "pi-compact recall: 未找到匹配的历史记录。", truncated: false };
+  if (raw) return formatRawHits(hits, maxChars, allowOversizeSingleRaw);
+  const chunks = hits.map((hit) => `[entry ${hit.entryId}] kinds=${hit.kinds.join(",")} files=${hit.files.join(", ")}\n${clip(hit.text, 2000)}\nsource snippet: ${clip(hit.snippet, 600)}`);
+  const assembled = `pi-compact recall (${hits.length} result(s))\n\n${chunks.join("\n\n")}`;
+  const text = assembled.slice(0, maxChars);
+  return { text, truncated: text.length < assembled.length };
+};
+
+export const formatHits = (
+  hits: ReturnType<typeof searchRecords>,
+  raw = false,
+  maxChars = 16000,
+  allowOversizeSingleRaw = false,
+): string => formatRecallOutput(hits, raw, maxChars, allowOversizeSingleRaw).text;
 
 const recallHits = (input: RecallInput, ctx: any) => {
   const entries = ctx.sessionManager.getEntries?.() ?? [];
   const allowed = input.scope === "all" ? undefined : activeEntryIds(ctx.sessionManager);
   const records = recordsFromEntries(entries, allowed);
-  if (input.entryIds?.length) return recordsForEntryIds(records, input.entryIds).slice(0, input.limit ?? 8).map((record) => ({ ...record, score: 1, snippet: record.text }));
+  if (input.entryIds?.length) {
+    const matched = recordsForEntryIds(records, input.entryIds);
+    // 单个 raw entryId 忽略默认 limit，避免把请求的那一条截掉。
+    const limited = input.raw === true && input.entryIds.length === 1 ? matched : matched.slice(0, input.limit ?? 8);
+    return limited.map((record) => ({ ...record, score: 1, snippet: record.text }));
+  }
   return searchRecords(records, input.query ?? "", {
     file: input.file,
     kind: input.kind,
@@ -36,7 +111,7 @@ const recallHits = (input: RecallInput, ctx: any) => {
   });
 };
 
-const parseCommand = (args: string): RecallInput => {
+export const parseCommand = (args: string): RecallInput => {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const plain: string[] = [];
   const result: RecallInput = {};
@@ -82,7 +157,11 @@ export const registerRecall = (pi: ExtensionAPI): void => {
     async execute(_toolCallId: string, input: RecallInput, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
       const config = loadConfig(ctx.cwd);
       const hits = recallHits(input, ctx);
-      return { content: [{ type: "text", text: formatHits(hits, input.raw === true, config.recallMaxChars) }], details: { source: "session-entries", count: hits.length } };
+      const formatted = formatRecallOutput(hits, input.raw === true, config.recallMaxChars, input.raw === true && input.entryIds?.length === 1);
+      return {
+        content: [{ type: "text", text: formatted.text }],
+        details: { source: "session-entries", count: hits.length, chars: formatted.text.length, truncated: formatted.truncated },
+      };
     },
   } as any);
 
@@ -92,7 +171,13 @@ export const registerRecall = (pi: ExtensionAPI): void => {
       const input = parseCommand(args);
       const config = loadConfig(ctx.cwd);
       const hits = recallHits(input, ctx);
-      pi.sendMessage({ customType: "pi-compact-recall", content: formatHits(hits, input.raw === true, config.recallMaxChars), display: true, details: { count: hits.length } }, { triggerTurn: true, deliverAs: "followUp" });
+      const formatted = formatRecallOutput(hits, input.raw === true, config.recallMaxChars, input.raw === true && input.entryIds?.length === 1);
+      pi.sendMessage({
+        customType: "pi-compact-recall",
+        content: formatted.text,
+        display: true,
+        details: { count: hits.length, chars: formatted.text.length, truncated: formatted.truncated },
+      }, { triggerTurn: true, deliverAs: "followUp" });
     },
   });
 };
