@@ -1,73 +1,75 @@
 # pi-compact
 
-面向 [Pi](https://pi.dev/) 的确定性 session 压缩与精确历史召回扩展。
+> 中文版：[README.zh-CN.md](README.zh-CN.md)
 
-`pi-compact` 不调用 LLM 生成压缩摘要，而是从 Pi 原始 session entries 中提取可追溯的上下文记录，并保留 entry ID、文件路径、工具调用 ID、原始记录和源 hash。被压缩文本中未容纳的历史内容，可以通过召回工具或命令重新读取。
+A deterministic session-compaction and exact-history-recall extension for [Pi](https://pi.dev/).
 
-## 功能
+`pi-compact` does not call an LLM to generate compaction summaries. Instead, it extracts traceable context records from Pi's original session entries and preserves entry IDs, file paths, tool-call IDs, raw records, and source hashes. History that did not fit into the checkpoint text can be re-read through the recall tool or command.
 
-- 接管 Pi 普通的 `manual`、`threshold` 和 `overflow` compaction。
-- 使用 Pi 自己计算的压缩边界、token accounting、持久化和恢复流程。
-- 在压缩前检查工具调用与工具结果是否完整配对；发现不安全边界时取消本次接管，避免破坏上下文。
-- 生成确定性的事件 ledger，不把规则提取结果伪装成目标、决策或已完成任务。
-- 提取并搜索用户消息、assistant 消息、工具调用、工具结果、bash 命令和其他 session context。
-- 提供 `pi_compact_recall` 工具，支持 entry ID、关键词、文件路径、消息类型、分页和原始 entry 回放。
-- 提供 `/pi-compact-recall` 命令，将召回结果作为 follow-up turn 发送给模型。
-- 可选地根据当前 user 请求，在每次 provider 请求前自动召回当前 branch 中的旧记录。
-- 自动创建项目级 `.pi/pi-compact.json` 配置，不覆盖已有项目或全局配置。
+## Features
 
-## 安装
+- Takes over Pi's normal `manual`, `threshold`, and `overflow` compactions.
+- Reuses Pi's own boundary calculation, token accounting, persistence, and recovery flow.
+- Verifies that tool calls and tool results are fully paired before compacting; cancels the takeover on unsafe boundaries to avoid breaking context.
+- Produces a deterministic event ledger and does not disguise rule-extracted records as goals, decisions, or completed tasks.
+- Extracts and searches user messages, assistant messages, tool calls, tool results, bash commands, and other session context.
+- Provides the `pi_compact_recall` tool with entry-ID lookup, keyword search, file-path and kind filters, pagination, and raw-entry replay.
+- Provides the `/pi-compact-recall` command, which sends recall results to the model as a follow-up turn.
+- Optionally recalls old records from the current branch before every provider request, based on the current user request.
+- Automatically creates a project-level `.pi/pi-compact.json` config without overwriting existing project or global configs.
 
-需要已安装 Pi；当前验证版本为 `0.85.1`，该版本要求 Node.js `>=22.19.0`。以下使用本地源码安装，不假定本项目已发布到 npm。
+## Installation
 
-Pi package 会执行扩展代码，请在安装前审查源代码。
+Pi must already be installed; the verified version is `0.85.1`, which requires Node.js `>=22.19.0`. The instructions below install from the local source tree and do not assume this package has been published to npm.
 
-### 临时加载本地版本
+Pi packages execute extension code, so review the source before installing.
 
-在项目根目录执行：
+### Try locally
+
+Run from the project root:
 
 ```bash
 npm ci
 pi -e /absolute/path/to/pi-compact
 ```
 
-也可以直接指定入口文件：
+You can also point directly at the entry file:
 
 ```bash
 pi -e /absolute/path/to/pi-compact/index.ts
 ```
 
-### 安装本地 package
+### Install the local package
 
 ```bash
 pi install /absolute/path/to/pi-compact
 ```
 
-默认写入全局 Pi settings。使用 `-l` 可以写入当前项目的 `.pi/settings.json`：
+This writes to the global Pi settings by default. Use `-l` to write to the current project's `.pi/settings.json`:
 
 ```bash
 pi install -l /absolute/path/to/pi-compact
 ```
 
-当前项目使用 Pi 的 `@earendil-works/pi-coding-agent` API，并已按 Pi `0.85.1` 进行验证。Pi 和 `typebox` 是 peer dependencies，由 Pi 环境提供。
+The extension uses Pi's `@earendil-works/pi-coding-agent` API, verified against Pi `0.85.1`. Pi and `typebox` are peer dependencies provided by the Pi environment.
 
-## 配置
+## Configuration
 
-首次启动扩展时，如果项目中没有配置文件且用户目录中也没有全局配置，扩展会创建：
+On first startup, if there is no project config and no global config in the user directory, the extension creates:
 
 ```text
 .pi/pi-compact.json
 ```
 
-配置优先级为：
+Config lookup order:
 
-1. 当前项目的 `.pi/pi-compact.json`
-2. 全局的 `~/.pi/agent/pi-compact.json`
-3. 内置默认值
+1. Current project `.pi/pi-compact.json`
+2. Global `~/.pi/agent/pi-compact.json`
+3. Built-in defaults
 
-扩展使用第一个存在的配置文件，并以默认值补齐缺失字段；项目配置与全局配置不会逐字段合并。如果项目配置存在但 JSON 无法解析，扩展使用默认配置，不会继续读取全局配置。
+The extension uses the first existing config file and fills in missing fields with defaults; project and global configs are not merged field-by-field. If the project config exists but cannot be parsed as JSON, the extension falls back to the default config and does not read the global one.
 
-默认配置如下：
+Default config:
 
 ```json
 {
@@ -82,82 +84,82 @@ pi install -l /absolute/path/to/pi-compact
 }
 ```
 
-配置项说明：
+Config fields:
 
-| 配置项 | 默认值 | 说明 |
+| Field | Default | Description |
 | --- | ---: | --- |
-| `enabled` | `true` | 是否启用压缩接管和自动召回；不注销手动命令或召回工具 |
-| `overrideDefaultCompaction` | `true` | 是否接管 Pi 的普通 compaction；关闭后保留默认压缩 |
-| `summaryMaxChars` | `12000` | 确定性 checkpoint 文本的最大字符数 |
-| `autoRecall` | `true` | 是否在 provider 请求前自动召回历史 |
-| `autoRecallMaxChars` | `5000` | 单次自动召回文本的最大字符数 |
-| `recallMaxResults` | `8` | 自动召回最多返回的记录数 |
-| `recallMaxChars` | `16000` | 手动召回结果的最大字符数 |
-| `debug` | `false` | 是否输出扩展调试日志 |
+| `enabled` | `true` | Enables compaction takeover and auto recall; does not unregister the manual commands or recall tool |
+| `overrideDefaultCompaction` | `true` | Whether to take over Pi's normal compaction; when disabled, the default compaction is kept |
+| `summaryMaxChars` | `12000` | Maximum character count of the deterministic checkpoint text |
+| `autoRecall` | `true` | Whether to recall history before provider requests |
+| `autoRecallMaxChars` | `5000` | Maximum character count of a single auto-recall payload |
+| `recallMaxResults` | `8` | Maximum number of records returned by auto recall |
+| `recallMaxChars` | `16000` | Maximum character count of manual recall output |
+| `debug` | `false` | Whether to print extension debug logs |
 
-数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。
+Numeric fields must be positive safe integers. The caps for `summaryMaxChars`, `autoRecallMaxChars`, `recallMaxResults`, and `recallMaxChars` are `100000`, `50000`, `30`, and `100000` respectively; legal values above a cap are clamped, invalid values fall back to defaults, and unknown fields are ignored. Char budgets are not token budgets.
 
-自动压缩阈值和保留尾部大小仍由 Pi 自身的 compaction settings 控制，本扩展不另设触发阈值。
+The automatic compaction threshold and retained-tail size are still controlled by Pi's own compaction settings; this extension does not set its own trigger threshold.
 
-## 使用
+## Usage
 
-### 立即压缩
+### Compact now
 
-在 Pi 中执行：
+Run inside Pi:
 
 ```text
 /pi-compact
 ```
 
-该命令调用 Pi 原有的 `ctx.compact()` 流程。压缩完成或失败时，扩展会在 Pi UI 中通知结果。当 `enabled` 或 `overrideDefaultCompaction` 为 `false` 时，命令仍会触发 Pi 的压缩流程，但本扩展不再替换默认摘要。
+This command uses Pi's existing `ctx.compact()` flow. The extension notifies the Pi UI when compaction completes or fails. When `enabled` or `overrideDefaultCompaction` is `false`, the command still triggers Pi's compaction flow, but this extension no longer replaces the default summary.
 
-### 手动召回
+### Manual recall
 
-在 Pi 中执行：
+Run inside Pi:
 
 ```text
-/pi-compact-recall token 刷新
+/pi-compact-recall token refresh
 ```
 
-支持的参数形式：
+Supported argument forms:
 
 ```text
 /pi-compact-recall file:src/auth/session.ts
 /pi-compact-recall kind:tool_result timeout
 /pi-compact-recall ids:entry-123,entry-456 raw
-/pi-compact-recall scope:all 旧配置 page:2 limit:5
+/pi-compact-recall scope:all old config page:2 limit:5
 /pi-compact-recall raw:true file:src/auth.ts
 ```
 
-参数说明：
+Arguments:
 
-| 参数 | 说明 |
+| Argument | Description |
 | --- | --- |
-| 普通文本 | 按关键词搜索原始 session records |
-| `ids:id1,id2` | 按 entry ID 精确选择记录 |
-| `file:path` | 匹配记录中的文件路径 |
-| `kind:type` | 按 `user`、`assistant`、`tool_call`、`tool_result`、`bash` 或 `custom` 过滤 |
-| `scope:active-lineage` | 只搜索当前 branch，默认值 |
-| `scope:all` | 搜索整个 session，包括其他 branch |
-| `page:N` | 结果分页，从 1 开始 |
-| `limit:N` | 每页结果数，默认 8，范围为 1 到 30；不受 `recallMaxResults` 影响 |
-| `raw` 或 `raw:true` | 输出原始 session entry JSON |
+| Plain text | Searches original session records by keyword |
+| `ids:id1,id2` | Selects records exactly by entry ID |
+| `file:path` | Matches file paths extracted from records |
+| `kind:type` | Filters by `user`, `assistant`, `tool_call`, `tool_result`, `bash`, or `custom` |
+| `scope:active-lineage` | Searches only the current branch; the default |
+| `scope:all` | Searches the whole session, including other branches |
+| `page:N` | Result pagination, starting at 1 |
+| `limit:N` | Results per page, default 8, range 1 to 30; not affected by `recallMaxResults` |
+| `raw` or `raw:true` | Outputs the raw session entry JSON |
 
-示例中的 entry ID 是占位符，请使用 checkpoint 或召回结果中显示的真实 ID。
+Entry IDs in the examples are placeholders; use the real IDs shown by checkpoints or recall output.
 
-指定 `ids` 后，按 ID 选择记录并应用 `scope` 和 `limit`，忽略关键词、`file`、`kind` 和 `page`；结果按 session 原有顺序返回。未指定 ID 时，需要关键词或 `file`，空查询或仅指定 `kind` 不会列出全部历史。
+When `ids` is given, records are selected by ID and `scope` and `limit` apply, while the keyword, `file`, `kind`, and `page` are ignored; results are returned in original session order. Without `ids`, a keyword or `file` is required — an empty query or a `kind`-only query does not list the full history.
 
-关键词搜索是分词后的文本匹配，不支持正则表达式或语义检索；文件过滤仅匹配已提取的路径，不读取磁盘文件。路径主要来自工具参数和简单 bash 命令，消息正文中的路径不一定被索引。命令按空白拆分参数，不支持带空格路径的引号解析；这类路径可通过工具的 `file` 字段传入。
+Keyword search is tokenized text matching; it does not support regular expressions or semantic search. File filtering only matches already-extracted paths and never reads files from disk. Paths mainly come from tool arguments and simple bash commands; paths inside message bodies are not necessarily indexed. The command splits arguments on whitespace and does not parse quoted paths with spaces; pass such paths via the tool's `file` field instead.
 
-命令会把召回内容作为 follow-up turn 发送，触发模型继续处理，并进入正常 session 历史。
+The command sends recall content as a follow-up turn, which triggers the model to continue and enters the normal session history.
 
-### `pi_compact_recall` 工具
+### `pi_compact_recall` tool
 
-模型可以直接调用：
+The model can call it directly:
 
 ```json
 {
-  "query": "token 刷新",
+  "query": "token refresh",
   "file": "src/auth/session.ts",
   "kind": "tool_call",
   "scope": "active-lineage",
@@ -167,97 +169,97 @@ pi install -l /absolute/path/to/pi-compact
 }
 ```
 
-可用字段与 `/pi-compact-recall` 参数对应：`query`、`entryIds`、`file`、`kind`、`scope`、`page`、`limit` 和 `raw`。
+Available fields mirror the `/pi-compact-recall` arguments: `query`, `entryIds`, `file`, `kind`, `scope`, `page`, `limit`, and `raw`.
 
-使用 `raw: true` 时，输出原始 session entry 的 JSON 文本，包含该 entry 存有的工具参数、工具输出、时间戳和父子 entry 关系。但结果仍受 `recallMaxChars` 限制，超长输出会被截断，甚至可能不是完整可解析的 JSON；分页只划分记录，不划分单条 entry 内容。可缩小 `limit` 或提高字符预算；超过预算上限的完整内容需从 Pi 原始 session 文件读取。
+With `raw: true`, the output is the JSON text of the original session entries, including whatever tool arguments, tool output, timestamps, and parent/child entry relationships the entry holds. The output is still limited by `recallMaxChars`, so very long entries may be truncated and might not even be fully parseable JSON; pagination divides records, not the content of a single entry. Reduce `limit` or raise the char budget; content that exceeds the cap must be read from Pi's original session files.
 
-## 自动召回行为
+## Auto-recall behavior
 
-自动召回默认开启，满足以下条件时生效：
+Auto recall is on by default and triggers only when:
 
-- 当前请求的最新 user 文本去除首尾空白后，长度至少为 3。
-- 当前 session 可以取得有效的 active branch。
-- 当前 branch 中存在带有效 ID 的 user entry。
-- 当前 user entry 之前的历史记录中存在匹配结果。
+- The latest user text of the current request, trimmed, is at least 3 characters long.
+- The current session provides a valid active branch.
+- The current branch contains a user entry with a valid ID.
+- The history before that user entry contains matching records.
 
-自动召回只修改当前 provider 请求的 messages，不写入 session，也不会生成新的 session entry。同一 user turn 的多次 provider 请求会复用召回结果；新的 user entry 会重新计算。当前 turn 新产生的工具结果不会被混入该 turn 的自动召回范围。
+Auto recall only modifies the current provider request's messages; it does not write to the session and does not create a session entry. Multiple provider requests in the same user turn reuse the recall result; a new user entry recomputes it. Tool results produced during the current turn are not mixed into that turn's auto-recall scope.
 
-如果 branch 查询失败、没有合法 user entry 或没有命中，扩展会安静跳过自动召回。手动召回在无法取得 active lineage 时也不会扩大为整个 session；只有显式指定 `scope:all` 才跨 branch 检索。
+If the branch query fails, no valid user entry exists, or nothing matches, the extension silently skips auto recall. Manual recall does not expand to the whole session when the active lineage is unavailable either; only an explicit `scope:all` searches across branches.
 
-自动召回不要求已发生压缩，因此可能与当前上下文中的历史重复，并增加请求 token 用量。召回内容会发送给当前模型提供方，可能包含原始工具输出或其他敏感文本；`raw` 不做脱敏，`scope:all` 还会包含其他分支的匹配记录。
+Auto recall does not require a prior compaction, so it may duplicate history already present in context and adds to request token usage. Recall content is sent to the current model provider and may contain raw tool output or other sensitive text; `raw` does not redact anything, and `scope:all` also includes matching records from other branches.
 
-## 压缩与数据边界
+## Compaction and data boundaries
 
-`pi-compact` 只接管普通 compaction，暂不接管 Pi 的 `session_before_tree` 分支摘要。
+`pi-compact` takes over only normal compactions and does not yet take over Pi's `session_before_tree` branch summaries.
 
-压缩时：
+During compaction:
 
-1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界。
-2. 将边界之前的原始 entries 转换成带 ID 的记录。
-3. 按用户消息、assistant 消息、工具调用、工具结果、命令和其他 session context 生成 checkpoint。
-4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId` 和 `omittedRecordCount` 等 details。
-5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；不安全或已中止的接管请求返回 `{ cancel: true }`，不落回默认 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
+1. Uses Pi's `firstKeptEntryId` as the retained boundary.
+2. Converts original entries before the boundary into records with IDs.
+3. Generates a checkpoint grouped by user messages, assistant messages, tool calls, tool results, commands, and other session context.
+4. Stores details such as `sourceEntryIds`, `sourceHash`, `sourceRecordCount`, `keptEntryId`, and `omittedRecordCount`.
+5. Validates the boundary relationships of tool calls and results, and the pairing order in the retained tail; unsafe or already-aborted takeover requests return `{ cancel: true }` and do not fall back to the default LLM summary. Pi's `error` and `aborted` terminal assistant states allow tool calls without results; this does not apply to ordinary incomplete calls.
 
-原始 session entries 才是事实来源。checkpoint 会折叠空白、截短长记录，并在预算不足时省略记录；它不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。
+Original session entries remain the source of truth. The checkpoint collapses whitespace, truncates long records, and omits records when the budget runs out; it is not a backup of the raw text and does not verify whether statements in history are correct. Non-text content such as images shows only placeholder information in the text extraction.
 
-扩展不删除原始 session entries，也不建立独立备份；原文仍依赖 Pi 的 session 存储。保存原文和支持精确检索并不等于模型一定会自动召回所有相关细节，也不代表有限上下文能够同时展示全部历史。
+The extension does not delete original session entries and does not create a separate backup; the raw text still relies on Pi's session storage. Keeping the originals and supporting exact retrieval does not mean the model will automatically recall every relevant detail, nor that a finite context can display all history at once.
 
-## 开发
+## Development
 
-安装依赖：
+Install dependencies:
 
 ```bash
 npm ci
 ```
 
-运行测试：
+Run tests:
 
 ```bash
 npm test
 ```
 
-运行 TypeScript 类型检查：
+Run the TypeScript type check:
 
 ```bash
 npm run typecheck
 ```
 
-检查发布包内容：
+Inspect published contents:
 
 ```bash
 npm pack --dry-run
 ```
 
-运行源码的发布白名单为 `index.ts` 和 `src/`；npm 还会自动包含 `package.json` 和本 README。测试文件与 `tsconfig.json` 不会进入 package。
+The published allowlist is `index.ts` and `src/`; npm also automatically includes `package.json` and README files. Test files and `tsconfig.json` are not part of the package.
 
-## 项目结构
+## Project structure
 
 ```text
-index.ts                 Pi 扩展入口
-src/config.ts            配置读取、归一化和初始化
-src/command.ts           /pi-compact 命令
-src/hooks.ts             compaction、context 和 session hooks
-src/recall.ts            召回工具与 /pi-compact-recall 命令
-src/core/content.ts      消息文本、文件和工具调用提取
-src/core/ledger.ts       确定性 checkpoint 与 details
-src/core/session.ts      session entry 转换、搜索和原文回放
-src/types.ts             共享类型
-tests/                   单元测试
+index.ts                 Pi extension entry
+src/config.ts            Config loading, normalization, and scaffolding
+src/command.ts           /pi-compact command
+src/hooks.ts             Compaction, context, and session hooks
+src/recall.ts            Recall tool and /pi-compact-recall command
+src/core/content.ts      Message text, file, and tool-call extraction
+src/core/ledger.ts       Deterministic checkpoint and details
+src/core/session.ts      Session entry conversion, search, and raw replay
+src/types.ts             Shared types
+tests/                   Unit tests
 ```
 
-## 验证范围
+## Verification scope
 
-当前已验证：
+Verified so far:
 
-- 确定性记录提取、关键词和文件搜索、原始记录保留与 hash。
-- 工具调用与工具结果的压缩边界校验。
-- 配置初始化与非法配置归一化。
-- 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
-- 空 active lineage 不扩大搜索范围；自动召回的同轮复用、新 user 更新、去重和 branch 查询异常处理。
-- 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
+- Deterministic record extraction, keyword and file search, raw record preservation, and hashing.
+- Compaction boundary checks for tool calls and tool results.
+- Config scaffolding and normalization of invalid configs.
+- `manual`, `threshold`, and `overflow` compaction reasons plus aborted requests, via simulated hook events.
+- Empty active lineage does not widen the search; auto-recall same-turn reuse, new-user updates, deduplication, and branch-query error handling.
+- Clean dependency installation, TypeScript type checking, and real Pi CLI extension loading.
 
-尚未作为完整端到端场景验证：真实模型响应、overflow retry 的完整运行过程，以及跨 session 或 branch 切换下的长时间运行行为。
+Not yet verified as full end-to-end scenarios: real model responses, the complete overflow-retry run, and long-running behavior across session or branch switches.
 
-## 许可证
+## License
 
 MIT
