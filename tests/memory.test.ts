@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -165,33 +165,45 @@ for (let index = 0; index < 10; index++) {
   }
 });
 
-test("锁超时明确报错，残留/死亡进程锁可恢复且不永久阻塞", async () => {
+test("锁超时明确报错，死亡进程锁可恢复；无效 metadata 需人工清理", async () => {
   const cwd = tempCwd();
   const lockPath = `${memoryLogPath(cwd)}.lock`;
   try {
     mkdirSync(join(cwd, ".pi", "pi-compact"), { recursive: true });
-    // 无法解析的锁文件视为残留垃圾，自动恢复。
-    writeFileSync(lockPath, "not-json\n");
-    appendMemoryEvent(cwd, { type: "create", recordId: "mem_a", author: "user", payload: createPayload("alpha") });
-    assert.equal(existsSync(lockPath), false);
+    const previous = process.env.PI_COMPACT_LOCK_TIMEOUT_MS;
+    process.env.PI_COMPACT_LOCK_TIMEOUT_MS = "200";
+    try {
+      writeFileSync(lockPath, "not-json\n");
+      assert.throws(
+        () => appendMemoryEvent(cwd, { type: "create", recordId: "mem_blocked", author: "user", payload: createPayload("blocked") }),
+        /所有者 metadata 无法验证或锁仍被持有.*本次写入未完成/,
+      );
+      assert.equal(existsSync(lockPath), true);
+      assert.equal(existsSync(memoryLogPath(cwd)), false);
+      unlinkSync(lockPath);
+      appendMemoryEvent(cwd, { type: "create", recordId: "mem_a", author: "user", payload: createPayload("alpha") });
+      assert.equal(existsSync(lockPath), false);
+    } finally {
+      if (previous === undefined) delete process.env.PI_COMPACT_LOCK_TIMEOUT_MS;
+      else process.env.PI_COMPACT_LOCK_TIMEOUT_MS = previous;
+    }
 
-    // 活进程持有的新鲜锁：有限超时后抛出明确错误，不静默丢失写入。
+    // 活进程持有的锁：有限超时后抛出明确错误，不静默丢失写入，也不按年龄回收。
     const holder = spawn(process.execPath, ["-e", "console.log('ready'); setInterval(() => {}, 1000);"], { stdio: ["ignore", "pipe", "pipe"] });
     await new Promise<void>((resolve) => holder.stdout.on("data", () => resolve()));
     try {
       writeFileSync(lockPath, `${JSON.stringify({ pid: holder.pid, token: "other-holder", ts: Date.now() })}\n`);
-      const previous = process.env.PI_COMPACT_LOCK_TIMEOUT_MS;
       process.env.PI_COMPACT_LOCK_TIMEOUT_MS = "200";
       try {
         assert.throws(
           () => appendMemoryEvent(cwd, { type: "create", recordId: "mem_b", author: "user", payload: createPayload("beta") }),
-          /获取日志锁超时/,
+          /获取日志锁超时.*所有者 metadata 无法验证或锁仍被持有/,
         );
       } finally {
         if (previous === undefined) delete process.env.PI_COMPACT_LOCK_TIMEOUT_MS;
         else process.env.PI_COMPACT_LOCK_TIMEOUT_MS = previous;
       }
-      // 持有进程死亡后锁自动回收，后续写入恢复，不留下永久锁。
+      // 持有进程死亡后锁自动回收，后续写入恢复。
       holder.kill();
       await new Promise<void>((resolve) => holder.on("exit", () => resolve()));
       appendMemoryEvent(cwd, { type: "create", recordId: "mem_c", author: "user", payload: createPayload("gamma") });

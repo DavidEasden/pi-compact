@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { ensureDir } from "./jsonl.ts";
 
@@ -8,14 +8,15 @@ import { ensureDir } from "./jsonl.ts";
 /* 同步文件锁：保护 append 事务（读末条 -> 算 seq/prevHash -> append）的跨进程原子性。 */
 /* ------------------------------------------------------------------ */
 
-/** 获取锁的最长等待；可用 PI_COMPACT_LOCK_TIMEOUT_MS 覆盖（主要供测试）。 */
+/** 获取锁的最长等待；可用 PI_COMPACT_LOCK_TIMEOUT_MS 覆盖（主要供测试）。仅是等待超时，不是活锁租约。 */
 const lockTimeoutMs = (): number => {
   const parsed = Number(process.env.PI_COMPACT_LOCK_TIMEOUT_MS);
   return Number.isFinite(parsed) && parsed >= 100 ? parsed : 5000;
 };
-/** 持锁进程仍存活但超过该时长视为死锁/过期，可被回收。 */
-const lockStaleMs = (): number => Math.max(1000, lockTimeoutMs() * 2);
 const LOCK_POLL_MS = 10;
+
+/** 可用同步 ps 读取启动时间的 Unix 平台（不含 Linux，Linux 走 /proc）。 */
+const UNIX_PS_PLATFORMS = new Set(["darwin", "freebsd", "openbsd", "netbsd", "sunos", "aix"]);
 
 export interface LockInfo {
   pid: number;
@@ -30,8 +31,14 @@ export interface LockRecoveryOptions {
   held?: boolean;
   alive?: (pid: number) => boolean;
   startTime?: (pid: number) => string | undefined;
-  ageMs?: number;
-  staleMs?: number;
+}
+
+export type ProcessStartTimeKind = "linux" | "unix-ps" | "windows";
+
+export interface ProcessStartTimeReaders {
+  linux?: (pid: number) => string | undefined;
+  unixPs?: (pid: number) => string | undefined;
+  windows?: (pid: number) => string | undefined;
 }
 
 interface HeldLock {
@@ -67,31 +74,75 @@ const linuxStartTime = (pid: number): string | undefined => {
   }
 };
 
-const darwinStartTime = (pid: number): string | undefined => {
+/** 解析 ps / PowerShell 的同步输出；非 0 或空文本视为无法读取。 */
+export const parseSpawnedStartTime = (result: { status: number | null; stdout?: string | null } | undefined): string | undefined => {
+  if (!result || result.status !== 0) return undefined;
+  const text = (result.stdout ?? "").trim();
+  return text.length > 0 ? text : undefined;
+};
+
+/** ps 的 lstart 会受时区影响，固定为 UTC 以便跨进程稳定比较。 */
+const unixPsStartTime = (pid: number): string | undefined => {
   try {
-    const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+    return parseSpawnedStartTime(spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
       encoding: "utf8",
       timeout: 1000,
       stdio: ["ignore", "pipe", "ignore"],
-    });
-    if (result.status !== 0) return undefined;
-    const text = (result.stdout ?? "").trim();
-    return text.length > 0 ? text : undefined;
+      env: { ...process.env, TZ: "UTC" },
+    }));
   } catch {
     return undefined;
   }
 };
 
-/**
- * 读取进程启动时间。Linux 用 /proc/<pid>/stat 的 starttime；macOS 用 ps lstart。
- * 其他平台或读取失败时返回 undefined，调用方必须按活锁保守处理。
- */
-export const readProcessStartTime = (pid: number): string | undefined => {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
-  if (process.platform === "linux") return linuxStartTime(pid);
-  if (process.platform === "darwin") return darwinStartTime(pid);
+const windowsStartTime = (pid: number): string | undefined => {
+  try {
+    return parseSpawnedStartTime(spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().ToString('o')`,
+    ], {
+      encoding: "utf8",
+      timeout: 3000,
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    }));
+  } catch {
+    return undefined;
+  }
+};
+
+/** 按平台选择启动时间读取方式；未知平台不声称可读。 */
+export const processStartTimeKind = (platform: string): ProcessStartTimeKind | undefined => {
+  if (platform === "linux") return "linux";
+  if (platform === "win32") return "windows";
+  if (UNIX_PS_PLATFORMS.has(platform)) return "unix-ps";
   return undefined;
 };
+
+/**
+ * 读取进程启动时间。Linux 用 /proc/<pid>/stat；macOS 及其他可用 Unix 用同步 ps；
+ * Windows 用 PowerShell Get-Process StartTime。读取失败或未知平台返回 undefined。
+ */
+export const readProcessStartTimeForPlatform = (
+  pid: number,
+  platform: string,
+  readers: ProcessStartTimeReaders = {},
+): string | undefined => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  const kind = processStartTimeKind(platform);
+  try {
+    if (kind === "linux") return (readers.linux ?? linuxStartTime)(pid);
+    if (kind === "unix-ps") return (readers.unixPs ?? unixPsStartTime)(pid);
+    if (kind === "windows") return (readers.windows ?? windowsStartTime)(pid);
+    return undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+export const readProcessStartTime = (pid: number): string | undefined => readProcessStartTimeForPlatform(pid, process.platform);
 
 const selfStartTime = readProcessStartTime(process.pid);
 
@@ -105,7 +156,7 @@ export const readLockInfo = (path: string): LockInfo | undefined => {
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     const pid = Number(parsed.pid);
-    if (!Number.isSafeInteger(pid) || typeof parsed.token !== "string" || parsed.token.length === 0) return undefined;
+    if (!Number.isSafeInteger(pid) || pid <= 0 || typeof parsed.token !== "string" || parsed.token.length === 0) return undefined;
     const ts = Number(parsed.ts);
     const startTime = lockStartTime(parsed.startTime);
     return { pid, token: parsed.token, ts: Number.isFinite(ts) ? ts : 0, startTime };
@@ -114,43 +165,41 @@ export const readLockInfo = (path: string): LockInfo | undefined => {
   }
 };
 
-const lockAgeMs = (path: string): number => {
-  try {
-    return Date.now() - statSync(path).mtimeMs;
-  } catch {
-    return Number.POSITIVE_INFINITY;
-  }
-};
-
 /**
- * 锁可恢复：内容无法解析、本进程遗留、持有进程已死、PID 复用（启动时间不一致），或超过过期阈值。
- * PID 仍存在但无法读取启动时间时，不把锁当成死者回收，以免误删新锁。
+ * 锁可恢复：持有进程已死、PID 复用（启动时间明确不一致），
+ * 或能用当前进程启动时间证明是本进程遗留且当前未持有。
+ * 活进程不得按年龄回收；缺失 metadata 或无法验证身份时必须保守等待。
  */
 export const isRecoverableLock = (path: string, info: LockInfo | undefined, options: LockRecoveryOptions = {}): boolean => {
   const selfPid = options.pid ?? process.pid;
   const held = options.held ?? heldLocks.has(path);
   const alive = options.alive ?? processAlive;
   const startTimeOf = options.startTime ?? readProcessStartTime;
-  const ageMs = options.ageMs ?? lockAgeMs(path);
-  const staleMs = options.staleMs ?? lockStaleMs();
-  if (!info) return true;
-  if (info.pid === selfPid) return !held;
+  if (!info) return false;
+  if (info.pid === selfPid) {
+    if (held) return false;
+    if (!info.startTime) return false;
+    const liveStart = startTimeOf(selfPid);
+    // 启动时间明确可比：相等为本进程遗留，不等为 PID 复用，均可回收。
+    return liveStart !== undefined;
+  }
   if (!alive(info.pid)) return true;
   if (info.startTime) {
     const liveStart = startTimeOf(info.pid);
-    // 启动时间能读到且与锁内记录不同：原进程已死、PID 被新进程复用，可以回收。
     if (liveStart !== undefined && liveStart !== info.startTime) return true;
   }
-  return ageMs > staleMs;
+  return false;
 };
 
-/** 仅当锁内容仍是之前读到的 owner（token，以及 pid/startTime）时才删除，避免误删他人随后获取的新锁。 */
+/** 仅当 expected 与当前锁的 owner token/pid/startTime 完全一致时才删除；缺失 expected 或无法解析时不删除。 */
 export const reclaimLock = (path: string, expected: LockInfo | undefined): void => {
   try {
+    if (!expected) return;
     const current = readLockInfo(path);
-    if (current?.token !== expected?.token) return;
-    if (current && expected && current.pid !== expected.pid) return;
-    if (current && expected && current.startTime !== expected.startTime) return;
+    if (!current) return;
+    if (current.token !== expected.token) return;
+    if (current.pid !== expected.pid) return;
+    if (current.startTime !== expected.startTime) return;
     unlinkSync(path);
   } catch {
     // 锁文件已被其他进程回收。
@@ -191,7 +240,7 @@ const acquireLock = (path: string): void => {
       if (fd !== undefined) closeSync(fd);
     }
     if (Date.now() >= deadline) {
-      throw new Error(`pi-compact: 获取日志锁超时（${timeoutMs}ms）：${path}，本次写入未完成`);
+      throw new Error(`pi-compact: 获取日志锁超时（${timeoutMs}ms）：${path}，所有者 metadata 无法验证或锁仍被持有，本次写入未完成`);
     }
     sleepSync(LOCK_POLL_MS);
   }

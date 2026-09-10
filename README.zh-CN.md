@@ -178,7 +178,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 长期记忆存放在项目目录 `.pi/pi-compact/memory.jsonl`（append-only 事件日志）。当前状态由纯函数 projector 重放得到。用户写入是权威来源；模型提议默认且始终为 provisional，必须由用户 `/remember` 确认后才成为 active/pinned。扩展不能保证模型一定遵守这些记忆。
 
-`memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。锁有有限超时，可恢复崩溃进程遗留的锁（无法解析、持有进程已死或已过期），进程内可重入，事务结束时必然释放；锁文件不会永久阻塞后续写入。释放与回收必须核对锁文件中的 owner token，并在存在 pid/startTime 时一并核对；metadata 不匹配时不会删除他人的新锁。在 macOS/Linux 上，若能读到进程启动时间会写入锁内，避免 PID 复用被误判为原持有者仍存活。若无法读取启动时间，则把持有者视为仍存活直到锁过期——证明不了过期时不会删除锁。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
+`memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。`PI_COMPACT_LOCK_TIMEOUT_MS` 只是有限等待超时（主要供测试），不是活锁租约：持有者 PID 仍存活时，不会因为锁文件年龄而回收。崩溃恢复只在以下情况删除锁：所有者 PID 明确死亡；锁内 startTime 与实时启动时间都能读到且明确不同（PID 复用）；或能用当前进程的 startTime 证明这是本进程遗留且当前未持有。Linux 读取 `/proc/<pid>/stat`；macOS 和其他可用 Unix 平台尝试设置 `TZ=UTC` 后同步执行 `ps`；Windows 尝试标准系统能力（如 PowerShell `Get-Process` StartTime）。启动时间身份是尽力而为——并非所有平台都能读到，失败一律视为无法验证。无法解析、空的或缺少有效 owner token/pid 的锁不会被自动删除（可能正处在创建写入窗口，也可能是损坏残留）。无法验证身份时会等到超时，并抛出明确错误：所有者 metadata 无法验证或锁仍被持有，且本次写入未完成。人工删除 `.lock` 文件是明确的恢复途径。锁在进程内可重入，事务结束时必然释放。释放与回收必须核对锁文件中的 owner token，并在存在 pid/startTime 时一并核对；expected metadata 缺失或不匹配时不会删除他人的新锁。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
 
 读取任一日志时，事件必须构成完整链：`seq` 从 1 起严格连续递增，`prevHash` 必须等于上一条被接受事件的 hash，且每条事件自身 hash 正确。遇到首个非法、重复、跳号或被篡改的事件即停止，只重放可信前缀。一旦存在这样的事件，该日志的后续追加会被拒绝并报出明确错误：用户必须先人工修复日志才能继续写入，扩展不会通过截断或重写日志来掩盖问题。EOF 处无法解析的半行仍被容忍——读取时跳过，下次追加前补齐换行，因此写入中途崩溃仍可恢复。
 
@@ -346,7 +346,7 @@ src/recall.ts            召回工具与 /pi-compact-recall 命令
 src/memory.ts            记忆命令与记忆/新窗口工具
 src/core/content.ts      消息文本、文件、thinking 分离和片段边界
 src/core/auto-recall.ts  自动历史召回的确定性高置信门控
-src/core/lock.ts         同步日志锁、owner-token 回收、PID 启动时间校验
+src/core/lock.ts         同步日志锁、owner-token 回收、跨平台启动时间身份
 src/core/ledger.ts       确定性 checkpoint 与 details
 src/core/session.ts      session entry 转换、sourceClass、搜索和原文回放
 src/core/jsonl.ts        损坏安全的 JSONL 读写
@@ -372,7 +372,7 @@ tests/                   单元测试
 - 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
 - 空 active lineage 不扩大搜索范围；自动召回的同轮复用、新 user 更新、去重和 branch 查询异常处理。
 - 自动召回高置信门控会拒绝 continue/ok 等泛词，同时仍注入具体 token、错误码和路径；手动召回仍能命中这些泛词。
-- 日志锁回收在 token/metadata 不匹配时不删除；PID 复用与读不到启动时间的保守降级均有不依赖真实 PID 复用的单测。
+- 日志锁回收在 token/metadata 不匹配时不删除，也不会自动删除无效 metadata；活锁不按年龄回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
 - 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
 
 尚未作为完整端到端场景验证：真实模型响应、overflow retry 的完整运行过程，以及跨 session 或 branch 切换下的长时间运行行为。
