@@ -121,6 +121,22 @@ export const isSafeCut = (branchEntries: SessionEntryLike[], keptEntryId: string
   return [...openCalls.values()].every((calls) => calls.every((terminal) => terminal));
 };
 
+/**
+ * Pi 给出的边界不安全时，向前回退寻找最近一个安全边界：
+ * 回退只会让保留区变大（少摘要、多保留），不会引入新的断链风险。
+ * 找不到任何安全边界时返回 undefined，由调用方决定取消。
+ */
+export const findEarlierSafeCut = (branch: SessionEntryLike[], proposedId: string): string | undefined => {
+  const proposed = branch.findIndex((entry) => entry.id === proposedId);
+  if (proposed <= 0) return undefined;
+  for (let index = proposed; index >= 1; index--) {
+    const entry = branch[index];
+    if (typeof entry?.id !== "string" || !isValidCutEntry(entry)) continue;
+    if (isSafeCut(branch, entry.id)) return entry.id;
+  }
+  return undefined;
+};
+
 const latestUser = (messages: any[]): { text: string } => {
   for (let index = messages.length - 1; index >= 0; index--) {
     if (messages[index]?.role === "user") return { text: messageText(messages[index]) };
@@ -222,13 +238,28 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const config = loadConfig(ctx.cwd);
     if (!config.enabled || !config.overrideDefaultCompaction) return;
     if (event.signal?.aborted) return { cancel: true };
-    const keptEntryId = event.preparation?.firstKeptEntryId;
+    const proposedKeptEntryId = event.preparation?.firstKeptEntryId;
     const branch: SessionEntryLike[] = event.branchEntries ?? [];
     const preparation = event.preparation;
     const splitPrefix = Array.isArray(preparation?.turnPrefixMessages) ? preparation.turnPrefixMessages : [];
-    if (preparation?.isSplitTurn !== (splitPrefix.length > 0) || typeof keptEntryId !== "string" || !isSafeCut(branch, keptEntryId)) {
-      ctx.ui.notify("pi-compact: Pi 给出的压缩边界不是完整消息边界，本次压缩已取消以避免丢失工具调用；请重试或暂时关闭扩展。", "warning");
+    // isSplitTurn 先规范化为布尔：字段缺失（undefined）按 false 处理，
+    // 避免 pi API 形状变化时压缩被永久取消。
+    const isSplitTurn = preparation?.isSplitTurn === true;
+    if (isSplitTurn !== (splitPrefix.length > 0) || typeof proposedKeptEntryId !== "string") {
+      ctx.ui?.notify?.("pi-compact: Pi 给出的压缩准备数据不一致（isSplitTurn 与 turnPrefixMessages 矛盾），本次压缩已取消。", "warning");
       return { cancel: true };
+    }
+    // Pi 边界不安全时优先回退到更早的安全边界，而不是直接取消：
+    // 反复取消会让阈值/溢出触发的自动压缩失效，最终导致上下文溢出。
+    let keptEntryId = proposedKeptEntryId;
+    if (!isSafeCut(branch, keptEntryId)) {
+      const fallbackId = findEarlierSafeCut(branch, keptEntryId);
+      if (fallbackId === undefined) {
+        ctx.ui?.notify?.("pi-compact: 未找到不破坏工具调用链的安全压缩边界（含更早回退），本次压缩已取消；请重试或暂时关闭扩展。", "warning");
+        return { cancel: true };
+      }
+      keptEntryId = fallbackId;
+      ctx.ui?.notify?.(`pi-compact: Pi 给出的压缩边界会破坏工具调用链，已回退到更早的安全边界 ${fallbackId}（保留更多内容）。`, "info");
     }
     try {
       const cutIndex = branch.findIndex((entry: any) => entry.id === keptEntryId);
@@ -247,7 +278,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
               sourceHash,
               keptEntryId,
               reason: event.reason,
-              isSplitTurn: preparation?.isSplitTurn === true,
+              isSplitTurn,
               sessionId,
             });
             persistWindowManifest(ctx.cwd, manifest);

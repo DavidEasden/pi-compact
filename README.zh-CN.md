@@ -14,7 +14,7 @@
 - 接管 Pi 原生的 `/compact` 命令，以及普通的 `manual`、`threshold` 和 `overflow` compaction。
 - 使用 Pi 自己计算的压缩边界、token accounting、持久化和恢复流程；checkpoint 是确定性指针/审计内容，不是 primary memory。
 - 记录 WindowManifest（windowId、父窗口、保留边界、sourceCount、sourceHash、previousHash）。
-- 在压缩前检查工具调用与工具结果是否完整配对；发现不安全边界时取消本次接管，避免破坏上下文。
+- 在压缩前检查工具调用与工具结果是否完整配对；发现不安全边界时优先回退到更早的安全边界，找不到任何安全边界才取消本次接管，避免破坏上下文。
 - 生成确定性的事件 ledger，不把规则提取结果伪装成目标、决策或已完成任务。规则派生只提取文件、命令、退出码、测试计数等不需要语义推断的字段，并带 provenance。
 - 历史记录区分 primary/derived：`compaction` 与 `branch_summary` 默认不进入自动召回；thinking 保留在 raw 中，不进入默认搜索文本。
 - 提供 `pi_compact_recall` 工具，支持 list/search/read、entry ID、关键词、文件路径、消息类型、分页和原始 entry 回放；长 raw 可用 `offset`/`rawLimit` 分段读取。
@@ -178,7 +178,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 长期记忆存放在项目目录 `.pi/pi-compact/memory.jsonl`（append-only 事件日志）。当前状态由纯函数 projector 重放得到。用户写入是权威来源；模型提议默认且始终为 provisional，必须由用户 `/remember` 确认后才成为 active/pinned。扩展不能保证模型一定遵守这些记忆。
 
-`memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。`PI_COMPACT_LOCK_TIMEOUT_MS` 只是有限等待超时（主要供测试），不是活锁租约：持有者 PID 仍存活时，不会因为锁文件年龄而回收。崩溃恢复只在以下情况删除锁：所有者 PID 明确死亡；锁内 startTime 与实时启动时间都能读到且明确不同（PID 复用）；或能用当前进程的 startTime 证明这是本进程遗留且当前未持有。Linux 读取 `/proc/<pid>/stat`；macOS 和其他可用 Unix 平台尝试设置 `TZ=UTC` 后同步执行 `ps`；Windows 尝试标准系统能力（如 PowerShell `Get-Process` StartTime）。启动时间身份是尽力而为——并非所有平台都能读到，失败一律视为无法验证。无法解析、空的或缺少有效 owner token/pid 的锁不会被自动删除（可能正处在创建写入窗口，也可能是损坏残留）。无法验证身份时会等到超时，并抛出明确错误：所有者 metadata 无法验证或锁仍被持有，且本次写入未完成。人工删除 `.lock` 文件是明确的恢复途径。锁在进程内可重入，事务结束时必然释放。释放与回收必须核对锁文件中的 owner token，并在存在 pid/startTime 时一并核对；expected metadata 缺失或不匹配时不会删除他人的新锁。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
+`memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。`PI_COMPACT_LOCK_TIMEOUT_MS` 只是有限等待超时（主要供测试），不是活锁租约：持有者 PID 仍存活时，不会因为锁文件年龄而回收。崩溃恢复只在以下情况删除锁：所有者 PID 明确死亡；锁内 startTime 与实时启动时间都能读到且明确不同（PID 复用）；或能用当前进程的 startTime 证明这是本进程遗留且当前未持有。Linux 读取 `/proc/<pid>/stat`；macOS 和其他可用 Unix 平台尝试设置 `TZ=UTC` 后同步执行 `ps`；Windows 尝试标准系统能力（如 PowerShell `Get-Process` StartTime）。启动时间身份是尽力而为——并非所有平台都能读到，失败一律视为无法验证。无法解析、空的或缺少有效 owner token/pid 的锁在宽限期内不会被自动删除（可能正处在创建写入窗口）；超过宽限期（`PI_COMPACT_STALE_LOCK_GRACE_MS`，默认 1000 毫秒，主要供测试覆盖）后按崩溃遗留自动回收，避免空锁文件把写入永久卡死。宽限期内无法验证身份时会等到超时，并抛出明确错误：所有者 metadata 无法验证或锁仍被持有，且本次写入未完成。人工删除 `.lock` 文件仍是明确的恢复途径。锁在进程内可重入，事务结束时必然释放。释放与回收必须核对锁文件中的 owner token，并在存在 pid/startTime 时一并核对；expected metadata 缺失或不匹配时不会删除他人的新锁。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
 
 读取任一日志时，事件必须构成完整链：`seq` 从 1 起严格连续递增，`prevHash` 必须等于上一条被接受事件的 hash，且每条事件自身 hash 正确。遇到首个非法、重复、跳号或被篡改的事件即停止，只重放可信前缀。一旦存在这样的事件，该日志的后续追加会被拒绝并报出明确错误：用户必须先人工修复日志才能继续写入，扩展不会通过截断或重写日志来掩盖问题。EOF 处无法解析的半行仍被容忍——读取时跳过，下次追加前补齐换行，因此写入中途崩溃仍可恢复。
 
@@ -301,7 +301,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 2. 将边界之前的原始 entries 转换成带 ID 的记录。
 3. 生成 checkpoint：写入 windowId/parentWindowId/sourceHash/previousHash 等指针字段，再按原始 entry 顺序写出 `## Timeline`（`sourceOrdinal`），然后保留现有分类区块（用户消息、assistant 消息、工具调用、工具结果、命令和其他 session context）。Timeline 与分类区块共用字符预算和省略计数。checkpoint 明确不是 primary memory。
 4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars`、`estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）和可选的 `window` manifest。扩展不会伪造计费 `usage`；Pi 会自行计算包含完整上下文的压缩后估算值。
-5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；不安全或已中止的接管请求返回 `{ cancel: true }`，不落回默认 LLM 摘要。处理出错时降级为指针型 checkpoint，而不是让 Pi 改用 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
+5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；边界不安全时先回退到更早的安全边界（保留更多内容），找不到任何安全边界或请求已中止才返回 `{ cancel: true }`，不落回默认 LLM 摘要。处理出错时降级为指针型 checkpoint，而不是让 Pi 改用 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
 6. 窗口事件写入 `.pi/pi-compact/windows.jsonl`，形成 previousHash 链；写入同样受按日志文件锁保护，读取同样按可信前缀规则校验。模型可通过 `pi_compact_new_context` 请求新窗口；若当前 API 没有 `ctx.compact`，则提示使用 `/compact`。
 
 原始 session entries 才是历史事实来源；用户写入的 memory log 才是长期记忆事实来源。checkpoint 会折叠空白、截短长记录，并在预算不足时省略记录；它不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。

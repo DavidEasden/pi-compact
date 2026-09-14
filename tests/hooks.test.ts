@@ -153,6 +153,61 @@ test("session_before_compact 在边界可能破坏工具链时取消压缩", asy
   }
 });
 
+test("preparation 缺失 isSplitTurn 字段时不再误判为矛盾并取消压缩", async () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const branch = [
+      messageEntry("u1", "user", "保留细节"),
+      messageEntry("a1", "assistant", [{ type: "toolCall", id: "call1", name: "read", arguments: { path: "src/auth.ts" } }], "u1"),
+      messageEntry("t1", "toolResult", "token implementation", "a1", { toolCallId: "call1" }),
+    ];
+    const notifications: string[] = [];
+    const handler = harness.handlers.get("session_before_compact")![0];
+    const result = await handler({
+      reason: "threshold",
+      branchEntries: branch,
+      preparation: { firstKeptEntryId: "a1", tokensBefore: 100 },
+      signal: new AbortController().signal,
+    }, { cwd: harness.cwd, ui: { notify(message: string) { notifications.push(message); } } });
+    assert.equal(notifications.length, 0);
+    assert.equal(result.compaction.firstKeptEntryId, "a1");
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("Pi 边界不安全时回退到更早的安全边界而不是取消", async () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    // call1 的结果 t1 落在 u2 之后：在 u2 处切开会让 t1 成为孤儿结果；回退到 a1 才安全。
+    const branch = [
+      messageEntry("u1", "user", "执行读取"),
+      messageEntry("a1", "assistant", [{ type: "toolCall", id: "call1", name: "read", arguments: {} }], "u1"),
+      messageEntry("u2", "user", "中间插入", "a1"),
+      messageEntry("t1", "toolResult", "result", "u2", { toolCallId: "call1" }),
+      messageEntry("a2", "assistant", "完成", "t1"),
+    ];
+    const notifications: string[] = [];
+    const handler = harness.handlers.get("session_before_compact")![0];
+    const result = await handler({
+      reason: "threshold",
+      branchEntries: branch,
+      preparation: { firstKeptEntryId: "u2", tokensBefore: 100, isSplitTurn: false, turnPrefixMessages: [] },
+      signal: new AbortController().signal,
+    }, { cwd: harness.cwd, ui: { notify(message: string) { notifications.push(message); } } });
+    assert.equal(result.compaction.firstKeptEntryId, "a1");
+    assert.deepEqual(result.compaction.details.sourceEntryIds, ["u1"]);
+    assert.equal(result.compaction.details.window.keptEntryId, "a1");
+    assert.equal(notifications.length, 1);
+    assert.match(notifications[0], /回退到更早的安全边界/);
+    assert.match(result.compaction.summary, /retained context starts at entry: a1/);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
 test("自动召回只修改当前请求消息，不写入 session，并可避免同一请求重复注入", () => {
   const harness = createHarness();
   try {

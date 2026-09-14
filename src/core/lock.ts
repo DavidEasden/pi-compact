@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import { ensureDir } from "./jsonl.ts";
 
@@ -14,6 +14,12 @@ const lockTimeoutMs = (): number => {
   return Number.isFinite(parsed) && parsed >= 100 ? parsed : 5000;
 };
 const LOCK_POLL_MS = 10;
+
+/** 无法解析的锁文件在回收前等待的宽限期；可用 PI_COMPACT_STALE_LOCK_GRACE_MS 覆盖（主要供测试）。 */
+const staleLockGraceMs = (): number => {
+  const parsed = Number(process.env.PI_COMPACT_STALE_LOCK_GRACE_MS);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 1000;
+};
 
 /** 可用同步 ps 读取启动时间的 Unix 平台（不含 Linux，Linux 走 /proc）。 */
 const UNIX_PS_PLATFORMS = new Set(["darwin", "freebsd", "openbsd", "netbsd", "sunos", "aix"]);
@@ -165,6 +171,15 @@ export const readLockInfo = (path: string): LockInfo | undefined => {
   }
 };
 
+/** 无法解析的锁文件的存活年龄（毫秒）；读取失败返回 undefined。 */
+const unparseableLockAgeMs = (path: string): number | undefined => {
+  try {
+    return Date.now() - statSync(path).mtimeMs;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * 锁可恢复：持有进程已死、PID 复用（启动时间明确不一致），
  * 或能用当前进程启动时间证明是本进程遗留且当前未持有。
@@ -235,7 +250,20 @@ const acquireLock = (path: string): void => {
         throw new Error(`pi-compact: 无法创建日志锁 ${path}：${(error as Error).message}`);
       }
       const info = readLockInfo(path);
-      if (isRecoverableLock(path, info, { startTime: startTimeOf })) reclaimLock(path, info);
+      if (info === undefined) {
+        // 无法解析的锁文件没有可验证的持有者，多为创建后、写入 metadata 前崩溃留下的空文件。
+        // 正常持有方会在创建后立即写入完整 metadata，宽限期内不回收；超过宽限期按遗留锁回收，避免永久死锁。
+        const age = unparseableLockAgeMs(path);
+        if (age !== undefined && age >= staleLockGraceMs()) {
+          try {
+            unlinkSync(path);
+          } catch {
+            // 回收失败（如权限问题）则继续等待，由超时兜底。
+          }
+        }
+      } else if (isRecoverableLock(path, info, { startTime: startTimeOf })) {
+        reclaimLock(path, info);
+      }
     } finally {
       if (fd !== undefined) closeSync(fd);
     }

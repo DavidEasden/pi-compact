@@ -278,6 +278,38 @@ test("无效锁 metadata 短超时后报错且不悄悄写入，人工清理后�
   }
 });
 
+test("无法解析的遗留锁超过宽限期后自动回收，宽限期内仍保守等待", () => {
+  const { dir, path, logPath } = tempLock();
+  const withStaleGrace = (ms: string, fn: () => void): void => {
+    const previous = process.env.PI_COMPACT_STALE_LOCK_GRACE_MS;
+    process.env.PI_COMPACT_STALE_LOCK_GRACE_MS = ms;
+    try {
+      fn();
+    } finally {
+      if (previous === undefined) delete process.env.PI_COMPACT_STALE_LOCK_GRACE_MS;
+      else process.env.PI_COMPACT_STALE_LOCK_GRACE_MS = previous;
+    }
+  };
+  try {
+    // 模拟创建后、写入 metadata 前崩溃留下的空锁文件。
+    writeFileSync(path, "");
+    // 宽限期内：按仍被持有处理，超时报错且不写入，不悄悄回收。
+    withLockTimeout("150", () => {
+      withStaleGrace("60000", () => {
+        assert.throws(() => withLogLock(logPath, () => "wrote"), /本次写入未完成/);
+      });
+    });
+    assert.equal(existsSync(path), true);
+    // 超过宽限期：自动回收并成功写入，不再永久死锁。
+    withStaleGrace("0", () => {
+      assert.equal(withLogLock(logPath, () => "ok"), "ok");
+    });
+    assert.equal(existsSync(path), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("Unix ps 启动时间强制 UTC，不受调用方时区影响", () => {
   if (process.platform === "linux" || process.platform === "win32") return;
   const previous = process.env.TZ;
