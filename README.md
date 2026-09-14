@@ -61,6 +61,31 @@ Notes:
 pi -e git:github.com/DavidEasden/pi-compact
 ```
 
+### Install from npm
+
+The same code is published to npm as `pi-compact`:
+
+```bash
+pi install npm:pi-compact@0.1.0
+```
+
+Or track the latest published version:
+
+```bash
+pi install npm:pi-compact
+```
+
+Try it without installing it:
+
+```bash
+pi -e npm:pi-compact
+```
+
+Notes:
+
+- A versioned spec such as `npm:pi-compact@0.1.0` is pinned, so `pi update --extensions` and `pi update --all` skip it.
+- Global installs go under `~/.pi/agent/npm/`; with `-l` (project settings) they go under `.pi/npm/`.
+
 ### Try locally
 
 Run from the project root:

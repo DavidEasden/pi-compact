@@ -61,6 +61,31 @@ pi install https://github.com/DavidEasden/pi-compact@v0.1.0
 pi -e git:github.com/DavidEasden/pi-compact
 ```
 
+### 通过 npm 安装
+
+同一份代码已发布到 npm，包名为 `pi-compact`：
+
+```bash
+pi install npm:pi-compact@0.1.0
+```
+
+或者跟踪最新发布版本：
+
+```bash
+pi install npm:pi-compact
+```
+
+不安装也可以临时试用：
+
+```bash
+pi -e npm:pi-compact
+```
+
+说明：
+
+- 形如 `npm:pi-compact@0.1.0` 的带版本 spec 会被固定，`pi update --extensions` 与 `pi update --all` 会跳过它。
+- 全局安装位于 `~/.pi/agent/npm/`；使用 `-l`（项目 settings）时位于 `.pi/npm/`。
+
 ### 临时加载本地版本
 
 在项目根目录执行：
