@@ -11,7 +11,13 @@ const DERIVED_CUSTOM_TYPES = new Set([
 ]);
 
 const entryMessage = (entry: SessionEntryLike): MessageLike | undefined => {
-  if (entry.type === "message" && entry.message) return entry.message as MessageLike;
+  if (entry.type === "message" && entry.message) {
+    const message = entry.message as MessageLike;
+    // Pi 0.86+ 把当前 prompt 与工具声明持久化为 role=system 的 message entry，
+    // 它不是对话历史；记录它只会产生 text 为空、files 误抓 sections.cwd 的噪音命中。
+    if (message.role === "system") return undefined;
+    return message;
+  }
   if (entry.type === "custom_message") {
     return { role: "custom", customType: String(entry.customType ?? "custom"), content: entry.content };
   }

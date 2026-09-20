@@ -21,6 +21,32 @@ test("从真实 session entry 确定性提取记录", () => {
   assert.equal(records[3].kinds[0], "bash");
 });
 
+test("Pi 0.86 的 system prompt/tools checkpoint 不进入历史记录", () => {
+  const withSystemCheckpoint: SessionEntryLike[] = [
+    {
+      type: "message",
+      id: "s1",
+      parentId: null,
+      timestamp: "2024-01-01T00:00:00Z",
+      message: { role: "system", content: "", sections: { preamble: "You are an expert coding assistant", cwd: "/project" }, toolsAdded: [{ name: "read" }] },
+    },
+    ...entries,
+    {
+      type: "message",
+      id: "s2",
+      parentId: "b1",
+      timestamp: "2024-01-01T00:00:04Z",
+      message: { role: "system", content: "", toolsRemoved: [{ name: "write" }] },
+    },
+  ];
+  const records = recordsFromEntries(withSystemCheckpoint);
+  assert.equal(records.length, entries.length);
+  assert.equal(records.some((record) => record.entryId === "s1" || record.entryId === "s2"), false);
+  // sections.cwd 不能被误当成文件信号。
+  assert.equal(records.some((record) => record.files.includes("/project")), false);
+  assert.deepEqual(records.map((record) => record.entryId), entries.map((entry) => entry.id));
+});
+
 test("上下文 entry 也可记录，但扩展状态 entry 不进入上下文记录", () => {
   const contextEntries: SessionEntryLike[] = [
     ...entries,
