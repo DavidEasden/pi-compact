@@ -247,5 +247,10 @@ test("压缩边界必须保留完整的工具调用和结果配对", () => {
     summary: "切分后的上下文摘要",
   };
   assert.equal(isSafeCut([user, branchSummary], "branch-summary-1"), true);
-  assert.equal(isSafeCut([user, { type: "custom", id: "state-1", parentId: "u1" }], "state-1"), false);
+  for (const type of ["custom", "usage", "model_change", "thinking_level_change"]) {
+    const metadata: SessionEntryLike = { type, id: "state-1", parentId: "t1" };
+    assert.equal(isSafeCut([user, call, result, metadata, nextAssistant], "state-1"), true);
+    // 元数据本身不产生消息，也不能据此放行跨边界的工具结果。
+    assert.equal(isSafeCut([user, call, metadata, result, nextAssistant], "state-1"), false);
+  }
 });

@@ -94,6 +94,9 @@ export interface CompactionDetails {
   summaryMaxChars: number;
   /** chars/4 向上取整，不是 provider usage。 */
   estimatedTokensAfter: number;
+  /** 成功提交后生成窗口日志所需的切分信息；准备阶段不写窗口。 */
+  isSplitTurn?: boolean;
+  /** 兼容旧 checkpoint；新窗口清单只在 windows.jsonl 中保存。 */
   window?: WindowManifest;
 }
 

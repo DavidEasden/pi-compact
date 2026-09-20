@@ -8,6 +8,7 @@ const DERIVED_CUSTOM_TYPES = new Set([
   "pi-compact-recall",
   "pi-compact-auto-recall",
   "pi-compact-memory-hint",
+  "pi-compact-resume",
 ]);
 
 const entryMessage = (entry: SessionEntryLike): MessageLike | undefined => {

@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { registerNewContext } from "./new-context.ts";
 import { loadConfig } from "./config.ts";
-import { queryTerms } from "./core/content.ts";
+import { clip, queryTerms } from "./core/content.ts";
 import { formatMemoryRead, formatMemorySearch } from "./core/memory-output.ts";
 import { appendMemoryEvent, contentHash, loadMemories, newMemoryId, withMemoryLogLock } from "./core/store.ts";
 import type { MemoryKind, MemoryPriority, MemoryRecord, MemoryScope, MemoryStatus } from "./types.ts";
@@ -266,8 +267,9 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       status: Type.Optional(Type.String()),
       kind: Type.Optional(Type.String()),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
     }),
-    async execute(_toolCallId: string, input: { query?: string; status?: string; kind?: string; limit?: number }, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
+    async execute(_toolCallId: string, input: { query?: string; status?: string; kind?: string; limit?: number; offset?: number }, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
       const config = loadConfig(ctx.cwd);
       if (!config.memory.enabled) {
         return { content: [{ type: "text", text: "pi-compact: 记忆功能已关闭。" }], details: { count: 0 } };
@@ -279,18 +281,21 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       if (input.kind && KINDS.has(input.kind as MemoryKind)) records = records.filter((record) => record.kind === input.kind);
       if (input.query?.trim()) records = searchMemoryRecords(records, input.query);
       else if (!explicitStatus) records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
-      records = records.slice(0, input.limit ?? 8);
+      const offset = input.offset ?? 0;
+      const total = records.length;
+      records = records.slice(offset, offset + (input.limit ?? 8));
       if (records.length === 0) {
         return { content: [{ type: "text", text: "pi-compact memory: 未找到匹配记忆。" }], details: { source: "memory-log", count: 0 } };
       }
       const result = formatMemorySearch(records);
+      const nextOffset = offset + result.shown < total ? offset + result.shown : undefined;
       return {
         content: [{ type: "text", text: result.text }],
         details: {
           source: "memory-log",
           count: result.shown,
-          truncated: result.truncated,
-          ...(result.nextOffset !== undefined ? { nextOffset: result.nextOffset } : {}),
+          truncated: result.truncated || nextOffset !== undefined,
+          ...(nextOffset !== undefined ? { nextOffset } : {}),
         },
       };
     },
@@ -314,7 +319,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       }
       const record = visibleMemories(ctx.cwd, sessionIdOf(ctx)).find((item) => item.id === input.recordId);
       if (!record) {
-        return { content: [{ type: "text", text: `pi-compact memory: 找不到 ${input.recordId}` }], details: { count: 0 } };
+        return { content: [{ type: "text", text: `pi-compact memory: 找不到 ${clip(input.recordId, 256)}` }], details: { count: 0 } };
       }
       const result = formatMemoryRead(record, { offset: input.offset, limit: input.limit });
       return {
@@ -460,32 +465,5 @@ export const registerMemory = (pi: ExtensionAPI): void => {
     },
   } as any);
 
-  pi.registerTool({
-    name: "pi_compact_new_context",
-    label: "Request a new context window",
-    description: "请求开启新的上下文窗口。若当前 Pi API 提供 ctx.compact，则调用原生 compact；否则提示使用 /compact。不会删除原始 session，也不会把压缩摘要当作记忆。",
-    promptSnippet: "在上下文将满时请求 Pi 原生 compact 以开启新窗口",
-    promptGuidelines: ["需要新窗口时调用 pi_compact_new_context 或请用户执行 /compact；不要把 checkpoint 当成长期记忆。"],
-    parameters: Type.Object({}),
-    async execute(_toolCallId: string, _input: Record<string, never>, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
-      if (typeof ctx.compact === "function") {
-        try {
-          ctx.compact();
-          return {
-            content: [{ type: "text", text: "已请求 Pi 原生 compact 以开启新上下文窗口。原始 session 仍保留；长期记忆来自 /remember 与 memory 日志，而不是压缩摘要。" }],
-            details: { requested: true, degraded: false },
-          };
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `调用 ctx.compact 失败：${error instanceof Error ? error.message : String(error)}。请使用 Pi 原生 /compact。` }],
-            details: { requested: false, degraded: true },
-          };
-        }
-      }
-      return {
-        content: [{ type: "text", text: "当前扩展上下文没有 ctx.compact。请使用 Pi 原生 /compact。这是安全兼容降级，不会删除原始 session。" }],
-        details: { requested: false, degraded: true },
-      };
-    },
-  } as any);
+  registerNewContext(pi);
 };

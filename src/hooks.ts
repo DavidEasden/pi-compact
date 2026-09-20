@@ -1,10 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { toolCallIds } from "./core/content.ts";
 import { deriveFacts } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
 import { hashRecords, recordsFromEntries } from "./core/session.ts";
-import { appendMemoryEvent, loadMemories, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
+import { appendMemoryEvent, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
 import type { SessionEntryLike } from "./types.ts";
 
@@ -58,9 +58,9 @@ const hasMalformedToolMessage = (entries: SessionEntryLike[], start: number, end
 
 const isValidCutEntry = (entry: SessionEntryLike | undefined): boolean => {
   if (!entry || entry.type === "compaction") return false;
-  if (entry.type === "custom_message" || entry.type === "branch_summary") return true;
-  if (entry.type !== "message") return false;
-  return typeof entry.message?.role === "string" && CUT_POINT_ROLES.has(entry.message.role);
+  // Pi 会把相邻的无上下文元数据纳入保留区；验证其消息投影，而非限制 entry 类型。
+  const messages = sessionEntryToContextMessages(entry as SessionEntry);
+  return messages.length === 0 || messages.some((message) => message && CUT_POINT_ROLES.has(message.role));
 };
 
 /**
@@ -214,38 +214,10 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     try {
       const cutIndex = branch.findIndex((entry: any) => entry.id === keptEntryId);
       const records = recordsFromEntries(branch.slice(0, cutIndex));
-      const sourceHash = hashRecords(records);
-      const sessionId = sessionIdOf(ctx);
-      let window = undefined;
-      if (config.window.manifest) {
-        try {
-          // build（读末条定 seq/parent）+ persist 必须在同一锁事务内，避免并发压缩写出重复 seq。
-          window = withWindowLogLock(ctx.cwd, () => {
-            const manifest = buildWindowManifest({
-              cwd: ctx.cwd,
-              records,
-              sourceHash,
-              keptEntryId,
-              reason: event.reason,
-              isSplitTurn,
-              sessionId,
-            });
-            persistWindowManifest(ctx.cwd, manifest);
-            return manifest;
-          });
-        } catch {
-          window = undefined;
-        }
-      }
-      if (config.memory.enabled && config.memory.deriveOnCompact) {
-        try {
-          persistDerived(ctx.cwd, records, sourceHash, sessionId);
-        } catch {
-          // 规则派生失败不得阻断压缩。
-        }
-      }
+      // 准备阶段只计算。窗口与派生记忆在宿主确认提交之后才持久化。
       const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
-      const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars, window);
+      const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars);
+      details.isSplitTurn = isSplitTurn;
       if (config.debug) {
         console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);
       }
@@ -264,7 +236,47 @@ export const registerHooks = (pi: ExtensionAPI): void => {
   // 不注册 context 注入：旧配置也不能重新开启历史正文或工作记忆提示。
 
   pi.on("session_compact", (event: any, ctx: any) => {
-    if (event.fromExtension) ctx.ui.notify(`pi-compact: ${event.reason} 确定性压缩完成`, "info");
+    if (!event.fromExtension) return;
+    const branch: SessionEntryLike[] = ctx.sessionManager?.getBranch?.() ?? [];
+    // Pi 0.86.1 按 summary 查找事件 entry；摘要相同时可能返回旧条目，使用实际提交的分支末条。
+    const entry = branch.filter((item) => item.type === "compaction").at(-1) ?? event.compactionEntry;
+    const details = entry?.details;
+    if (details?.compactor !== "pi-compact") return;
+    const config = loadConfig(ctx.cwd);
+    const sessionId = sessionIdOf(ctx);
+    const records = recordsFromEntries(branch, new Set<string>(details.sourceEntryIds));
+    if (typeof entry.id === "string" && hashRecords(records) === details.sourceHash) {
+      if (config.window.manifest) {
+        try {
+          // 稳定 ID 用于成功事件去重；在同一锁中生成最终父窗口和哈希链，避免并发准备产生过期清单。
+          const windowId = `win_${contentHash(`${sessionId ?? ""}\n${entry.id}`).slice(0, 24)}`;
+          withWindowLogLock(ctx.cwd, () => {
+            if (readWindowEvents(ctx.cwd).some((window) => window.windowId === windowId)) return;
+            persistWindowManifest(ctx.cwd, buildWindowManifest({
+              cwd: ctx.cwd,
+              records,
+              sourceHash: details.sourceHash,
+              keptEntryId: entry.firstKeptEntryId,
+              reason: event.reason,
+              isSplitTurn: details.isSplitTurn === true,
+              sessionId,
+              createdAt: entry.timestamp,
+              windowId,
+            }));
+          });
+        } catch {
+          ctx.ui?.notify?.("pi-compact: 压缩已完成，但窗口日志写入失败。", "warning");
+        }
+      }
+      if (config.memory.enabled && config.memory.deriveOnCompact) {
+        try {
+          persistDerived(ctx.cwd, records, details.sourceHash, sessionId);
+        } catch {
+          ctx.ui?.notify?.("pi-compact: 压缩已完成，但派生记忆写入失败。", "warning");
+        }
+      }
+    }
+    ctx.ui?.notify?.(`pi-compact: ${event.reason} 确定性压缩完成`, "info");
   });
 
   pi.on("session_compact_failed", (event: any, ctx: any) => {

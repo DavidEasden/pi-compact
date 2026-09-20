@@ -17,12 +17,13 @@ export const buildWindowManifest = (input: {
   isSplitTurn: boolean;
   sessionId?: string;
   createdAt?: string;
+  windowId?: string;
 }): WindowManifest => {
   const parent = parentWindowForSession(input.cwd, input.sessionId);
   const sourceEntryIds = [...new Set(input.records.map((record) => record.entryId))];
   const seq = (readWindowEvents(input.cwd).at(-1)?.seq ?? 0) + 1;
   return {
-    windowId: newWindowId(input.sourceHash, seq),
+    windowId: input.windowId ?? newWindowId(input.sourceHash, seq),
     parentWindowId: parent?.windowId,
     keptEntryId: input.keptEntryId,
     sourceCount: sourceEntryIds.length,

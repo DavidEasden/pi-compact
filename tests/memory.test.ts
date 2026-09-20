@@ -433,6 +433,7 @@ test("记忆命令与工具入口：用户写入权威，模型提议保持 prov
     const tools = new Map<string, any>();
     const commands = new Map<string, any>();
     const pi = {
+      on() {},
       registerTool(definition: any) { tools.set(definition.name, definition); },
       registerCommand(name: string, definition: any) { commands.set(name, definition); },
     };
@@ -467,7 +468,8 @@ test("记忆命令与工具入口：用户写入权威，模型提议保持 prov
     assert.equal(compactTool.details.degraded, true);
     let compactCalled = false;
     const native = await tools.get("pi_compact_new_context").execute("c7", {}, new AbortController().signal, undefined, { ...ctx, compact() { compactCalled = true; } });
-    assert.equal(compactCalled, true);
+    assert.equal(compactCalled, false);
+    assert.equal(native.details.deferred, true);
     assert.equal(native.details.degraded, false);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -479,6 +481,7 @@ const registerMemoryHarness = (): { tools: Map<string, any>; commands: Map<strin
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const pi = {
+    on() {},
     registerTool(definition: any) { tools.set(definition.name, definition); },
     registerCommand(name: string, definition: any) { commands.set(name, definition); },
   };
@@ -625,6 +628,7 @@ test("20 万字符记忆的 search/read 输出受硬预算限制且分页可拼�
     assert.ok(search.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
     assert.match(search.content[0].text, /mem_huge/);
     assert.equal(search.details.count, 1);
+    assert.equal(search.details.truncated, true);
 
     const defaultRead = await runTool(tools, "pi_memory_read", { recordId: "mem_huge" }, ctx, "c2");
     assert.ok(defaultRead.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
@@ -701,6 +705,12 @@ test("search 多条命中超过总预算时截断并给出 nextOffset", async ()
     assert.equal(typeof search.details.nextOffset, "number");
     assert.ok(search.details.count < 30);
     assert.ok(search.details.nextOffset <= search.details.count);
+    const next = await runTool(tools, "pi_memory_search", { query: "共享关键词", limit: 30, offset: search.details.nextOffset }, ctx, "c2");
+    assert.equal(search.details.count + next.details.count, 30);
+    const firstIds = [...search.content[0].text.matchAll(/^- \[([^\]]+)\]/gm)].map((match: RegExpMatchArray) => match[1]);
+    const nextIds = [...next.content[0].text.matchAll(/^- \[([^\]]+)\]/gm)].map((match: RegExpMatchArray) => match[1]);
+    assert.equal(firstIds.some((id: string) => nextIds.includes(id)), false);
+    assert.equal(next.details.nextOffset, undefined);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

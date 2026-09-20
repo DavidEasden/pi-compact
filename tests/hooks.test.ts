@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { DEFAULT_CONFIG, loadConfig, scaffoldConfig } from "../src/config.ts";
+import { readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
 import { isSafeCut, registerHooks } from "../src/hooks.ts";
 import type { SessionEntryLike } from "../src/types.ts";
 
@@ -107,9 +108,10 @@ test("session_before_compact 使用 Pi 边界并支持 manual、threshold、over
       assert.equal(result.compaction.details.version, 1);
       assert.equal("usage" in result.compaction, false);
       assert.match(result.compaction.summary, /\"compactor\":\"pi-compact\"/);
-      assert.equal(result.compaction.details.window.sourceHash, result.compaction.details.sourceHash);
-      assert.equal(result.compaction.details.window.keptEntryId, "a1");
-      assert.equal(result.compaction.details.window.sourceCount, 1);
+      assert.equal(result.compaction.details.window, undefined);
+      assert.equal(result.compaction.details.isSplitTurn, false);
+      assert.equal(readWindowEvents(harness.cwd).length, 0);
+      assert.equal(readMemoryEvents(harness.cwd).length, 0);
       assert.equal(result.compaction.summary.includes("windowId"), false);
     }
     const aborted = await handler({
@@ -199,7 +201,7 @@ test("Pi 边界不安全时回退到更早的安全边界而不是取消", async
     }, { cwd: harness.cwd, ui: { notify(message: string) { notifications.push(message); } } });
     assert.equal(result.compaction.firstKeptEntryId, "a1");
     assert.deepEqual(result.compaction.details.sourceEntryIds, ["u1"]);
-    assert.equal(result.compaction.details.window.keptEntryId, "a1");
+    assert.equal(result.compaction.details.window, undefined);
     assert.equal(notifications.length, 1);
     assert.match(notifications[0], /回退到更早的安全边界/);
     assert.match(result.compaction.summary, /\"compactor\":\"pi-compact\"/);

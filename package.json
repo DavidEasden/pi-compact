@@ -21,10 +21,12 @@
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --import tsx --test tests/*.test.ts",
+    "test": "node --import tsx --test tests/*.test.ts tests/*.integration.mjs",
+    "test:integration": "node --test tests/*.integration.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.86.1",
     "@types/node": "^22.19.19",
     "tsx": "^4.19.3",
     "typescript": "^5.9.3"

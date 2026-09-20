@@ -25,7 +25,7 @@
 
 ## 安装
 
-需要已安装 Pi；当前验证版本为 `0.85.1`，该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。
+需要已安装 Pi；当前验证版本为 `0.86.1`，该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。
 
 Pi package 会执行扩展代码，请在安装前审查源代码。
 
@@ -113,7 +113,7 @@ pi install /absolute/path/to/pi-compact
 pi install -l /absolute/path/to/pi-compact
 ```
 
-当前项目使用 Pi 的 `@earendil-works/pi-coding-agent` API，并已按 Pi `0.85.1` 进行验证。Pi 和 `typebox` 是 peer dependencies，由 Pi 环境提供。
+当前项目使用 Pi 的 `@earendil-works/pi-coding-agent` API，并已按 Pi `0.86.1` 进行验证。Pi 和 `typebox` 是 peer dependencies，由 Pi 环境提供；开发依赖固定 Pi `0.86.1`，用于可重复的宿主集成测试。
 
 ## 配置
 
@@ -178,10 +178,10 @@ pi install -l /absolute/path/to/pi-compact
 | `memory.pinnedInjection` | `true` | 是否在每次 context 请求注入 pinned/active 工作记忆提示 |
 | `memory.proposalsProvisionalOnly` | `true` | 模型提议只能以 provisional 写入；即使设为 `false` 也不会自动升级为 active/pinned |
 | `memory.hintMaxChars` | `4000` | 工作记忆提示的最大字符数；pinned 优先，不会被普通召回挤掉 |
-| `memory.deriveOnCompact` | `true` | 压缩时是否写入规则派生的 provisional 记录（文件/命令/退出码/测试计数） |
+| `memory.deriveOnCompact` | `true` | 压缩成功提交后是否写入规则派生的 provisional 记录（文件/命令/退出码/测试计数） |
 | `history.autoRecallPrimaryOnly` | `true` | 自动历史召回默认只使用 primary 记录 |
 | `history.excludeInContext` | `true` | 自动召回排除当前请求已经存在的 entry（以 `buildContextEntries()` 为准） |
-| `window.manifest` | `true` | 压缩时是否写入 WindowManifest 与窗口事件日志 |
+| `window.manifest` | `true` | 压缩成功提交后是否写入 WindowManifest 与窗口事件日志；取消不写入 |
 
 也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认安全策略：记忆开启、pinned 注入开启、模型提议仅 provisional、自动历史召回仅 primary。
 
@@ -222,11 +222,17 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 | 工具 | 说明 |
 | --- | --- |
-| `pi_memory_search` | 搜索记忆；未给查询时列出 pinned/active/provisional |
-| `pi_memory_read` | 按 ID 读取；长内容可用 `offset`/`limit` 分段 |
+| `pi_memory_search` | 搜索记忆；无关键词且无显式 status 时列出 pinned/active/provisional；支持 offset/limit 分页 |
+| `pi_memory_read` | 按 ID 读取；默认读取 4000 字符，长内容通过 offset/limit 分段 |
 | `pi_memory_propose` | 模型提出 provisional 记忆，不会自动变成 active/pinned |
 | `pi_memory_update` | 只能 edit/resolve 模型自己的 provisional 提议 |
-| `pi_compact_new_context` | 若存在 `ctx.compact` 则请求 Pi 原生 compact；否则提示使用 `/compact`，属于安全兼容降级 |
+| `pi_compact_new_context` | 登记换窗请求；同批工具全部完成后压缩，成功后继续当前任务；不支持时提示使用 `/compact` |
+
+`memory.enabled=false` 会同时禁用记忆命令、搜索、读取、提议和修改。`scope:session` 的记录仅在创建它的同一 sessionId 下可见、可修改；没有有效 sessionId 时不能创建或访问会话范围记录。`project` 和 `user` 保持当前项目内共享的行为，不会转存到用户全局目录。
+
+记忆搜索和读取的总文本输出上限固定为 16000 字符，包含 JSON 元数据与转义。搜索对每条正文生成最多 600 字符的片段，省略的完整内容可按 ID 读取；读取默认段长为 4000，显式大 limit 也受总预算限制。搜索的 `details.nextOffset` 是下一页记录偏移；读取 JSON 的 `nextOffset` 是下一段正文字符偏移。显式查询 `status:resolved` 或 `status:superseded` 无需同时提供关键词。过大的元数据会标记 `metadataTruncated`，原始记忆仍保留在日志中。
+
+换窗工具只在压缩成功回调之后发起一次续跑。工具批次被用户中止、压缩失败或取消、会话切换，或已有新输入时，不会擅自续跑；失败仍可使用 Pi 原生 `/compact` 重试。
 
 规则派生记忆带 `author=rule` 与 provenance，状态为 provisional，不是用户确认的事实。
 
@@ -322,14 +328,14 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 压缩时：
 
-1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界。
+1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界，包括原生选取的 `usage`、`model_change` 等无上下文消息的元数据条目。
 2. 将边界之前的原始 entries 转换成带 ID 的记录。
-3. 生成 checkpoint：写入 windowId/parentWindowId/sourceHash/previousHash 等指针字段，再按原始 entry 顺序写出 `## Timeline`（`sourceOrdinal`），然后保留现有分类区块（用户消息、assistant 消息、工具调用、工具结果、命令和其他 session context）。Timeline 与分类区块共用字符预算和省略计数。checkpoint 明确不是 primary memory。
-4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars`、`estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）和可选的 `window` manifest。扩展不会伪造计费 `usage`；Pi 会自行计算包含完整上下文的压缩后估算值。
+3. 生成只含 `compactor`、`sourceCount`、`sourceHash` 的确定性 checkpoint；不复制历史正文，checkpoint 不是 primary memory。
+4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars`、`isSplitTurn`、`estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）。扩展不会伪造计费 `usage`；Pi 会自行计算包含完整上下文的压缩后估算值。
 5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；边界不安全时先回退到更早的安全边界（保留更多内容），找不到任何安全边界或请求已中止才返回 `{ cancel: true }`，不落回默认 LLM 摘要。处理出错时降级为指针型 checkpoint，而不是让 Pi 改用 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
-6. 窗口事件写入 `.pi/pi-compact/windows.jsonl`，形成 previousHash 链；写入同样受按日志文件锁保护，读取同样按可信前缀规则校验。模型可通过 `pi_compact_new_context` 请求新窗口；若当前 API 没有 `ctx.compact`，则提示使用 `/compact`。
+6. Pi 提交 compaction 并发出成功事件后，才在同一文件锁中生成窗口清单并写入 `.pi/pi-compact/windows.jsonl`；窗口 ID 绑定 sessionId 与实际 compaction entry，重复事件不会重复写入。规则派生记忆也在成功后写入。失败或取消不会留下窗口及派生记录。旧 checkpoint 中的 `details.window` 仍可读取，新清单以窗口日志为准。
 
-原始 session entries 才是历史事实来源；用户写入的 memory log 才是长期记忆事实来源。checkpoint 会折叠空白、截短长记录，并在预算不足时省略记录；它不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。
+原始 session entries 才是历史事实来源；用户写入的 memory log 才是长期记忆事实来源。checkpoint 只保存计数和哈希，不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。
 
 扩展不删除原始 session entries，也不建立独立备份；原文仍依赖 Pi 的 session 存储。有限上下文不能同时展示全部历史。
 
@@ -346,6 +352,8 @@ npm ci
 ```bash
 npm test
 ```
+
+`npm test` 同时运行单元测试与 Pi SDK 集成测试；仅运行宿主生命周期回归可使用 `npm run test:integration`。集成测试使用本地 Faux provider，不需要 API key，不访问线上模型，所有会话和日志都写入临时目录。
 
 运行 TypeScript 类型检查：
 
@@ -400,7 +408,10 @@ tests/                   单元测试
 - 日志锁回收在 token/metadata 不匹配时不删除，也不会自动删除无效 metadata；活锁不按年龄回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
 - 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
 
-尚未作为完整端到端场景验证：真实模型响应、overflow retry 的完整运行过程，以及跨 session 或 branch 切换下的长时间运行行为。
+- Pi 0.86.1 真实 SDK 的元数据切点、完整 overflow retry、并行及顺序工具换窗后续跑、用户中止、取消后的无副作用、成功事件去重和会话保存恢复。
+- 记忆工具禁用、session 范围隔离、显式历史状态查询、长正文与 JSON 元数据预算、搜索和读取分页。
+
+尚未覆盖线上模型 API 的真实网络响应和计费，以及交互 TUI 的人工操作与长时间运行。
 
 ## 许可证
 

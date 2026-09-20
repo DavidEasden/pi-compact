@@ -69,18 +69,12 @@ const boundMetadata = (record: MemoryRecord): BoundedMetadata => {
 
 /** 兜底降级：仅保留少量不可省略字段，保证即便是异常巨大的元数据也能产出有界有效 JSON。 */
 const minimalMetadata = (record: MemoryRecord): Record<string, unknown> => ({
-  id: record.id,
+  id: record.id.slice(0, METADATA_MAX_STRING_CHARS),
   kind: record.kind,
   scope: record.scope,
   status: record.status,
-  priority: record.priority,
-  author: record.author,
   sourceEntryIds: [],
-  sourceHash: record.sourceHash,
-  createdAt: record.createdAt,
-  updatedAt: record.updatedAt,
-  version: record.version,
-  pinned: record.pinned,
+  sourceHash: record.sourceHash.slice(0, METADATA_MAX_STRING_CHARS),
 });
 
 export interface MemoryReadResult {
@@ -113,21 +107,14 @@ export const formatMemoryRead = (record: MemoryRecord, options?: { offset?: numb
   const offset = Math.max(0, Math.floor(options?.offset ?? 0));
   const requested = options?.limit == null ? MEMORY_READ_DEFAULT_CHARS : Math.max(1, Math.floor(options.limit));
   const totalChars = record.content.length;
-  const ceiling = Math.min(requested, Math.max(0, totalChars - offset));
+  const ceiling = Math.min(requested, Math.max(0, totalChars - offset), MEMORY_TOOL_MAX_CHARS);
 
   let metadata = boundMetadata(record);
   let metadataTruncated = metadata.truncated;
-  if (renderRead(metadata.metadata, offset, totalChars, metadataTruncated, "", offset, offset < totalChars).length > MEMORY_TOOL_MAX_CHARS) {
+  // 除元数据外至少为下一个正文字符留空间，避免 nextOffset 停留原处而无法继续读取。
+  if (renderRead(metadata.metadata, offset, totalChars, metadataTruncated, record.content.slice(offset, offset + 1), offset + 1, offset < totalChars).length > MEMORY_TOOL_MAX_CHARS) {
     metadata = { metadata: minimalMetadata(record), truncated: true };
     metadataTruncated = true;
-  }
-  if (renderRead(metadata.metadata, offset, totalChars, metadataTruncated, "", offset, offset < totalChars).length > MEMORY_TOOL_MAX_CHARS) {
-    return {
-      text: JSON.stringify({ id: record.id, content: "", offset, totalChars, truncated: true, nextOffset: offset, metadataTruncated: true }),
-      truncated: true,
-      nextOffset: offset,
-      metadataTruncated: true,
-    };
   }
 
   let low = 0;
@@ -170,21 +157,22 @@ export const formatMemorySearch = (records: MemoryRecord[], options?: { header?:
       : record.content;
     return `${title}\n  ${snippet}`;
   };
-  const render = (entries: string[], remaining: number): string => {
-    const trailer = remaining > 0 ? `\n…[其余 ${remaining} 条已省略；继续时使用 nextOffset=${entries.length}]` : "";
-    return `${header}${entries.map((entry) => `\n${entry}`).join("")}${trailer}`;
-  };
+  const trailer = "\n…[输出已截断；用 pi_memory_read 读取条目，或按结果 details.nextOffset 继续搜索]";
+  const render = (entries: string[], remaining: number): string => (
+    `${header}${entries.map((entry) => `\n${entry}`).join("")}${remaining > 0 ? trailer : ""}`
+  );
 
   const entries: string[] = [];
+  let clippedEntry = false;
   for (const record of records) {
     const candidate = [...entries, entryFor(record)];
     if (render(candidate, records.length - candidate.length).length > MEMORY_TOOL_MAX_CHARS) break;
     entries.push(candidate[candidate.length - 1]);
   }
   if (entries.length === 0 && records.length > 0) {
-    const trailer = `\n…[其余 ${records.length} 条已省略；继续时使用 nextOffset=1]`;
     const room = Math.max(0, MEMORY_TOOL_MAX_CHARS - header.length - trailer.length - 1);
     entries.push(entryFor(records[0]).slice(0, room));
+    clippedEntry = true;
   }
 
   const shown = entries.length;
@@ -192,7 +180,7 @@ export const formatMemorySearch = (records: MemoryRecord[], options?: { header?:
   return {
     text: render(entries, remaining),
     shown,
-    truncated: remaining > 0,
+    truncated: clippedEntry || remaining > 0 || records.slice(0, shown).some((record) => record.content.length > MEMORY_SEARCH_ENTRY_CHARS),
     ...(remaining > 0 ? { nextOffset: shown } : {}),
   };
 };
