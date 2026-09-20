@@ -75,6 +75,20 @@ test("事件重放是确定性的，重复 seq 不会覆盖首次事件", () => 
   assert.equal(first.find((record) => record.id === "mem_c")?.content, "third");
 });
 
+test("projector 拒绝 model/rule 创建 active 或 pin 权威记忆", () => {
+  const records = projectMemories([
+    event({ seq: 1, author: "model", recordId: "model-active", type: "create", payload: createPayload("模型伪造的 active", "active") }),
+    event({ seq: 2, author: "rule", recordId: "rule-active", type: "create", payload: createPayload("规则伪造的 active", "active") }),
+    event({ seq: 3, author: "model", recordId: "model-provisional", type: "create", payload: createPayload("模型 provisional", "provisional") }),
+    event({ seq: 4, author: "model", recordId: "model-provisional", type: "pin", payload: {} }),
+  ]);
+  assert.equal(records.some((record) => record.id === "model-active"), false);
+  assert.equal(records.some((record) => record.id === "rule-active"), false);
+  const provisional = records.find((record) => record.id === "model-provisional");
+  assert.equal(provisional?.status, "provisional");
+  assert.equal(provisional?.pinned, false);
+});
+
 test("supersede 与 pin 建立版本关系，且不会改写已终结记录", () => {
   const events: MemoryEvent[] = [
     event({ seq: 1, recordId: "mem_old", type: "create", payload: createPayload("v1") }),
@@ -322,39 +336,6 @@ test("window 断链后拒绝追加，只保留可信前缀", () => {
   }
 });
 
-test("工作记忆 hint 同轮重试递增，新用户回合重置", () => {
-  const cwd = tempCwd();
-  try {
-    appendMemoryEvent(cwd, { type: "create", recordId: "mem_keep", author: "user", payload: createPayload("固定事实") });
-    appendMemoryEvent(cwd, { type: "pin", recordId: "mem_keep", author: "user", payload: {} });
-    const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
-    const pi = {
-      on(name: string, handler: (event: any, ctx: any) => any) {
-        const list = handlers.get(name) ?? [];
-        list.push(handler);
-        handlers.set(name, list);
-      },
-    };
-    registerHooks(pi as any);
-    const context = handlers.get("context")![0];
-    const entries: SessionEntryLike[] = [
-      { type: "message", id: "u1", message: { role: "user", content: "第一轮" } },
-      { type: "message", id: "a1", parentId: "u1", message: { role: "assistant", content: "ok" } },
-    ];
-    const ctx = { cwd, sessionManager: { getSessionId: () => "sess-1", getBranch: () => entries } };
-    const hintOf = (result: any) => result?.messages?.find((message: any) => message.customType === "pi-compact-memory-hint");
-    const first = context({ type: "context", messages: [{ role: "user", content: "第一轮" }] }, ctx);
-    assert.equal(hintOf(first).details.sameTurnInjectionCount, 1);
-    const retry = context({ type: "context", messages: [{ role: "user", content: "第一轮" }] }, ctx);
-    assert.equal(hintOf(retry).details.sameTurnInjectionCount, 2);
-    entries.push({ type: "message", id: "u2", parentId: "a1", message: { role: "user", content: "第二轮" } });
-    const nextTurn = context({ type: "context", messages: [{ role: "user", content: "第二轮" }] }, ctx);
-    assert.equal(hintOf(nextTurn).details.sameTurnInjectionCount, 1);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
 test("工作记忆预算优先保留 pinned，不会被 active 挤掉", () => {
   const pinned: MemoryRecord = {
     id: "mem_pin",
@@ -393,63 +374,6 @@ test("没有 pinned 记忆时仍注入查询说明", () => {
   assert.match(hint.content, /\/remember/);
   assert.match(hint.content, /pi_memory_search/);
   assert.match(hint.content, /pi_compact_recall/);
-});
-
-test("100 次模拟压缩后 pinned 记忆仍被注入，窗口哈希链连续", async () => {
-  const cwd = tempCwd();
-  try {
-    appendMemoryEvent(cwd, { type: "create", recordId: "mem_keep", author: "user", payload: createPayload("跨压缩保留的事实") });
-    appendMemoryEvent(cwd, { type: "pin", recordId: "mem_keep", author: "user", payload: {} });
-    const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
-    const pi = {
-      on(name: string, handler: (event: any, ctx: any) => any) {
-        const list = handlers.get(name) ?? [];
-        list.push(handler);
-        handlers.set(name, list);
-      },
-    };
-    registerHooks(pi as any);
-    const compact = handlers.get("session_before_compact")![0];
-    const context = handlers.get("context")![0];
-    const ctx = { cwd, ui: { notify() {} }, sessionManager: { getSessionId: () => "sess-1" } };
-    for (let index = 0; index < 100; index++) {
-      const userId = `u${index}`;
-      const assistantId = `a${index}`;
-      const branch: SessionEntryLike[] = [
-        { type: "message", id: userId, message: { role: "user", content: `步骤 ${index} token 刷新` } },
-        { type: "message", id: assistantId, parentId: userId, message: { role: "assistant", content: "继续" } },
-      ];
-      const result = await compact({
-        reason: "threshold",
-        branchEntries: branch,
-        preparation: { firstKeptEntryId: assistantId, tokensBefore: 80, isSplitTurn: false, turnPrefixMessages: [] },
-        signal: new AbortController().signal,
-      }, ctx);
-      assert.equal(result.compaction.details.window.previousHash === "" || result.compaction.details.window.previousHash.length === 64, true);
-    }
-    const windows = readWindowEvents(cwd);
-    assert.equal(windows.length, 100);
-    for (let index = 1; index < windows.length; index++) {
-      assert.equal(windows[index].previousHash, windows[index - 1].hash);
-      assert.equal(windows[index].prevHash, windows[index - 1].hash);
-      assert.equal(windows[index].parentWindowId, windows[index - 1].windowId);
-    }
-    const injected = context({
-      type: "context",
-      messages: [{ role: "user", content: "请继续" }],
-    }, {
-      cwd,
-      sessionManager: {
-        getSessionId: () => "sess-1",
-        getBranch: () => [{ type: "message", id: "now", message: { role: "user", content: "请继续" } }],
-      },
-    });
-    const hint = injected.messages.find((message: any) => message.customType === "pi-compact-memory-hint");
-    assert.match(hint.content, /mem_keep/);
-    assert.match(hint.content, /跨压缩保留的事实/);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
 });
 
 test("规则派生只提取文件、命令、退出码和测试计数", () => {

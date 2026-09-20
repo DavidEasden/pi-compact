@@ -1,17 +1,15 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
-import { clip, estimateTokensFromChars, messageText, toolCallIds } from "./core/content.ts";
+import { toolCallIds } from "./core/content.ts";
 import { deriveFacts } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
-import { analyzeAutoRecallQuery } from "./core/auto-recall.ts";
-import { contextEntryIds, hashRecords, recordsFromEntries, searchRecords } from "./core/session.ts";
+import { hashRecords, recordsFromEntries } from "./core/session.ts";
 import { appendMemoryEvent, loadMemories, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
-import { buildWindowManifest, persistWindowManifest, windowHeaderLines } from "./core/window.ts";
-import { MEMORY_HINT_TYPE, renderWorkingHint } from "./core/working.ts";
-import type { AutoRecallMode, SessionEntryLike } from "./types.ts";
+import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
+import type { SessionEntryLike } from "./types.ts";
 
 export const AUTO_RECALL_TYPE = "pi-compact-auto-recall";
-export { MEMORY_HINT_TYPE };
+export const MEMORY_HINT_TYPE = "pi-compact-memory-hint";
 
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TERMINAL_ASSISTANT_REASONS = new Set(["error", "aborted"]);
@@ -137,46 +135,6 @@ export const findEarlierSafeCut = (branch: SessionEntryLike[], proposedId: strin
   return undefined;
 };
 
-const latestUser = (messages: any[]): { text: string } => {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    if (messages[index]?.role === "user") return { text: messageText(messages[index]) };
-  }
-  return { text: "" };
-};
-
-const completeLines = (lines: string[], maxChars: number): string => {
-  const assembled = lines.join("\n");
-  if (assembled.length <= maxChars) return assembled;
-  const boundary = assembled.lastIndexOf("\n", Math.max(0, maxChars));
-  return boundary > 0 ? assembled.slice(0, boundary) : assembled.slice(0, maxChars);
-};
-
-const renderRecall = (hits: ReturnType<typeof searchRecords>, maxChars: number, mode: AutoRecallMode): string => {
-  const lines = [
-    "[pi-compact automatic exact-history recall]",
-    mode === "hint"
-      ? "Matched original session records (short hints, not an LLM summary):"
-      : "Matched original session records (not an LLM summary):",
-  ];
-  for (const hit of hits) {
-    const customType = hit.customType ? ` customType=${hit.customType}` : "";
-    if (mode === "hint") {
-      const files = hit.files.length > 0 ? ` files=${hit.files.join(",")}` : "";
-      lines.push(`- [${hit.entryId}] kinds=${hit.kinds.join(",")}${customType}${files}`);
-      continue;
-    }
-    lines.push(`- [${hit.entryId}] ${hit.kinds.join(",")}${customType} ${clip(hit.snippet.replace(/\s+/g, " "), 650)}`);
-  }
-  return completeLines(lines, maxChars);
-};
-
-interface InjectionCache {
-  key: string;
-  content: string;
-  ids: string[];
-  injectionCount: number;
-}
-
 const sessionIdOf = (ctx: any): string | undefined => {
   try {
     const id = ctx.sessionManager?.getSessionId?.();
@@ -205,13 +163,8 @@ const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromEntri
 
 const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: number, summaryMaxChars: number) => ({
   compaction: {
-    summary: [
-      "[pi-compact deterministic context checkpoint]",
-      `compaction reason: ${reason}`,
-      `retained context starts at entry: ${keptEntryId}`,
-      "Extension compaction recovered from an internal error. Original session entries remain retrievable via pi_compact_recall.",
-      "This checkpoint is a deterministic pointer/audit extract, not primary memory.",
-    ].join("\n"),
+    // 降级路径也不复制历史、ID 或异常文本，不添加行为提示词。
+    summary: summaryMaxChars >= 2 ? "{}" : "",
     firstKeptEntryId: keptEntryId,
     tokensBefore,
     details: {
@@ -223,17 +176,14 @@ const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: n
       sourceRecordCount: 0,
       keptEntryId,
       omittedRecordCount: 0,
-      checkpointChars: 0,
+      checkpointChars: summaryMaxChars >= 2 ? 2 : 0,
       summaryMaxChars,
-      estimatedTokensAfter: 0,
+      estimatedTokensAfter: summaryMaxChars >= 2 ? 1 : 0,
     },
   },
 });
 
 export const registerHooks = (pi: ExtensionAPI): void => {
-  let autoRecallCache: InjectionCache | null = null;
-  let memoryHintCache: InjectionCache | null = null;
-
   pi.on("session_before_compact", async (event: any, ctx: any) => {
     const config = loadConfig(ctx.cwd);
     if (!config.enabled || !config.overrideDefaultCompaction) return;
@@ -266,7 +216,6 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       const records = recordsFromEntries(branch.slice(0, cutIndex));
       const sourceHash = hashRecords(records);
       const sessionId = sessionIdOf(ctx);
-      let extraHeaderLines: string[] = ["This checkpoint is a deterministic pointer/audit extract, not primary memory."];
       let window = undefined;
       if (config.window.manifest) {
         try {
@@ -284,7 +233,6 @@ export const registerHooks = (pi: ExtensionAPI): void => {
             persistWindowManifest(ctx.cwd, manifest);
             return manifest;
           });
-          extraHeaderLines = [...windowHeaderLines(window), extraHeaderLines[0]];
         } catch {
           window = undefined;
         }
@@ -296,7 +244,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
           // 规则派生失败不得阻断压缩。
         }
       }
-      const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars, { extraHeaderLines });
+      const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
       const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars, window);
       if (config.debug) {
         console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);
@@ -313,124 +261,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     }
   });
 
-  // `context` 只修改当前 provider 请求；Pi 不会把返回的 custom message 持久化为 session entry。
-  pi.on("context", (event: any, ctx: any) => {
-    const config = loadConfig(ctx.cwd);
-    if (!config.enabled) return;
-    const messages = [...event.messages];
-    const sessionId = sessionIdOf(ctx) ?? "";
-    let currentBranch: SessionEntryLike[] | undefined;
-    try {
-      const branch = ctx.sessionManager?.getBranch?.();
-      if (Array.isArray(branch)) currentBranch = branch;
-    } catch {
-      currentBranch = undefined;
-    }
-    // 本回合最新的 user entry：作为工作记忆 hint 的回合键，新回合重置注入计数。
-    let latestUserEntry: { index: number; id?: string } | undefined;
-    if (currentBranch) {
-      for (let index = currentBranch.length - 1; index >= 0; index--) {
-        const entry = currentBranch[index];
-        if (entry?.type === "message" && entry.message?.role === "user") {
-          latestUserEntry = { index, id: typeof entry.id === "string" ? entry.id : undefined };
-          break;
-        }
-      }
-    }
-    let changed = false;
-
-    if (config.memory.enabled && config.memory.pinnedInjection && !messages.some((message: any) => message.customType === MEMORY_HINT_TYPE)) {
-      const memories = loadMemories(ctx.cwd);
-      const liveKey = memories
-        .filter((record) => record.status === "pinned" || record.status === "active")
-        .map((record) => `${record.id}:${record.updatedAt}:${record.status}`)
-        .join(",");
-      // 回合键：本回合最新 user entry id；branch 不可用时退化为当前 user 文本。
-      const turnKey = latestUserEntry?.id ?? latestUser(event.messages).text;
-      const hintKey = `${sessionId}\u0000${turnKey}\u0000${liveKey}\u0000${config.memory.hintMaxChars}`;
-      if (memoryHintCache?.key !== hintKey) {
-        const hint = renderWorkingHint(memories, config.memory.hintMaxChars);
-        memoryHintCache = { key: hintKey, content: hint.content, ids: [...hint.pinnedIds, ...hint.activeIds], injectionCount: 0 };
-      }
-      if (memoryHintCache.content) {
-        memoryHintCache.injectionCount += 1;
-        const chars = memoryHintCache.content.length;
-        messages.push({
-          role: "custom",
-          customType: MEMORY_HINT_TYPE,
-          timestamp: Date.now(),
-          content: memoryHintCache.content,
-          display: false,
-          details: {
-            source: "working-memory",
-            memoryIds: memoryHintCache.ids,
-            chars,
-            estimatedTokens: estimateTokensFromChars(chars),
-            sameTurnInjectionCount: memoryHintCache.injectionCount,
-          },
-        });
-        changed = true;
-      }
-    }
-
-    if (config.autoRecallMode !== "off" && !messages.some((message: any) => message.customType === AUTO_RECALL_TYPE)) {
-      const current = latestUser(event.messages);
-      const autoQuery = analyzeAutoRecallQuery(current.text);
-      // 自动召回只使用高置信词/短语；长度>=3 不再作为唯一门槛。手动召回不走此门控。
-      if (autoQuery.eligible && currentBranch) {
-        const latestUserId = latestUserEntry?.id;
-        const latestUserIndex = latestUserEntry?.index ?? -1;
-        if (typeof latestUserId === "string" && latestUserIndex >= 0) {
-          const cacheKey = `${sessionId}\u0000${latestUserId}\u0000${current.text}\u0000${autoQuery.terms.join("\u0001")}\u0000${config.recallMaxResults}\u0000${config.autoRecallMaxChars}\u0000${config.autoRecallMode}\u0000${config.history.autoRecallPrimaryOnly}\u0000${config.history.excludeInContext}`;
-          if (autoRecallCache?.key !== cacheKey) {
-            const historyEntries = currentBranch.slice(0, latestUserIndex);
-            let records = recordsFromEntries(historyEntries);
-            if (config.history.autoRecallPrimaryOnly) records = records.filter((record) => record.sourceClass === "primary");
-            if (config.history.excludeInContext) {
-              const inContext = contextEntryIds(ctx.sessionManager);
-              if (inContext.size > 0) records = records.filter((record) => !inContext.has(record.entryId));
-            }
-            const hits = searchRecords(records, current.text, {
-              maxResults: config.recallMaxResults,
-              sourceClass: config.history.autoRecallPrimaryOnly ? "primary" : "all",
-              terms: autoQuery.terms,
-            });
-            autoRecallCache = hits.length === 0
-              ? { key: cacheKey, content: "", ids: [], injectionCount: 0 }
-              : { key: cacheKey, content: renderRecall(hits, config.autoRecallMaxChars, config.autoRecallMode), ids: hits.map((hit) => hit.entryId), injectionCount: 0 };
-          }
-          if (autoRecallCache.content) {
-            autoRecallCache.injectionCount += 1;
-            const chars = autoRecallCache.content.length;
-            const estimatedTokens = estimateTokensFromChars(chars);
-            if (config.debug) {
-              console.log(`[pi-compact] auto-recall: hitCount=${autoRecallCache.ids.length} chars=${chars} mode=${config.autoRecallMode} sameTurnInjectionCount=${autoRecallCache.injectionCount} estimatedTokens=${estimatedTokens}`);
-            }
-            messages.push({
-              role: "custom",
-              customType: AUTO_RECALL_TYPE,
-              timestamp: Date.now(),
-              content: autoRecallCache.content,
-              display: false,
-              details: {
-                source: "request-context",
-                entryIds: autoRecallCache.ids,
-                chars,
-                hitCount: autoRecallCache.ids.length,
-                estimatedTokens,
-                mode: config.autoRecallMode,
-                sameTurnInjectionCount: autoRecallCache.injectionCount,
-              },
-            });
-            changed = true;
-          }
-        }
-      }
-    }
-
-    if (!changed) return;
-    return { messages };
-  });
+  // 不注册 context 注入：旧配置也不能重新开启历史正文或工作记忆提示。
 
   pi.on("session_compact", (event: any, ctx: any) => {
     if (event.fromExtension) ctx.ui.notify(`pi-compact: ${event.reason} 确定性压缩完成`, "info");

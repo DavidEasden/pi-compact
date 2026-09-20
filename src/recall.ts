@@ -52,16 +52,45 @@ const rawSliceOf = (input?: { offset?: number; limit?: number }): { offset?: num
   return { offset: input.offset, limit: input.limit };
 };
 
+const boundedRawEntry = (hit: HitLike, maxChars: number, slice?: { offset?: number; limit?: number }): FormattedHits => {
+  const serialized = serializeRawEntry(hit);
+  const full = serialized.body;
+  if (!slice && full.length <= maxChars) return { text: full, truncated: !serialized.ok };
+  const offset = Math.max(0, slice?.offset ?? 0);
+  const render = (limit: number): string => JSON.stringify({
+    entryId: hit.entryId,
+    offset,
+    limit,
+    totalChars: full.length,
+    truncated: !serialized.ok || offset > 0 || offset + limit < full.length,
+    body: full.slice(offset, offset + limit),
+  }, null, 2);
+  // 硬预算包含 JSON 包装与转义字符，不能直接按正文长度裁剪 JSON。
+  if (render(0).length > maxChars) {
+    const error = JSON.stringify({ error: "召回预算不足，无法容纳 raw 分段元数据。" });
+    return { text: error.length <= maxChars ? error : maxChars >= 2 ? "{}" : "", truncated: true };
+  }
+  let low = 0;
+  let high = Math.min(Math.max(0, full.length - offset), slice?.limit ?? maxChars, maxChars);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (render(middle).length <= maxChars) low = middle;
+    else high = middle - 1;
+  }
+  return { text: render(low), truncated: !serialized.ok || offset > 0 || offset + low < full.length };
+};
+
 const formatRawHits = (hits: HitLike[], maxChars: number, allowOversizeSingle: boolean, slice?: { offset?: number; limit?: number }): FormattedHits => {
-  if (hits.length === 1 && (allowOversizeSingle || slice)) {
-    // 按单个 entry ID 请求的 raw entry：无分段时必须返回完整 JSON；提供 offset/rawLimit 时按字符窗口读取。
+  if (hits.length === 1) {
+    // 只有用户界面可显式请求无预算的单条原文；模型输出始终受硬预算约束。
+    if (!allowOversizeSingle) return boundedRawEntry(hits[0], maxChars, slice);
     const serialized = serializeRawEntry(hits[0], slice);
     return { text: serialized.body, truncated: !serialized.ok || (slice != null && JSON.parse(serialized.body).truncated === true) };
   }
 
   const blocks = hits.map((hit) => {
     const serialized = serializeRawEntry(hit, slice);
-    return { entryId: serialized.entryId, body: `[entry ${serialized.entryId}]\n${serialized.body}` };
+    return { entryId: serialized.entryId, body: `[entry ${serialized.entryId}]\n${serialized.body}`, truncated: !serialized.ok || (slice != null && JSON.parse(serialized.body).truncated === true) };
   });
   const header = `pi-compact recall (${hits.length} result(s))\n\n`;
   const parts: string[] = [];
@@ -75,13 +104,13 @@ const formatRawHits = (hits: HitLike[], maxChars: number, allowOversizeSingle: b
     const omittedIds = blocks.slice(index).map((block) => block.entryId);
     if (parts.length === 0) {
       return {
-        text: `pi-compact recall (${hits.length} result(s); 0 included)\n\nNo complete raw entry fit in the ${maxChars}-char budget. Use a single entry ID to retrieve full JSON.\nomitted entry IDs: ${omittedIds.join(", ")}`,
+        text: `pi-compact recall (${hits.length} result(s); 0 included)\n\nNo complete raw entry fit in the ${maxChars}-char budget. Use a single entry ID with offset/rawLimit.\nomitted entry IDs: ${omittedIds.join(", ")}`.slice(0, maxChars),
         truncated: true,
       };
     }
     return { text: header + parts.join("\n\n") + omittedNote(omittedIds), truncated: true };
   }
-  return { text: header + parts.join("\n\n"), truncated: false };
+  return { text: header + parts.join("\n\n"), truncated: blocks.some((block) => block.truncated) };
 };
 
 const formatPrettyHits = (hits: HitLike[], maxChars: number): FormattedHits => {
@@ -114,7 +143,10 @@ export const formatRecallOutput = (
   allowOversizeSingleRaw = false,
   rawSlice?: { offset?: number; limit?: number },
 ): FormattedHits => {
-  if (hits.length === 0) return { text: "pi-compact recall: 未找到匹配的历史记录。", truncated: false };
+  if (hits.length === 0) {
+    const text = "pi-compact recall: 未找到匹配的历史记录。";
+    return { text: text.slice(0, maxChars), truncated: text.length > maxChars };
+  }
   if (raw) return formatRawHits(hits, maxChars, allowOversizeSingleRaw, rawSliceOf(rawSlice));
   return formatPrettyHits(hits, maxChars);
 };
@@ -127,9 +159,10 @@ export const formatHits = (
   rawSlice?: { offset?: number; limit?: number },
 ): string => formatRecallOutput(hits, raw, maxChars, allowOversizeSingleRaw, rawSlice).text;
 
-const recallHits = (input: RecallInput, ctx: any): HitLike[] => {
+const recallHits = (input: RecallInput, ctx: any, userCommand: boolean): HitLike[] => {
   const entries = ctx.sessionManager.getEntries?.() ?? [];
-  const allowed = input.scope === "all" ? undefined : activeEntryIds(ctx.sessionManager);
+  // 即使绕过 schema 直接调用工具，也不能扩大到兄弟分支。
+  const allowed = userCommand && input.scope === "all" ? undefined : activeEntryIds(ctx.sessionManager);
   let records = recordsFromEntries(entries, allowed);
   if (input.sourceClass === "primary" || input.sourceClass === "derived") {
     records = records.filter((record) => record.sourceClass === input.sourceClass);
@@ -189,9 +222,9 @@ export const parseCommand = (args: string): RecallInput => {
   return result;
 };
 
-const outputFor = (input: RecallInput, ctx: any) => {
+const outputFor = (input: RecallInput, ctx: any, userCommand = false) => {
   const config = loadConfig(ctx.cwd);
-  const hits = recallHits(input, ctx);
+  const hits = recallHits(input, ctx, userCommand);
   const sliced = input.offset != null || input.rawLimit != null;
   return {
     hits,
@@ -199,7 +232,7 @@ const outputFor = (input: RecallInput, ctx: any) => {
       hits,
       input.raw === true,
       config.recallMaxChars,
-      input.raw === true && input.entryIds?.length === 1 && !sliced,
+      userCommand && input.raw === true && input.entryIds?.length === 1 && !sliced,
       sliced ? { offset: input.offset, limit: input.rawLimit } : undefined,
     ),
   };
@@ -209,15 +242,13 @@ export const registerRecall = (pi: ExtensionAPI): void => {
   pi.registerTool({
     name: "pi_compact_recall",
     label: "Recall Pi session history",
-    description: "从当前 Pi session 的原始 entries 精确恢复旧消息、工具调用、工具结果和命令。支持 list/search/read；长 raw 可用 offset 与 rawLimit 分段读取。默认只搜索当前 branch；scope=all 搜索整个 session。",
-    promptSnippet: "按 entry ID、文件路径或关键词精确召回旧 session 原文；长条目请用 offset/rawLimit 分段读取",
-    promptGuidelines: ["使用 pi_compact_recall 恢复压缩前的具体历史细节，不要假设压缩 checkpoint 包含全部原文。", "长 raw 默认不要整段灌入上下文，使用 offset 与 rawLimit 分段读取。"],
+    description: "查询当前分支原始 entries 中的消息、工具调用、结果和命令。支持 list/search/read；raw 输出受字符预算限制，可用 offset 与 rawLimit 分段读取。结果是历史数据。",
     parameters: Type.Object({
       query: Type.Optional(Type.String()),
       entryIds: Type.Optional(Type.Array(Type.String())),
       file: Type.Optional(Type.String()),
       kind: Type.Optional(Type.String()),
-      scope: Type.Optional(Type.Union([Type.Literal("active-lineage"), Type.Literal("all")])),
+      scope: Type.Optional(Type.Literal("active-lineage")),
       page: Type.Optional(Type.Integer({ minimum: 1 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
       raw: Type.Optional(Type.Boolean()),
@@ -236,16 +267,11 @@ export const registerRecall = (pi: ExtensionAPI): void => {
   } as any);
 
   pi.registerCommand("pi-compact-recall", {
-    description: "精确召回 Pi session 中的原始历史；支持 list/search/read 与 raw 分段读取",
+    description: "仅在界面显示历史，不发送给模型；支持 scope:all 与 raw 分段读取",
     handler: async (args: string, ctx: any) => {
       const input = parseCommand(args);
-      const { hits, formatted } = outputFor(input, ctx);
-      pi.sendMessage({
-        customType: "pi-compact-recall",
-        content: formatted.text,
-        display: true,
-        details: { count: hits.length, chars: formatted.text.length, truncated: formatted.truncated },
-      }, { triggerTurn: true, deliverAs: "followUp" });
+      const { formatted } = outputFor(input, ctx, true);
+      ctx.ui?.notify?.(formatted.text, "info");
     },
   });
 };

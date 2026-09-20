@@ -116,7 +116,7 @@ test("关键词召回仍按字符预算截断，保持兼容", () => {
   assert.equal(formatted.text.includes("[entry"), false);
 });
 
-test("非 entry ID 的单条 raw 命中仍遵守字符预算", () => {
+test("非 entry ID 的单条 raw 命中受硬字符预算限制", () => {
   const raw: SessionEntryLike = {
     type: "message",
     id: "keyword-big",
@@ -126,7 +126,10 @@ test("非 entry ID 的单条 raw 命中仍遵守字符预算", () => {
   const formatted = formatRecallOutput([hit], true, 400, false);
   assert.ok(formatted.text.length <= 400);
   assert.equal(formatted.truncated, true);
-  assert.match(formatted.text, /Use a single entry ID/);
+  const parsed = JSON.parse(formatted.text);
+  assert.equal(parsed.entryId, "keyword-big");
+  assert.equal(parsed.truncated, true);
+  assert.ok(parsed.body.length < 20_000);
 });
 
 test("pretty 召回按完整结果块截断，不切断 entry ID", () => {
@@ -186,7 +189,7 @@ test("长 raw 支持 offset/limit 分段读取", () => {
   assert.ok(parsed.totalChars > 12);
 });
 
-test("注册的召回工具按单个 entry ID 返回完整 raw JSON 和统计", async () => {
+test("注册的召回工具对单条 raw 也执行硬预算并固定当前 branch", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-compact-recall-"));
   try {
     mkdirSync(join(cwd, ".pi"));
@@ -196,6 +199,11 @@ test("注册的召回工具按单个 entry ID 返回完整 raw JSON 和统计", 
       id: "tool-big",
       message: { role: "user", content: "r".repeat(2_000) },
     };
+    const sibling: SessionEntryLike = {
+      type: "message",
+      id: "sibling",
+      message: { role: "user", content: "sibling-secret" },
+    };
     let tool: any;
     const pi = {
       registerTool(definition: any) { tool = definition; },
@@ -204,13 +212,16 @@ test("注册的召回工具按单个 entry ID 返回完整 raw JSON 和统计", 
     registerRecall(pi as any);
     const result = await tool.execute("call", { entryIds: ["tool-big"], raw: true }, new AbortController().signal, undefined, {
       cwd,
-      sessionManager: { getEntries: () => [entry], getBranch: () => [entry] },
+      sessionManager: { getEntries: () => [entry, sibling], getBranch: () => [entry] },
     });
-    const parsed = JSON.parse(result.content[0].text);
-    assert.equal(parsed.id, "tool-big");
+    assert.ok(result.content[0].text.length <= 100);
     assert.equal(result.details.count, 1);
-    assert.equal(result.details.truncated, false);
-    assert.ok(result.details.chars > 100);
+    assert.equal(result.details.truncated, true);
+    const siblingResult = await tool.execute("call-sibling", { entryIds: ["sibling"], raw: true, scope: "all" }, new AbortController().signal, undefined, {
+      cwd,
+      sessionManager: { getEntries: () => [entry, sibling], getBranch: () => [entry] },
+    });
+    assert.equal(siblingResult.details.count, 0);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

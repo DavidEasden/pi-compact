@@ -106,11 +106,11 @@ test("session_before_compact 使用 Pi 边界并支持 manual、threshold、over
       assert.equal(result.compaction.details.estimatedTokensAfter, Math.ceil(result.compaction.summary.length / 4));
       assert.equal(result.compaction.details.version, 1);
       assert.equal("usage" in result.compaction, false);
-      assert.match(result.compaction.summary, /## Timeline/);
+      assert.match(result.compaction.summary, /\"compactor\":\"pi-compact\"/);
       assert.equal(result.compaction.details.window.sourceHash, result.compaction.details.sourceHash);
       assert.equal(result.compaction.details.window.keptEntryId, "a1");
       assert.equal(result.compaction.details.window.sourceCount, 1);
-      assert.match(result.compaction.summary, /windowId:/);
+      assert.equal(result.compaction.summary.includes("windowId"), false);
     }
     const aborted = await handler({
       reason: "manual",
@@ -202,194 +202,24 @@ test("Pi 边界不安全时回退到更早的安全边界而不是取消", async
     assert.equal(result.compaction.details.window.keptEntryId, "a1");
     assert.equal(notifications.length, 1);
     assert.match(notifications[0], /回退到更早的安全边界/);
-    assert.match(result.compaction.summary, /retained context starts at entry: a1/);
+    assert.match(result.compaction.summary, /\"compactor\":\"pi-compact\"/);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
 });
 
-test("自动召回只修改当前请求消息，不写入 session，并可避免同一请求重复注入", () => {
+test("扩展不注册 context hook，历史和记忆不会自动注入请求", () => {
   const harness = createHarness();
   try {
     registerHooks(harness.pi as any);
-    const entries = [
-      messageEntry("old-user", "user", "修复 token 刷新"),
-      messageEntry("old-assistant", "assistant", "已定位 src/auth.ts", "old-user"),
-      messageEntry("current-user", "user", "请继续 token 刷新", "old-assistant"),
-    ];
-    let branchAvailable = true;
-    const sessionManager = {
-      getEntries: () => entries,
-      getBranch: () => {
-        if (!branchAvailable) throw new Error("branch unavailable");
-        return entries;
-      },
-    };
-    const handler = harness.handlers.get("context")![0];
-    const ctx = { cwd: harness.cwd, sessionManager };
-    const recallOf = (result: any) => result?.messages?.find((message: any) => message.customType === "pi-compact-auto-recall");
-    const hintOf = (result: any) => result?.messages?.find((message: any) => message.customType === "pi-compact-memory-hint");
-    const first = handler({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, ctx);
-    const firstRecall = recallOf(first);
-    const firstHint = hintOf(first);
-    assert.equal(first.messages[0].role, "user");
-    assert.ok(firstHint);
-    assert.equal(firstRecall.customType, "pi-compact-auto-recall");
-    assert.match(firstRecall.content, /old-user|old-assistant/);
-    assert.equal(entries.length, 3);
-    assert.equal(firstRecall.details.chars, firstRecall.content.length);
-    assert.equal(firstRecall.details.hitCount, firstRecall.details.entryIds.length);
-    assert.equal(firstRecall.details.mode, "full");
-    assert.equal(firstRecall.details.sameTurnInjectionCount, 1);
-    assert.equal(typeof firstRecall.timestamp, "number");
-    assert.equal(firstRecall.content.length <= DEFAULT_CONFIG.autoRecallMaxChars, true);
-    assert.equal(firstRecall.details.estimatedTokens, Math.ceil(firstRecall.content.length / 4));
-    assert.ok(firstRecall.details.hitCount > 0);
-    assert.match(firstHint.content, /pi_memory_search/);
-
-    const repeatedRequest = handler({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, ctx);
-    const repeatedRecall = recallOf(repeatedRequest);
-    assert.equal(repeatedRecall.content, firstRecall.content);
-    assert.equal(repeatedRecall.details.sameTurnInjectionCount, 2);
-
-    const second = handler({ type: "context", messages: first.messages }, ctx);
-    assert.equal(second, undefined);
-
-    entries.push(messageEntry("next-user", "user", "请继续 token 刷新", "current-user"));
-    const updated = handler({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, ctx);
-    assert.match(recallOf(updated).content, /current-user/);
-
-    branchAvailable = false;
-    const branchFailed = handler({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, ctx);
-    assert.equal(recallOf(branchFailed), undefined);
-    assert.ok(hintOf(branchFailed));
+    assert.equal(harness.handlers.has("context"), false);
+    assert.equal(harness.handlers.has("session_before_compact"), true);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
 });
 
-test("自动召回 hint 模式只注入短提示，off 模式不注入", () => {
-  const hintHarness = createHarness();
-  const offHarness = createHarness();
-  try {
-    writeFileSync(join(hintHarness.cwd, ".pi", "pi-compact.json"), `${JSON.stringify({ ...DEFAULT_CONFIG, autoRecallMode: "hint" })}\n`);
-    writeFileSync(join(offHarness.cwd, ".pi", "pi-compact.json"), `${JSON.stringify({ ...DEFAULT_CONFIG, autoRecall: true, autoRecallMode: "off" })}\n`);
-    registerHooks(hintHarness.pi as any);
-    registerHooks(offHarness.pi as any);
-    const entries = [
-      messageEntry("old-user", "user", "修复 token 刷新"),
-      messageEntry("old-assistant", "assistant", "已定位 src/auth.ts", "old-user"),
-      messageEntry("current-user", "user", "请继续 token 刷新", "old-assistant"),
-    ];
-    const sessionManager = { getEntries: () => entries, getBranch: () => entries };
-    const recallOf = (result: any) => result?.messages?.find((message: any) => message.customType === "pi-compact-auto-recall");
-    const hint = hintHarness.handlers.get("context")![0]({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, { cwd: hintHarness.cwd, sessionManager });
-    const hintRecall = recallOf(hint);
-    assert.equal(hintRecall.customType, "pi-compact-auto-recall");
-    assert.equal(hintRecall.details.mode, "hint");
-    assert.match(hintRecall.content, /kinds=user/);
-    assert.match(hintRecall.content, /short hints/);
-    assert.equal(hintRecall.content.includes("已定位 src/auth.ts"), false);
-    assert.match(hintRecall.content, /\[old-user\]/);
-
-    const off = offHarness.handlers.get("context")![0]({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, { cwd: offHarness.cwd, sessionManager });
-    assert.equal(recallOf(off), undefined);
-    assert.ok(off.messages.some((message: any) => message.customType === "pi-compact-memory-hint"));
-  } finally {
-    rmSync(hintHarness.cwd, { recursive: true, force: true });
-    rmSync(offHarness.cwd, { recursive: true, force: true });
-  }
-});
-
-test("泛词/礼貌用语不会自动注入历史正文，具体 token/错误码/路径仍会", () => {
-  const harness = createHarness();
-  try {
-    registerHooks(harness.pi as any);
-    const genericHistory = [
-      messageEntry("old-user", "user", "请继续处理，不要停下来"),
-      messageEntry("old-assistant", "assistant", "好的，我会继续 src 以外的普通回复", "old-user"),
-    ];
-    const specificHistory = [
-      messageEntry("old-user", "user", "修复 token 刷新，失败 ECONNREFUSED，文件 src/auth/session.ts"),
-      messageEntry("old-assistant", "assistant", "refreshToken 需要重试 npm test", "old-user"),
-    ];
-    const handler = harness.handlers.get("context")![0];
-    const recallOf = (result: any) => result?.messages?.find((message: any) => message.customType === "pi-compact-auto-recall");
-    const run = (history: ReturnType<typeof messageEntry>[], userId: string, text: string) => {
-      const entries = [...history, messageEntry(userId, "user", text, history.at(-1)?.id ?? null)];
-      return handler({ type: "context", messages: [{ role: "user", content: text }] }, {
-        cwd: harness.cwd,
-        sessionManager: { getEntries: () => entries, getBranch: () => entries },
-      });
-    };
-
-    for (const text of ["continue", "请继续", "ok", "好的", "谢谢", "上一步", "再试一次"]) {
-      assert.equal(recallOf(run(genericHistory, `generic-${text}`, text)), undefined, text);
-    }
-
-    const tokenRecall = recallOf(run(specificHistory, "q-token", "请继续 token 刷新"));
-    assert.ok(tokenRecall);
-    assert.match(tokenRecall.content, /old-user|old-assistant/);
-
-    const errorRecall = recallOf(run(specificHistory, "q-error", "ECONNREFUSED"));
-    assert.ok(errorRecall);
-    assert.match(errorRecall.content, /old-user/);
-
-    const pathRecall = recallOf(run(specificHistory, "q-path", "src/auth/session.ts"));
-    assert.ok(pathRecall);
-    assert.match(pathRecall.content, /old-user|old-assistant/);
-  } finally {
-    rmSync(harness.cwd, { recursive: true, force: true });
-  }
-});
-
-test("自动召回默认排除 derived 以及已在上下文中的 entry", () => {
-  const harness = createHarness();
-  try {
-    registerHooks(harness.pi as any);
-    const entries = [
-      messageEntry("old-user", "user", "修复 token 刷新"),
-      { type: "compaction", id: "cp-old", parentId: "old-user", summary: "旧压缩摘要里也有 token 刷新", firstKeptEntryId: "old-assistant" },
-      messageEntry("old-assistant", "assistant", "已定位 src/auth.ts", "cp-old"),
-      messageEntry("current-user", "user", "请继续 token 刷新", "old-assistant"),
-    ];
-    const sessionManager = {
-      getEntries: () => entries,
-      getBranch: () => entries,
-      buildContextEntries: () => [entries[2], entries[3]],
-    };
-    const result = harness.handlers.get("context")![0]({
-      type: "context",
-      messages: [{ role: "user", content: "请继续 token 刷新" }],
-    }, { cwd: harness.cwd, sessionManager });
-    const recall = result.messages.find((message: any) => message.customType === "pi-compact-auto-recall");
-    assert.match(recall.content, /old-user/);
-    assert.equal(recall.content.includes("cp-old"), false);
-    assert.equal(recall.content.includes("old-assistant"), false);
-  } finally {
-    rmSync(harness.cwd, { recursive: true, force: true });
-  }
-});
-
-test("非法 memory/history/window 配置回退到安全默认值", () => {
+ test("非法 memory/history/window 配置回退到安全默认值", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-compact-config-memory-"));
   try {
     mkdirSync(join(cwd, ".pi"));

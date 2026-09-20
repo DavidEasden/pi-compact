@@ -71,7 +71,9 @@ export const projectMemories = (events: MemoryEvent[]): MemoryRecord[] => {
   for (const event of unique) {
     if (event.type === "create") {
       if (byId.has(event.recordId) || !validCreatePayload(event.payload as Record<string, unknown>)) continue;
+      // 非用户事件只能创建 provisional；不能靠伪造日志把模型/规则内容升级为权威记忆。
       const payload = event.payload as MemoryCreatePayload;
+      if (event.author !== "user" && payload.status !== "provisional") continue;
       byId.set(event.recordId, {
         id: event.recordId,
         kind: payload.kind,
@@ -97,27 +99,33 @@ export const projectMemories = (events: MemoryEvent[]): MemoryRecord[] => {
     if (current.status === "superseded" || current.status === "resolved") continue;
 
     if (event.type === "pin") {
+      if (event.author !== "user") continue;
       current.pinned = true;
       current.status = "pinned";
       current.updatedAt = event.ts;
       continue;
     }
     if (event.type === "unpin") {
+      if (event.author !== "user") continue;
       current.pinned = false;
       if (current.status === "pinned") current.status = "active";
       current.updatedAt = event.ts;
       continue;
     }
     if (event.type === "resolve") {
+      if (event.author !== "user" && (current.author !== event.author || current.status !== "provisional")) continue;
       current.status = "resolved";
       current.pinned = false;
       current.updatedAt = event.ts;
       continue;
     }
     if (event.type === "supersede") {
+      if (event.author !== "user" && (current.author !== event.author || current.status !== "provisional")) continue;
       const payload = event.payload as Record<string, unknown>;
       if (!validSupersedePayload(payload) || byId.has(payload.newRecordId)) continue;
-      const nextStatus = payload.status === "provisional" || payload.status === "active" ? payload.status : current.status === "provisional" ? "provisional" : "active";
+      const nextStatus = event.author === "user"
+        ? payload.status === "provisional" || payload.status === "active" ? payload.status : current.status === "provisional" ? "provisional" : "active"
+        : "provisional";
       const next: MemoryRecord = {
         id: payload.newRecordId,
         kind: typeof payload.kind === "string" && KINDS.has(payload.kind as MemoryKind) ? payload.kind as MemoryKind : current.kind,
