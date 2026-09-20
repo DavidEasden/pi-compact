@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { queryTerms } from "./core/content.ts";
+import { formatMemoryRead, formatMemorySearch } from "./core/memory-output.ts";
 import { appendMemoryEvent, contentHash, loadMemories, newMemoryId, withMemoryLogLock } from "./core/store.ts";
 import type { MemoryKind, MemoryPriority, MemoryRecord, MemoryScope, MemoryStatus } from "./types.ts";
 
@@ -34,6 +35,15 @@ const sessionIdOf = (ctx: any): string | undefined => {
     return undefined;
   }
 };
+
+/** session 范围记忆只在创建它的同一非空会话可见；缺失或不同 sessionId 都不匹配。project/user 仍在项目内共享。 */
+const visibleToSession = (record: MemoryRecord, sessionId: string | undefined): boolean => (
+  record.scope !== "session" || (sessionId !== undefined && record.sessionId === sessionId)
+);
+
+const visibleMemories = (cwd: string, sessionId: string | undefined): MemoryRecord[] => (
+  loadMemories(cwd).filter((record) => visibleToSession(record, sessionId))
+);
 
 const parseTokens = (args: string): MemoryCommandInput => {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -117,7 +127,7 @@ const supersedeUserMemory = (cwd: string, ctx: any, targetId: string, input: Mem
   const newRecordId = newMemoryId();
   // 读取 current + supersede/pin 是一个事务，都在同一把锁内；成功返回前根据重读的 projected record 验证已生效。
   return withMemoryLogLock(cwd, (): MemoryRecord | undefined => {
-    const current = loadMemories(cwd).find((record) => record.id === targetId);
+    const current = visibleMemories(cwd, sessionIdOf(ctx)).find((record) => record.id === targetId);
     if (!current || current.status === "superseded" || current.status === "resolved") return undefined;
     const content = input.content.trim() || current.content;
     appendMemoryEvent(cwd, {
@@ -158,6 +168,10 @@ export const registerMemory = (pi: ExtensionAPI): void => {
         return;
       }
       const input = parseTokens(args);
+      if (input.scope === "session" && !sessionIdOf(ctx)) {
+        notify(ctx, "pi-compact: 当前会话没有 sessionId，不能创建或改写 session 范围记忆。", "warning");
+        return;
+      }
       if (!input.content && !input.supersede && !input.recordId) {
         notify(ctx, "用法：/remember [pin] [kind:fact] [scope:project] 文本  或  /remember supersede:<id> 新文本", "warning");
         return;
@@ -189,7 +203,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
         return;
       }
       const input = parseTokens(args);
-      let records = loadMemories(ctx.cwd);
+      let records = visibleMemories(ctx.cwd, sessionIdOf(ctx));
       if (input.status) records = records.filter((record) => record.status === input.status);
       else records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
       if (input.kind) records = records.filter((record) => record.kind === input.kind);
@@ -220,7 +234,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       try {
         // 存在检查 + resolve 追加放在同一把锁内；返回成功前根据重读的 projected record 验证已 resolve。
         const resolved = withMemoryLogLock(ctx.cwd, (): boolean => {
-          const current = loadMemories(ctx.cwd).find((record) => record.id === recordId);
+          const current = visibleMemories(ctx.cwd, sessionIdOf(ctx)).find((record) => record.id === recordId);
           if (!current) return false;
           appendMemoryEvent(ctx.cwd, { type: "resolve", recordId, author: "user", sessionId: sessionIdOf(ctx), payload: { reason: "user:/forget" } });
           const projected = loadMemories(ctx.cwd).find((record) => record.id === recordId);
@@ -258,16 +272,27 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       if (!config.memory.enabled) {
         return { content: [{ type: "text", text: "pi-compact: 记忆功能已关闭。" }], details: { count: 0 } };
       }
-      let records = loadMemories(ctx.cwd);
-      if (input.status && STATUSES.has(input.status as MemoryStatus)) records = records.filter((record) => record.status === input.status);
+      let records = visibleMemories(ctx.cwd, sessionIdOf(ctx));
+      // 显式 status 优先：即使没有 query 也返回该状态（例如 resolved/superseded）。
+      const explicitStatus = input.status && STATUSES.has(input.status as MemoryStatus) ? input.status as MemoryStatus : undefined;
+      if (explicitStatus) records = records.filter((record) => record.status === explicitStatus);
       if (input.kind && KINDS.has(input.kind as MemoryKind)) records = records.filter((record) => record.kind === input.kind);
       if (input.query?.trim()) records = searchMemoryRecords(records, input.query);
-      else records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
+      else if (!explicitStatus) records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
       records = records.slice(0, input.limit ?? 8);
-      const text = records.length === 0
-        ? "pi-compact memory: 未找到匹配记忆。"
-        : `pi-compact memory (${records.length})\n${records.map(formatRecord).join("\n")}`;
-      return { content: [{ type: "text", text }], details: { source: "memory-log", count: records.length } };
+      if (records.length === 0) {
+        return { content: [{ type: "text", text: "pi-compact memory: 未找到匹配记忆。" }], details: { source: "memory-log", count: 0 } };
+      }
+      const result = formatMemorySearch(records);
+      return {
+        content: [{ type: "text", text: result.text }],
+        details: {
+          source: "memory-log",
+          count: result.shown,
+          truncated: result.truncated,
+          ...(result.nextOffset !== undefined ? { nextOffset: result.nextOffset } : {}),
+        },
+      };
     },
   } as any);
 
@@ -283,17 +308,24 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       limit: Type.Optional(Type.Integer({ minimum: 1 })),
     }),
     async execute(_toolCallId: string, input: { recordId: string; offset?: number; limit?: number }, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
-      const record = loadMemories(ctx.cwd).find((item) => item.id === input.recordId);
+      const config = loadConfig(ctx.cwd);
+      if (!config.memory.enabled) {
+        return { content: [{ type: "text", text: "pi-compact: 记忆功能已关闭。" }], details: { count: 0 } };
+      }
+      const record = visibleMemories(ctx.cwd, sessionIdOf(ctx)).find((item) => item.id === input.recordId);
       if (!record) {
         return { content: [{ type: "text", text: `pi-compact memory: 找不到 ${input.recordId}` }], details: { count: 0 } };
       }
-      const offset = Math.max(0, input.offset ?? 0);
-      const limit = input.limit;
-      const body = limit == null ? record.content.slice(offset) : record.content.slice(offset, offset + limit);
-      const truncated = offset > 0 || offset + body.length < record.content.length;
+      const result = formatMemoryRead(record, { offset: input.offset, limit: input.limit });
       return {
-        content: [{ type: "text", text: JSON.stringify({ ...record, content: body, offset, totalChars: record.content.length, truncated }, null, 2) }],
-        details: { source: "memory-log", count: 1, truncated },
+        content: [{ type: "text", text: result.text }],
+        details: {
+          source: "memory-log",
+          count: 1,
+          truncated: result.truncated,
+          ...(result.nextOffset !== undefined ? { nextOffset: result.nextOffset } : {}),
+          metadataTruncated: result.metadataTruncated,
+        },
       };
     },
   } as any);
@@ -320,17 +352,22 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       if (!content) {
         return { content: [{ type: "text", text: "pi-compact: content 不能为空。" }], details: { count: 0 } };
       }
+      const sessionId = sessionIdOf(ctx);
+      const scope = input.scope && SCOPES.has(input.scope as MemoryScope) ? input.scope as MemoryScope : "project";
+      if (scope === "session" && !sessionId) {
+        return { content: [{ type: "text", text: "pi-compact: 当前会话没有 sessionId，不能创建 session 范围记忆。" }], details: { count: 0, rejected: true } };
+      }
       const recordId = newMemoryId();
       try {
         appendMemoryEvent(ctx.cwd, {
           type: "create",
           recordId,
           author: "model",
-          sessionId: sessionIdOf(ctx),
+          sessionId,
           payload: {
             kind: input.kind && KINDS.has(input.kind as MemoryKind) ? input.kind as MemoryKind : "fact",
             content,
-            scope: input.scope && SCOPES.has(input.scope as MemoryScope) ? input.scope as MemoryScope : "project",
+            scope,
             status: "provisional",
             priority: input.priority && PRIORITIES.has(input.priority as MemoryPriority) ? input.priority as MemoryPriority : "normal",
             sourceEntryIds: input.sourceEntryIds ?? [],
@@ -363,11 +400,15 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       content: Type.Optional(Type.String()),
     }),
     async execute(_toolCallId: string, input: { recordId: string; action: "edit" | "resolve"; content?: string }, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
+      const config = loadConfig(ctx.cwd);
+      if (!config.memory.enabled) {
+        return { content: [{ type: "text", text: "pi-compact: 记忆功能已关闭。" }], details: { count: 0 } };
+      }
       const newRecordId = newMemoryId();
       // 读取 provisional + resolve/supersede 追加放在同一把锁内；返回成功前根据重读的 projected record 验证已生效。
       try {
         return withMemoryLogLock(ctx.cwd, (): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } => {
-          const current = loadMemories(ctx.cwd).find((record) => record.id === input.recordId);
+          const current = visibleMemories(ctx.cwd, sessionIdOf(ctx)).find((record) => record.id === input.recordId);
           if (!current) {
             return { content: [{ type: "text", text: `找不到记忆 ${input.recordId}` }], details: { count: 0 } };
           }

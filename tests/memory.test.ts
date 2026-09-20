@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { deriveFacts } from "../src/core/derive.ts";
+import { MEMORY_TOOL_MAX_CHARS } from "../src/core/memory-output.ts";
 import { projectMemories } from "../src/core/projector.ts";
 import { recordsFromEntries } from "../src/core/session.ts";
 import {
@@ -468,6 +469,238 @@ test("记忆命令与工具入口：用户写入权威，模型提议保持 prov
     const native = await tools.get("pi_compact_new_context").execute("c7", {}, new AbortController().signal, undefined, { ...ctx, compact() { compactCalled = true; } });
     assert.equal(compactCalled, true);
     assert.equal(native.details.degraded, false);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+/** memory 命令/工具注册的轻量 harness，供入口级测试复用。 */
+const registerMemoryHarness = (): { tools: Map<string, any>; commands: Map<string, any> } => {
+  const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const pi = {
+    registerTool(definition: any) { tools.set(definition.name, definition); },
+    registerCommand(name: string, definition: any) { commands.set(name, definition); },
+  };
+  registerMemory(pi as any);
+  return { tools, commands };
+};
+
+/** 无 sessionId 时模拟没有 sessionManager 的真实上下文。 */
+const memoryCtx = (cwd: string, sessionId?: string, notes: string[] = []): any => ({
+  cwd,
+  ui: { notify(message: string) { notes.push(message); } },
+  ...(sessionId === undefined ? {} : { sessionManager: { getSessionId: () => sessionId } }),
+});
+
+const runTool = (tools: Map<string, any>, name: string, input: any, ctx: any, callId = "c") => (
+  tools.get(name).execute(callId, input, new AbortController().signal, undefined, ctx)
+);
+
+test("memory.enabled=false 时 read/update 不生效也不追加日志", async () => {
+  const cwd = tempCwd();
+  try {
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), `${JSON.stringify({ ...DEFAULT_CONFIG, memory: { ...DEFAULT_CONFIG.memory, enabled: false } })}\n`);
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    const recordId = "mem_disabled";
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId,
+      author: "model",
+      sessionId: "s1",
+      payload: { kind: "fact", content: "禁用前写入", scope: "project", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "h", provenance: "model:test" },
+    });
+    const before = lineCount(memoryLogPath(cwd));
+    const read = await runTool(tools, "pi_memory_read", { recordId }, ctx, "c1");
+    assert.match(read.content[0].text, /记忆功能已关闭/);
+    const update = await runTool(tools, "pi_memory_update", { recordId, action: "edit", content: "试图修改" }, ctx, "c2");
+    assert.match(update.content[0].text, /记忆功能已关闭/);
+    const search = await runTool(tools, "pi_memory_search", { query: "禁用前写入" }, ctx, "c3");
+    assert.match(search.content[0].text, /记忆功能已关闭/);
+    assert.equal(lineCount(memoryLogPath(cwd)), before);
+    assert.equal(loadMemories(cwd).find((record) => record.id === recordId)?.content, "禁用前写入");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("session 范围记忆只在同一会话可搜读改，project 仍项目内共享", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools, commands } = registerMemoryHarness();
+    const notesA: string[] = [];
+    const notesB: string[] = [];
+    const sessionA = memoryCtx(cwd, "session-a", notesA);
+    const sessionB = memoryCtx(cwd, "session-b", notesB);
+    const noSession = memoryCtx(cwd, undefined, notesA);
+
+    await commands.get("remember").handler("scope:session kind:decision 仅本会话可见", sessionA);
+    await commands.get("remember").handler("kind:constraint 项目共享约束", sessionA);
+    const sessionRecord = loadMemories(cwd).find((record) => record.content === "仅本会话可见")!;
+    const projectRecord = loadMemories(cwd).find((record) => record.content === "项目共享约束")!;
+    assert.equal(sessionRecord.scope, "session");
+    assert.equal(sessionRecord.sessionId, "session-a");
+    assert.equal(projectRecord.scope, "project");
+
+    // /memories：B 会话看不到 A 的 session 记录，但 project 记录共享可见。
+    await commands.get("memories").handler("", sessionB);
+    const listB = notesB.at(-1) ?? "";
+    assert.equal(listB.includes(sessionRecord.id), false);
+    assert.equal(listB.includes(projectRecord.id), true);
+
+    const searchB = await runTool(tools, "pi_memory_search", { query: "仅本会话可见" }, sessionB, "s1");
+    assert.equal(searchB.content[0].text.includes(sessionRecord.id), false);
+    const readB = await runTool(tools, "pi_memory_read", { recordId: sessionRecord.id }, sessionB, "s2");
+    assert.match(readB.content[0].text, /找不到/);
+    await commands.get("forget").handler(sessionRecord.id, sessionB);
+    assert.match(notesB.at(-1) ?? "", /找不到/);
+    assert.equal(loadMemories(cwd).find((record) => record.id === sessionRecord.id)?.status, "active");
+
+    // 模型 provisional 的 session 记录同样不能跨会话读改。
+    await runTool(tools, "pi_memory_propose", { content: "会话内临时提议", scope: "session" }, sessionA, "s3");
+    const provisional = loadMemories(cwd).find((record) => record.content === "会话内临时提议")!;
+    assert.equal(provisional.scope, "session");
+    assert.equal(provisional.sessionId, "session-a");
+    const updateB = await runTool(tools, "pi_memory_update", { recordId: provisional.id, action: "edit", content: "跨会话篡改" }, sessionB, "s4");
+    assert.match(updateB.content[0].text, /找不到/);
+    const updateA = await runTool(tools, "pi_memory_update", { recordId: provisional.id, action: "edit", content: "会话内更新" }, sessionA, "s5");
+    assert.match(updateA.content[0].text, /provisional/);
+
+    // 缺失 sessionId：不能创建 session scope，也不能访问 session 记录。
+    await commands.get("remember").handler("scope:session 无会话不应写入", noSession);
+    assert.match(notesA.at(-1) ?? "", /没有 sessionId/);
+    assert.equal(loadMemories(cwd).some((record) => record.content === "无会话不应写入"), false);
+    const readNoSession = await runTool(tools, "pi_memory_read", { recordId: sessionRecord.id }, noSession, "s6");
+    assert.match(readNoSession.content[0].text, /找不到/);
+    const proposeNoSession = await runTool(tools, "pi_memory_propose", { content: "无会话提议", scope: "session" }, noSession, "s7");
+    assert.match(proposeNoSession.content[0].text, /没有 sessionId/);
+    assert.equal(loadMemories(cwd).some((record) => record.content === "无会话提议"), false);
+
+    // project 记录在 B 会话可读。
+    const readProjectB = await runTool(tools, "pi_memory_read", { recordId: projectRecord.id }, sessionB, "s8");
+    assert.equal(JSON.parse(readProjectB.content[0].text).content, "项目共享约束");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("search 显式 status=resolved/superseded 无 query 也返回对应记录", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    appendMemoryEvent(cwd, { type: "create", recordId: "mem_resolved", author: "user", sessionId: "s1", payload: { kind: "fact", content: "已解决记忆", scope: "project", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: "r1" } });
+    appendMemoryEvent(cwd, { type: "resolve", recordId: "mem_resolved", author: "user", payload: {} });
+    appendMemoryEvent(cwd, { type: "create", recordId: "mem_superseded", author: "user", payload: { kind: "fact", content: "旧记忆", scope: "project", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: "s1" } });
+    appendMemoryEvent(cwd, { type: "supersede", recordId: "mem_superseded", author: "user", payload: { newRecordId: "mem_new", content: "新记忆", scope: "project", status: "active", priority: "normal", sourceHash: "s2" } });
+
+    const resolvedSearch = await runTool(tools, "pi_memory_search", { status: "resolved" }, ctx, "c1");
+    assert.match(resolvedSearch.content[0].text, /mem_resolved/);
+    assert.equal(resolvedSearch.content[0].text.includes("mem_new"), false);
+    const supersededSearch = await runTool(tools, "pi_memory_search", { status: "superseded" }, ctx, "c2");
+    assert.match(supersededSearch.content[0].text, /mem_superseded/);
+
+    // 无显式 status 时保留旧默认语义：只返回 live 记录。
+    const defaultSearch = await runTool(tools, "pi_memory_search", {}, ctx, "c3");
+    assert.equal(defaultSearch.content[0].text.includes("- [mem_resolved]"), false);
+    assert.equal(defaultSearch.content[0].text.includes("- [mem_superseded]"), false);
+    assert.match(defaultSearch.content[0].text, /- \[mem_new\]/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("20 万字符记忆的 search/read 输出受硬预算限制且分页可拼回原文", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    const marker = "记忆标记";
+    const content = marker + Array.from({ length: 200000 - marker.length }, (_, index) => String.fromCharCode(0x4e00 + (index % 2000))).join("");
+    assert.equal(content.length, 200000);
+    appendMemoryEvent(cwd, { type: "create", recordId: "mem_huge", author: "user", sessionId: "s1", payload: { kind: "fact", content, scope: "project", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: "huge" } });
+
+    const search = await runTool(tools, "pi_memory_search", { query: marker }, ctx, "c1");
+    assert.ok(search.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
+    assert.match(search.content[0].text, /mem_huge/);
+    assert.equal(search.details.count, 1);
+
+    const defaultRead = await runTool(tools, "pi_memory_read", { recordId: "mem_huge" }, ctx, "c2");
+    assert.ok(defaultRead.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
+    const defaultParsed = JSON.parse(defaultRead.content[0].text);
+    assert.equal(defaultParsed.content.length, 4000);
+    assert.equal(defaultParsed.truncated, true);
+    assert.equal(defaultParsed.nextOffset, 4000);
+
+    const oversizedRead = await runTool(tools, "pi_memory_read", { recordId: "mem_huge", offset: 0, limit: 1_000_000 }, ctx, "c3");
+    assert.ok(oversizedRead.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
+    const oversizedParsed = JSON.parse(oversizedRead.content[0].text);
+    assert.ok(oversizedParsed.content.length > 4000);
+    assert.equal(oversizedParsed.truncated, true);
+
+    let offset = 0;
+    let rebuilt = "";
+    let guard = 0;
+    while (guard < 100) {
+      const page = await runTool(tools, "pi_memory_read", { recordId: "mem_huge", offset }, ctx, `p${guard}`);
+      assert.ok(page.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
+      const parsed = JSON.parse(page.content[0].text);
+      assert.equal(parsed.offset, offset);
+      rebuilt += parsed.content;
+      if (!parsed.truncated) break;
+      assert.equal(typeof parsed.nextOffset, "number");
+      assert.ok(parsed.nextOffset > offset);
+      offset = parsed.nextOffset;
+      guard += 1;
+    }
+    assert.equal(guard < 100, true);
+    assert.equal(rebuilt.length, content.length);
+    assert.equal(rebuilt, content);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("read 对 JSON 转义与超大元数据做有界有效 JSON 降级", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    const content = "引号\" 反斜杠\\ 换行\n 制表\t ".repeat(20000);
+    const sourceEntryIds = Array.from({ length: 5000 }, (_, index) => `entry_${index}_${"x".repeat(40)}`);
+    appendMemoryEvent(cwd, { type: "create", recordId: "mem_escaped", author: "user", sessionId: "s1", payload: { kind: "fact", content, scope: "project", status: "active", priority: "normal", sourceEntryIds, sourceHash: "esc" } });
+
+    const read = await runTool(tools, "pi_memory_read", { recordId: "mem_escaped" }, ctx, "c1");
+    const text = read.content[0].text;
+    assert.ok(text.length <= MEMORY_TOOL_MAX_CHARS);
+    const parsed = JSON.parse(text);
+    assert.equal(parsed.truncated, true);
+    assert.equal(parsed.metadataTruncated, true);
+    assert.equal(Array.isArray(parsed.sourceEntryIds), true);
+    assert.ok(parsed.sourceEntryIds.length <= 64);
+    assert.ok(parsed.sourceEntryIdsOmitted > 0);
+    assert.ok(parsed.content.length > 0);
+    assert.equal(content.startsWith(parsed.content), true);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("search 多条命中超过总预算时截断并给出 nextOffset", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    for (let index = 0; index < 30; index++) {
+      appendMemoryEvent(cwd, { type: "create", recordId: `mem_many_${index}`, author: "user", sessionId: "s1", payload: { kind: "fact", content: `共享关键词 batch ${index} ${"内容".repeat(1500)}`, scope: "project", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: `many-${index}` } });
+    }
+    const search = await runTool(tools, "pi_memory_search", { query: "共享关键词", limit: 30 }, ctx, "c1");
+    assert.ok(search.content[0].text.length <= MEMORY_TOOL_MAX_CHARS);
+    assert.equal(search.details.truncated, true);
+    assert.equal(typeof search.details.nextOffset, "number");
+    assert.ok(search.details.count < 30);
+    assert.ok(search.details.nextOffset <= search.details.count);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
