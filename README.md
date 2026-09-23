@@ -24,7 +24,7 @@ The core of `pi-compact` is long-term memory. Compaction manages window capacity
 
 ## Installation
 
-The current source requires Pi `>=0.87.1`; development and integration tests pin `0.87.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.2.0` does not include subsequent source fixes; use the local loading instructions to verify current changes.
+The current source requires Pi `>=0.87.1`; development and integration tests pin `0.87.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.3.0` matches the current source.
 
 Pi packages execute extension code, so review the source before installing.
 
@@ -33,7 +33,7 @@ Pi packages execute extension code, so review the source before installing.
 Pin to a release tag (recommended — pinned refs are not moved by `pi update --extensions` or `pi update --all`):
 
 ```bash
-pi install git:github.com/DavidEasden/pi-compact@v0.2.0
+pi install git:github.com/DavidEasden/pi-compact@v0.3.0
 ```
 
 Or track the default branch without pinning:
@@ -45,14 +45,14 @@ pi install git:github.com/DavidEasden/pi-compact
 SSH shorthand and raw HTTPS URLs work too:
 
 ```bash
-pi install git:git@github.com:DavidEasden/pi-compact@v0.2.0
-pi install https://github.com/DavidEasden/pi-compact@v0.2.0
+pi install git:git@github.com:DavidEasden/pi-compact@v0.3.0
+pi install https://github.com/DavidEasden/pi-compact@v0.3.0
 ```
 
 Notes:
 
 - The `git:` prefix enables `host/user/repo` and `git@host:user/repo` shorthands; without it, only protocol URLs (`https://`, `http://`, `ssh://`, `git://`) are accepted.
-- `v0.2.0` must be an existing tag or commit (create and push it once with `git tag v0.2.0 && git push origin v0.2.0`). To move to a newer tag later, re-run `pi install git:github.com/DavidEasden/pi-compact@<new-tag>`.
+- `v0.3.0` must be an existing tag or commit (create and push it once with `git tag v0.3.0 && git push origin v0.3.0`). To move to a newer tag later, re-run `pi install git:github.com/DavidEasden/pi-compact@<new-tag>`.
 - Global installs are cloned to `~/.pi/agent/git/github.com/DavidEasden/pi-compact`; with `-l` (project settings), the clone lives at `.pi/git/github.com/DavidEasden/pi-compact` and the project auto-installs any missing packages on startup after being trusted.
 - Try the package without installing it:
 
@@ -65,7 +65,7 @@ pi -e git:github.com/DavidEasden/pi-compact
 The same code is published to npm as `pi-compact`:
 
 ```bash
-pi install npm:pi-compact@0.2.0
+pi install npm:pi-compact@0.3.0
 ```
 
 Or track the latest published version:
@@ -82,7 +82,7 @@ pi -e npm:pi-compact
 
 Notes:
 
-- A versioned spec such as `npm:pi-compact@0.2.0` is pinned, so `pi update --extensions` and `pi update --all` skip it.
+- A versioned spec such as `npm:pi-compact@0.3.0` is pinned, so `pi update --extensions` and `pi update --all` skip it.
 - Global installs go under `~/.pi/agent/npm/`; with `-l` (project settings) they go under `.pi/npm/`.
 
 ### Try locally

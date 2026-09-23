@@ -1,6 +1,6 @@
 {
   "name": "pi-compact",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "不依赖 LLM 的 Pi 自动压缩、精确历史召回与上下文增强扩展",
   "type": "module",
   "keywords": [
