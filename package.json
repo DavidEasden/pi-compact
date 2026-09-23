@@ -17,16 +17,16 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
     "typebox": "*"
   },
   "scripts": {
-    "test": "node --import tsx --test tests/*.test.ts tests/*.integration.mjs",
+    "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts tests/*.integration.mjs",
     "test:integration": "node --test tests/*.integration.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@types/node": "^22.19.19",
     "tsx": "^4.19.3",
     "typescript": "^5.9.3"

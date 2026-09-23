@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, loadConfig, scaffoldConfig } from "../src/config.ts";
 import { readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
 import { isSafeCut, registerHooks } from "../src/hooks.ts";
@@ -126,6 +127,29 @@ test("session_before_compact 使用 Pi 边界并支持 manual、threshold、over
   }
 });
 
+test("checkpoint 记录遵循 context projection，不重新读取被隐藏的 raw 调用", async () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const session = SessionManager.inMemory(harness.cwd);
+    session.appendMessage({ role: "user", content: "旧任务", timestamp: Date.now() } as any);
+    const hiddenCall = session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "hidden-call", name: "read", arguments: { path: "secret.txt" } }], stopReason: "toolUse", timestamp: Date.now() } as any);
+    session.appendContextEdit(hiddenCall, null);
+    const kept = session.appendMessage({ role: "user", content: "新任务", timestamp: Date.now() } as any);
+    const result = await harness.handlers.get("session_before_compact")![0]({
+      reason: "threshold",
+      branchEntries: session.getBranch(),
+      preparation: { firstKeptEntryId: kept, tokensBefore: 100, isSplitTurn: false, turnPrefixMessages: [] },
+      signal: new AbortController().signal,
+    }, { cwd: harness.cwd, ui: { notify() {} } });
+    assert.deepEqual(result.compaction.details.sourceEntryIds, [session.getBranch()[0].id]);
+    assert.equal(result.compaction.details.sourceEntryIds.includes(hiddenCall), false);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+
 test("session_before_compact 在边界可能破坏工具链时取消压缩", async () => {
   const harness = createHarness();
   try {
@@ -133,7 +157,7 @@ test("session_before_compact 在边界可能破坏工具链时取消压缩", asy
     const branch = [
       messageEntry("u1", "user", "执行读取"),
       messageEntry("a1", "assistant", [{ type: "toolCall", id: "call1", name: "read", arguments: {} }], "u1"),
-      messageEntry("a2", "assistant", "未完成调用后的消息", "a1"),
+      messageEntry("a2", "assistant", [{ type: "toolCall", id: "call2", name: "read", arguments: {} }], "a1"),
     ];
     const notifications: string[] = [];
     const handler = harness.handlers.get("session_before_compact")![0];
@@ -200,6 +224,7 @@ test("Pi 边界不安全时回退到更早的安全边界而不是取消", async
       signal: new AbortController().signal,
     }, { cwd: harness.cwd, ui: { notify(message: string) { notifications.push(message); } } });
     assert.equal(result.compaction.firstKeptEntryId, "a1");
+    assert.equal(result.compaction.details.isSplitTurn, true);
     assert.deepEqual(result.compaction.details.sourceEntryIds, ["u1"]);
     assert.equal(result.compaction.details.window, undefined);
     assert.equal(notifications.length, 1);

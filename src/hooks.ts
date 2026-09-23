@@ -1,9 +1,9 @@
-import { sessionEntryToContextMessages, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, type ExtensionAPI, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { toolCallIds } from "./core/content.ts";
 import { deriveFacts } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
-import { hashRecords, recordsFromEntries } from "./core/session.ts";
+import { hashRecords, recordsFromProjectedEntries } from "./core/session.ts";
 import { appendMemoryEvent, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
 import type { SessionEntryLike } from "./types.ts";
@@ -14,125 +14,97 @@ export const MEMORY_HINT_TYPE = "pi-compact-memory-hint";
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TERMINAL_ASSISTANT_REASONS = new Set(["error", "aborted"]);
 
-type ToolCallCounts = Map<string, number>;
-
-const countToolCalls = (entries: SessionEntryLike[], start: number, end: number): ToolCallCounts => {
-  const counts: ToolCallCounts = new Map();
-  for (let index = start; index < end; index++) {
-    const message = entries[index]?.message;
-    if (message?.role !== "assistant") continue;
-    for (const id of toolCallIds(message)) counts.set(id, (counts.get(id) ?? 0) + 1);
-  }
-  return counts;
-};
-
-const countTerminalToolCalls = (entries: SessionEntryLike[], start: number, end: number): ToolCallCounts => {
-  const counts: ToolCallCounts = new Map();
-  for (let index = start; index < end; index++) {
-    const message = entries[index]?.message;
-    if (message?.role !== "assistant" || !TERMINAL_ASSISTANT_REASONS.has(message.stopReason ?? "")) continue;
-    for (const id of toolCallIds(message)) counts.set(id, (counts.get(id) ?? 0) + 1);
-  }
-  return counts;
-};
-
-const countToolResults = (entries: SessionEntryLike[], start: number, end: number): ToolCallCounts => {
-  const counts: ToolCallCounts = new Map();
-  for (let index = start; index < end; index++) {
-    const message = entries[index]?.message;
-    if (message?.role !== "toolResult" || typeof message.toolCallId !== "string") continue;
-    const id = message.toolCallId;
-    counts.set(id, (counts.get(id) ?? 0) + 1);
-  }
-  return counts;
-};
-
-const hasMalformedToolMessage = (entries: SessionEntryLike[], start: number, end: number): boolean => {
-  for (let index = start; index < end; index++) {
-    const message = entries[index]?.message;
-    if (message?.role === "toolResult" && typeof message.toolCallId !== "string") return true;
-    if (message?.role === "assistant" && Array.isArray(message.content) && message.content.some((part: any) => part?.type === "toolCall" && typeof part.id !== "string")) return true;
-  }
-  return false;
-};
-
-const isValidCutEntry = (entry: SessionEntryLike | undefined): boolean => {
-  if (!entry || entry.type === "compaction") return false;
-  // Pi 会把相邻的无上下文元数据纳入保留区；验证其消息投影，而非限制 entry 类型。
-  const messages = sessionEntryToContextMessages(entry as SessionEntry);
-  return messages.length === 0 || messages.some((message) => message && CUT_POINT_ROLES.has(message.role));
+// 在副本中追加候选 compaction，由 Pi 应用保留区内的最后一次 context_edit。
+// 回退可能重新保留旧消息或旧编辑，不能直接切片压缩前的投影。
+const projectCompactionTail = (branch: SessionEntryLike[], keptEntryId: string): ProjectedSessionEntry[] => {
+  const ids = new Set(branch.map((entry) => entry.id));
+  let previewId = "pi-compact-preview";
+  while (ids.has(previewId)) previewId += "-";
+  const preview: SessionEntry = {
+    type: "compaction", id: previewId, parentId: branch.at(-1)?.id ?? null,
+    timestamp: new Date(0).toISOString(), summary: "{}", firstKeptEntryId: keptEntryId, tokensBefore: 0,
+  };
+  return buildSessionProjection([...branch as SessionEntry[], preview]).entries.slice(1);
 };
 
 /**
- * Pi 不会把工具结果选为切点，但扩展仍需验证保留侧的完整调用/结果关系。
- * error/aborted assistant 响应中的调用可能没有结果，可以由被丢弃的检查点覆盖，
- * 不应因此阻塞后续压缩。
+ * 校验候选压缩提交后的消息投影；被省略的 toolResult 也可以是合法切点。
+ * 被 checkpoint 替换的前缀不再参与配对，保留侧必须按顺序闭合工具调用。
+ * Pi 的 error/aborted assistant 终态允许存在无结果调用。
  */
-export const isSafeCut = (branchEntries: SessionEntryLike[], keptEntryId: string): boolean => {
-  const cut = branchEntries.findIndex((entry) => entry.id === keptEntryId);
-  if (cut <= 0 || !isValidCutEntry(branchEntries[cut])) return false;
-  if (hasMalformedToolMessage(branchEntries, cut, branchEntries.length)) return false;
+const isSafeProjectedTail = (entries: ReturnType<typeof projectCompactionTail>): boolean => {
+  const first = entries[0];
+  if (!first || (first.messages.length > 0 && !first.messages.some((message) => CUT_POINT_ROLES.has(message.role)))) return false;
 
-  const callsBefore = countToolCalls(branchEntries, 0, cut);
-  const terminalCallsBefore = countTerminalToolCalls(branchEntries, 0, cut);
-  const resultsBefore = countToolResults(branchEntries, 0, cut);
-  for (const [id, count] of callsBefore) {
-    const missing = count - (resultsBefore.get(id) ?? 0);
-    if (missing > (terminalCallsBefore.get(id) ?? 0)) return false;
-  }
-  for (const [id, count] of resultsBefore) {
-    if (count > (callsBefore.get(id) ?? 0)) return false;
-  }
-
-  // 切点后的结果不能引用已经被丢弃的调用；终止的 error/aborted 调用可以没有结果。
-  const callsAfter = countToolCalls(branchEntries, cut, branchEntries.length);
-  const terminalCallsAfter = countTerminalToolCalls(branchEntries, cut, branchEntries.length);
-  const resultsAfter = countToolResults(branchEntries, cut, branchEntries.length);
-  for (const [id, count] of callsAfter) {
-    const missing = count - (resultsAfter.get(id) ?? 0);
-    if (missing > (terminalCallsAfter.get(id) ?? 0)) return false;
-  }
-  for (const id of resultsAfter.keys()) {
-    if (!callsAfter.has(id)) return false;
-  }
-
-  // 按 entry 顺序回放保留尾部，避免接受结果先于调用或普通未完成调用。
   const openCalls = new Map<string, boolean[]>();
-  for (let index = cut; index < branchEntries.length; index++) {
-    const message = branchEntries[index]?.message;
-    if (message?.role === "assistant") {
-      const terminal = TERMINAL_ASSISTANT_REASONS.has(message.stopReason ?? "");
-      for (const id of toolCallIds(message)) {
-        const calls = openCalls.get(id) ?? [];
-        calls.push(terminal);
-        openCalls.set(id, calls);
+  for (const { messages } of entries) {
+    for (const message of messages) {
+      if (message.role === "assistant") {
+        if (Array.isArray(message.content) && message.content.some((part: any) => part?.type === "toolCall" && typeof part.id !== "string")) return false;
+        const terminal = TERMINAL_ASSISTANT_REASONS.has(message.stopReason ?? "");
+        for (const id of toolCallIds({ content: message.content })) {
+          const calls = openCalls.get(id) ?? [];
+          calls.push(terminal);
+          openCalls.set(id, calls);
+        }
+      } else if (message.role === "toolResult") {
+        const id = message.toolCallId;
+        if (typeof id !== "string") return false;
+        const calls = openCalls.get(id);
+        if (!calls || calls.length === 0) return false;
+        calls.shift();
+        if (calls.length === 0) openCalls.delete(id);
       }
-    } else if (message?.role === "toolResult") {
-      const id = message.toolCallId;
-      if (typeof id !== "string") return false;
-      const calls = openCalls.get(id);
-      if (!calls || calls.length === 0) return false;
-      calls.shift();
-      if (calls.length === 0) openCalls.delete(id);
     }
   }
   return [...openCalls.values()].every((calls) => calls.every((terminal) => terminal));
 };
 
-/**
- * Pi 给出的边界不安全时，向前回退寻找最近一个安全边界：
- * 回退只会让保留区变大（少摘要、多保留），不会引入新的断链风险。
- * 找不到任何安全边界时返回 undefined，由调用方决定取消。
- */
+export const isSafeCut = (branchEntries: SessionEntryLike[], keptEntryId: string): boolean => {
+  const cut = branchEntries.findIndex((entry) => entry.id === keptEntryId);
+  if (cut <= 0 || branchEntries[cut].type === "compaction") return false;
+  try {
+    const entries = projectCompactionTail(branchEntries, keptEntryId);
+    return entries[0]?.sourceEntry.id === keptEntryId && isSafeProjectedTail(entries);
+  } catch {
+    // 无法构造宿主等价投影时不放行压缩，避免把不完整工具链交给模型。
+    return false;
+  }
+};
+
+/** 向前逐个预演候选边界；只有最终投影安全时才回退，否则取消压缩。 */
 export const findEarlierSafeCut = (branch: SessionEntryLike[], proposedId: string): string | undefined => {
   const proposed = branch.findIndex((entry) => entry.id === proposedId);
   if (proposed <= 0) return undefined;
+  let activeIds: Set<string>;
+  try {
+    activeIds = new Set(buildSessionProjection(branch as SessionEntry[]).entries.map((entry) => entry.sourceEntry.id));
+  } catch {
+    return undefined;
+  }
   for (let index = proposed; index >= 1; index--) {
     const entry = branch[index];
-    if (typeof entry?.id !== "string" || !isValidCutEntry(entry)) continue;
-    if (isSafeCut(branch, entry.id)) return entry.id;
+    if (typeof entry?.id === "string" && activeIds.has(entry.id) && isSafeCut(branch, entry.id)) return entry.id;
   }
   return undefined;
+};
+
+const isSplitAt = (branch: SessionEntryLike[], keptEntryId: string): boolean => {
+  const entries = buildSessionProjection(branch as SessionEntry[]).entries;
+  const cut = entries.findIndex((entry) => entry.sourceEntry.id === keptEntryId);
+  const startsTurn = (entry: ProjectedSessionEntry) => entry.sourceEntry.type !== "compaction"
+    && entry.messages.some((message) => message.role !== "assistant" && CUT_POINT_ROLES.has(message.role));
+  return cut > 0 && !startsTurn(entries[cut]) && entries.slice(0, cut).some(startsTurn);
+};
+
+const recordsBeforeCut = (branch: SessionEntryLike[], keptEntryId: string, excludedEntryId?: string) => {
+  const sourceBranch = excludedEntryId
+    ? branch.filter((entry) => entry.id !== excludedEntryId)
+    : branch;
+  const projection = buildSessionProjection(sourceBranch as SessionEntry[]).entries;
+  const cut = projection.findIndex((entry) => entry.sourceEntry.id === keptEntryId);
+  if (cut < 0) throw new Error(`kept entry ${keptEntryId} is absent from the active projection`);
+  return recordsFromProjectedEntries(projection.slice(0, cut));
 };
 
 const sessionIdOf = (ctx: any): string | undefined => {
@@ -144,7 +116,7 @@ const sessionIdOf = (ctx: any): string | undefined => {
   }
 };
 
-const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromEntries>, sourceHash: string, sessionId?: string): void => {
+const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromProjectedEntries>, sourceHash: string, sessionId?: string): void => {
   withMemoryLogLock(cwd, () => {
     const existing = new Set(loadMemories(cwd).map((record) => record.id));
     for (const draft of deriveFacts(records, sourceHash)) {
@@ -212,12 +184,12 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       ctx.ui?.notify?.(`pi-compact: Pi 给出的压缩边界会破坏工具调用链，已回退到更早的安全边界 ${fallbackId}（保留更多内容）。`, "info");
     }
     try {
-      const cutIndex = branch.findIndex((entry: any) => entry.id === keptEntryId);
-      const records = recordsFromEntries(branch.slice(0, cutIndex));
+      // 审计与派生记忆都使用宿主相同的 context projection；只有工具链安全检查使用候选 compaction 预览。
+      const records = recordsBeforeCut(branch, keptEntryId);
       // 准备阶段只计算。窗口与派生记忆在宿主确认提交之后才持久化。
       const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
       const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars);
-      details.isSplitTurn = isSplitTurn;
+      details.isSplitTurn = keptEntryId === proposedKeptEntryId ? isSplitTurn : isSplitAt(branch, keptEntryId);
       if (config.debug) {
         console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);
       }
@@ -238,13 +210,21 @@ export const registerHooks = (pi: ExtensionAPI): void => {
   pi.on("session_compact", (event: any, ctx: any) => {
     if (!event.fromExtension) return;
     const branch: SessionEntryLike[] = ctx.sessionManager?.getBranch?.() ?? [];
-    // Pi 0.86.1 按 summary 查找事件 entry；摘要相同时可能返回旧条目，使用实际提交的分支末条。
+    // Pi 按 summary 查找事件 entry；摘要相同时可能返回旧条目，使用实际提交的分支末条。
     const entry = branch.filter((item) => item.type === "compaction").at(-1) ?? event.compactionEntry;
     const details = entry?.details;
     if (details?.compactor !== "pi-compact") return;
     const config = loadConfig(ctx.cwd);
     const sessionId = sessionIdOf(ctx);
-    const records = recordsFromEntries(branch, new Set<string>(details.sourceEntryIds));
+    let records: ReturnType<typeof recordsFromProjectedEntries>;
+    try {
+      if (typeof entry.id !== "string" || typeof entry.firstKeptEntryId !== "string") throw new Error("missing committed compaction identity");
+      // 提交后从分支中移除刚写入的 compaction，重建提交前 projection，避免重新读取已被 context_edit 隐藏的 raw 正文。
+      records = recordsBeforeCut(branch, entry.firstKeptEntryId, entry.id);
+    } catch {
+      ctx.ui?.notify?.("pi-compact: 无法重建提交前的上下文投影，窗口日志和派生记忆未写入。", "warning");
+      return;
+    }
     if (typeof entry.id === "string" && hashRecords(records) === details.sourceHash) {
       if (config.window.manifest) {
         try {

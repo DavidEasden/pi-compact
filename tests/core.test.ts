@@ -3,7 +3,7 @@ import type { SessionEntryLike } from "../src/types.ts";
 import test from "node:test";
 import { buildDetails, renderLedger } from "../src/core/ledger.ts";
 import { messageFiles, messageText, snippetAround } from "../src/core/content.ts";
-import { isSafeCut } from "../src/hooks.ts";
+import { isSafeCut as checkSafeCut } from "../src/hooks.ts";
 import { activeEntryIds, entryToRecord, hashRecords, listRecords, recordsFromEntries, searchRecords } from "../src/core/session.ts";
 
 const entries: SessionEntryLike[] = [
@@ -172,6 +172,10 @@ test("derived 记录默认可列出但搜索降权，片段按行边界截取", 
 });
 
 test("压缩边界必须保留完整的工具调用和结果配对", () => {
+  // 每组夹具都表示一条分支，父链必须与数组顺序一致，供真实 SDK 投影使用。
+  const isSafeCut = (branch: SessionEntryLike[], id: string) => checkSafeCut(branch.map((entry, index) => ({
+    ...entry, parentId: index > 0 ? branch[index - 1].id : null,
+  })), id);
   const user = entries[0];
   const call = entries[1];
   const result = entries[2];
@@ -196,7 +200,8 @@ test("压缩边界必须保留完整的工具调用和结果配对", () => {
 
   assert.equal(isSafeCut([user, call, result], "a1"), true);
   assert.equal(isSafeCut([user, call, result], "t1"), false);
-  assert.equal(isSafeCut([user, call, nextAssistant], "a2"), false);
+  // 未完成调用若全部位于被 checkpoint 替换的前缀，不会破坏保留尾部。
+  assert.equal(isSafeCut([user, call, nextAssistant], "a2"), true);
   assert.equal(isSafeCut([user, call, result, nextCall, nextResult], "a3"), true);
   assert.equal(isSafeCut([user, call, result, nextCall], "a3"), false);
 

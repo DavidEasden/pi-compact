@@ -4,28 +4,27 @@
 
 面向 [Pi](https://pi.dev/) 的长期记忆、确定性 session 压缩与精确历史召回扩展。
 
-`pi-compact` 的核心是长期记忆。压缩只是窗口容量管理：历史可恢复，长期记忆必须在多次压缩、重启和 context window 切换后仍可重建，并自动出现在上下文中。扩展不调用 LLM 生成压缩摘要，也不把压缩 checkpoint 或模型笔记当成事实源。原始 session entries 始终保留，可通过召回工具重新读取。
+`pi-compact` 的核心是长期记忆。压缩负责窗口容量管理：历史可恢复，长期记忆在多次压缩、重启和 context window 切换后仍可重建，并通过工具按需查询。扩展不调用 LLM 生成压缩摘要，也不把压缩 checkpoint 或模型笔记当成事实源。原始 session entries 始终保留，可通过召回工具重新读取。
 
 ## 功能
 
 - 在项目 `.pi/pi-compact/` 中维护 append-only 记忆事件日志；当前记忆状态由纯函数从事件重放，旧事件不能静默覆盖。
 - 用户通过 `/remember`、`/memories`、`/forget` 写入权威记忆；模型只能提出 provisional 提议，不会自动变成 active 或 pinned。
-- 每次 context 请求注入确定性的 pinned/active 工作记忆提示；pinned 优先占用预算，不会被普通历史召回挤掉。没有 pinned 时也会注入如何查询记忆和历史的短提示。
+- 模型通过工具按需查询历史与记忆；扩展不注册 context 注入，不自动附加历史正文或 pinned/active 提示。
 - 接管 Pi 原生的 `/compact` 命令，以及普通的 `manual`、`threshold` 和 `overflow` compaction。
 - 使用 Pi 自己计算的压缩边界、token accounting、持久化和恢复流程；checkpoint 是确定性指针/审计内容，不是 primary memory。
 - 记录 WindowManifest（windowId、父窗口、保留边界、sourceCount、sourceHash、previousHash）。
 - 在压缩前检查工具调用与工具结果是否完整配对；发现不安全边界时优先回退到更早的安全边界，找不到任何安全边界才取消本次接管，避免破坏上下文。
 - 生成确定性的事件 ledger，不把规则提取结果伪装成目标、决策或已完成任务。规则派生只提取文件、命令、退出码、测试计数等不需要语义推断的字段，并带 provenance。
-- 历史记录区分 primary/derived：`compaction` 与 `branch_summary` 默认不进入自动召回；thinking 保留在 raw 中，不进入默认搜索文本。
+- 历史记录区分 primary/derived：`compaction` 与 `branch_summary` 属于 derived，可用 `sourceClass` 过滤；thinking 保留在 raw 中，不进入默认搜索文本。
 - 提供 `pi_compact_recall` 工具，支持 list/search/read、entry ID、关键词、文件路径、消息类型、分页和原始 entry 回放；长 raw 可用 `offset`/`rawLimit` 分段读取。
-- 提供 `/pi-compact-recall` 命令，将召回结果作为 follow-up turn 发送给模型。
+- 提供 `/pi-compact-recall` 命令，仅通过 UI 显示召回结果，不触发模型 turn。
 - 提供 `pi_memory_search`、`pi_memory_read`、`pi_memory_propose`、`pi_memory_update` 与 `pi_compact_new_context`。
-- 可选地根据当前 user 请求，在每次 provider 请求前自动召回当前 branch 中尚未出现在上下文里的 primary 历史。
 - 自动创建项目级 `.pi/pi-compact.json` 配置，不覆盖已有项目或全局配置。
 
 ## 安装
 
-需要已安装 Pi；当前验证版本为 `0.86.1`，该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。
+当前源码要求 Pi `>=0.87.1`，开发与集成测试固定在 `0.87.1`；该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。已发布的 `v0.2.0` 不包含后续源码修复；验证当前改动请使用本地加载方式。
 
 Pi package 会执行扩展代码，请在安装前审查源代码。
 
@@ -113,7 +112,7 @@ pi install /absolute/path/to/pi-compact
 pi install -l /absolute/path/to/pi-compact
 ```
 
-当前项目使用 Pi 的 `@earendil-works/pi-coding-agent` API，并已按 Pi `0.86.1` 进行验证。Pi 和 `typebox` 是 peer dependencies，由 Pi 环境提供；开发依赖固定 Pi `0.86.1`，用于可重复的宿主集成测试。
+当前项目使用 Pi 的 `@earendil-works/pi-coding-agent` API，并按 Pi `0.87.1` 验证 `context_edit` 与压缩后的消息投影。Pi 和 `typebox` 是 peer dependencies，由 Pi 环境提供；开发依赖固定 Pi `0.87.1`，用于可重复的宿主集成测试。
 
 ## 配置
 
@@ -165,25 +164,25 @@ pi install -l /absolute/path/to/pi-compact
 
 | 配置项 | 默认值 | 说明 |
 | --- | ---: | --- |
-| `enabled` | `true` | 是否启用压缩接管、工作记忆注入和自动召回；Pi 原生的 `/compact` 命令、召回工具和记忆命令仍然可用 |
+| `enabled` | `true` | 是否启用压缩接管；召回工具仍可使用，记忆功能由 `memory.enabled` 控制 |
 | `overrideDefaultCompaction` | `true` | 是否接管 Pi 的普通 compaction；关闭后保留默认压缩 |
 | `summaryMaxChars` | `12000` | 确定性 checkpoint 文本的最大字符数 |
-| `autoRecall` | `true` | 兼容开关。已配置 `autoRecallMode` 时被忽略；未配置模式时，`false` 映射为 `off`，否则为 `full` |
-| `autoRecallMode` | `full` | 自动召回模式：`full`（当前完整片段）、`hint`（短 ID/kind 提示）或 `off`（关闭）。合法模式优先于 `autoRecall` |
-| `autoRecallMaxChars` | `5000` | 单次自动历史召回文本的最大字符数；与记忆 hint 预算独立 |
-| `recallMaxResults` | `8` | 自动召回最多返回的记录数 |
-| `recallMaxChars` | `16000` | 手动召回结果的最大字符数；按单个 entry ID 的 `raw` 回放会返回完整 JSON，即使超过该预算 |
+| `autoRecall` | `true` | 仅兼容旧配置，当前不启用自动召回 |
+| `autoRecallMode` | `full` | 仅解析旧的 `full`/`hint`/`off` 模式，当前均不注入历史 |
+| `autoRecallMaxChars` | `5000` | 旧自动召回预算，当前无运行时作用 |
+| `recallMaxResults` | `8` | 旧自动召回条数，当前无运行时作用；手动查询使用 `limit` |
+| `recallMaxChars` | `16000` | 召回输出字符预算；模型工具始终遵守，只有 UI 命令可显式读取超预算的单条完整 raw |
 | `debug` | `false` | 是否输出扩展调试日志（只输出计数和字符数，不输出原文） |
-| `memory.enabled` | `true` | 是否启用长期记忆读写与工作记忆注入 |
-| `memory.pinnedInjection` | `true` | 是否在每次 context 请求注入 pinned/active 工作记忆提示 |
+| `memory.enabled` | `true` | 是否启用长期记忆命令、工具读写与规则派生 |
+| `memory.pinnedInjection` | `true` | 旧提示注入开关，当前无运行时作用 |
 | `memory.proposalsProvisionalOnly` | `true` | 模型提议只能以 provisional 写入；即使设为 `false` 也不会自动升级为 active/pinned |
-| `memory.hintMaxChars` | `4000` | 工作记忆提示的最大字符数；pinned 优先，不会被普通召回挤掉 |
+| `memory.hintMaxChars` | `4000` | 旧工作记忆提示预算，当前无运行时作用 |
 | `memory.deriveOnCompact` | `true` | 压缩成功提交后是否写入规则派生的 provisional 记录（文件/命令/退出码/测试计数） |
-| `history.autoRecallPrimaryOnly` | `true` | 自动历史召回默认只使用 primary 记录 |
-| `history.excludeInContext` | `true` | 自动召回排除当前请求已经存在的 entry（以 `buildContextEntries()` 为准） |
+| `history.autoRecallPrimaryOnly` | `true` | 旧自动召回来源过滤，当前无运行时作用 |
+| `history.excludeInContext` | `true` | 旧自动召回去重开关，当前无运行时作用 |
 | `window.manifest` | `true` | 压缩成功提交后是否写入 WindowManifest 与窗口事件日志；取消不写入 |
 
-也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认安全策略：记忆开启、pinned 注入开启、模型提议仅 provisional、自动历史召回仅 primary。
+也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史与记忆都通过工具按需查询。旧注入配置仍可解析，但不会重新启用已移除的 context hook。
 
 自动压缩阈值和保留尾部大小仍由 Pi 自身的 compaction settings 控制，本扩展不另设触发阈值。
 
@@ -216,7 +215,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 /forget mem_abc
 ```
 
-`/remember` 支持 `pin`、`kind:`、`scope:`、`priority:`、`supersede:<id>`。`/memories` 可按 `status:`、`kind:` 和关键词过滤。`/forget` 将记忆标记为 resolved，不再进入工作记忆。这些命令只做本地确定性写入并通过 UI 通知，不触发模型 turn。
+`/remember` 支持 `pin`、`kind:`、`scope:`、`priority:`、`supersede:<id>`。`/memories` 可按 `status:`、`kind:` 和关键词过滤。`/forget` 将记忆标记为 resolved，不再出现在默认记忆查询中。这些命令只做本地确定性写入并通过 UI 通知，不触发模型 turn。
 
 记忆工具：
 
@@ -272,13 +271,13 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 | `rawLimit:N` | raw 分段读取的字符长度 |
 | `sourceClass:primary\|derived\|all` | 按来源类别过滤 |
 
-示例中的 entry ID 是占位符，请使用 checkpoint 或召回结果中显示的真实 ID。
+示例中的 entry ID 是占位符，请使用召回结果中显示的真实 ID。
 
 指定 `ids` 后，按 ID 选择记录并应用 `scope` 和 `limit`，忽略关键词、`file`、`kind` 和 `page`；结果按 session 原有顺序返回。未指定 ID 时，需要关键词或 `file`（`action` 为 `list` 除外），空查询或仅指定 `kind` 不会列出全部历史。
 
 关键词搜索是分词后的文本匹配，不支持正则表达式或语义检索；文件过滤仅匹配已提取的路径，不读取磁盘文件。路径主要来自工具参数和简单 bash 命令，消息正文中的路径不一定被索引。命令按空白拆分参数，不支持带空格路径的引号解析；这类路径可通过工具的 `file` 字段传入。
 
-命令会把召回内容作为 follow-up turn 发送，触发模型继续处理，并进入正常 session 历史。
+命令仅通过 UI 通知显示召回内容，不发送给模型，也不新增 session 消息。UI 命令可使用 `scope:all` 查看其他 branch；模型工具始终限定为当前 branch。
 
 ### `pi_compact_recall` 工具
 
@@ -298,29 +297,17 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 可用字段与 `/pi-compact-recall` 参数对应：`query`、`entryIds`、`file`、`kind`、`scope`、`page`、`limit`、`raw`、`action`、`offset`、`rawLimit` 和 `sourceClass`。
 
-`action` 为 `list`/`search`/`read`。使用 `raw: true` 且只召回单个 entry ID、且未指定 `offset`/`rawLimit` 时，输出该原始 session entry 的完整 JSON，包含该 entry 存有的工具参数、工具输出、时间戳和父子 entry 关系。这条 JSON 不会被截断，即使超过 `recallMaxChars`；序列化失败时返回结构化错误对象，而不是截断的 JSON。指定 `offset` 与 `rawLimit` 时按字符窗口分段读取，避免默认把长 raw 无限灌入上下文。多个 raw 命中时，只返回字符预算内的完整 entry，并附带 `omitted entry IDs` 提示，绝不会从 JSON 中间截断。关键词和 pretty（非 raw）输出仍受 `recallMaxChars` 限制。分页只划分记录，不划分单条 entry 内容。按单个 raw entry ID 查询时忽略默认 `limit` 8，避免丢掉请求的那一条。thinking 保留在 raw 中，但不进入默认搜索文本。`compaction` 与 `branch_summary` 属于 derived，默认不进入自动召回。
+`action` 为 `list`/`search`/`read`。模型工具的所有输出（包括单个 entry ID 的 `raw`）均受 `recallMaxChars` 硬预算限制。单条 raw 超预算时返回包含 `entryId`、`offset`、`limit`、`totalChars`、`truncated` 与 `body` 的有效 JSON，可用 `offset`/`rawLimit` 继续分段读取。只有 UI 命令显式指定单个 `ids`、`raw` 且不指定分段参数时，才返回不受该预算限制的完整原始 entry JSON。
 
-## 自动召回与工作记忆
+多条 raw 只输出预算内的完整 entry，并提示省略的 ID；不会从 JSON 中间截断。pretty 输出按完整结果块裁剪。分页划分记录，`offset`/`rawLimit` 划分单条原文。原始工具参数、输出、时间戳和父子关系保留在 raw 中；thinking 不进入默认搜索文本。`compaction` 与 `branch_summary` 属于 derived，可用 `sourceClass` 过滤。
 
-每次 context 请求（在记忆启用且 `pinnedInjection` 为 true 时）都会注入 `pi-compact-memory-hint`。即使没有 pinned 记忆，也会告诉模型如何使用 `/remember`、`pi_memory_search` 和 `pi_compact_recall`。pinned 项优先占用 `memory.hintMaxChars`，不会被普通历史召回挤掉。工作记忆注入与自动历史召回是两条独立消息、两套预算。
+## 历史与记忆的按需查询
 
-自动召回默认模式为 `full`（当前完整片段注入），由 `enabled && autoRecallMode !== "off"` 控制。自动召回现在是高置信门控：像 `continue`、`ok`、`thanks`、`请继续`、`好的`、`谢谢`、`上一步`、`再试一次` 这类会话控制/礼貌/泛词，不能单独触发历史正文注入。手动 `pi_compact_recall` 不受影响，仍可按这些词做精确检索。自动召回不以查询长度 `>= 3` 作为唯一门槛，也不使用 LLM、embedding 或网络服务。
+当前版本不注册 `context` hook，不自动注入 `pi-compact-auto-recall` 或 `pi-compact-memory-hint`。旧的 `autoRecall*`、`memory.pinnedInjection`、`memory.hintMaxChars` 和 `history.*` 字段保留配置兼容性，不能重新开启注入。pinned/active 记忆可通过 `pi_memory_search` 和 `pi_memory_read` 查询。
 
-满足以下条件时生效：
+模型调用 `pi_compact_recall` 时只搜索当前 branch；active lineage 无法取得时不会扩大到整个 session。用户可在 `/pi-compact-recall` 命令中显式指定 `scope:all` 查看其他 branch。工具返回内容会作为普通工具结果进入模型上下文，UI 命令返回内容只显示在界面中。
 
-- 当前请求的最新 user 文本经过确定性规范化、停用词/停用短语过滤和匹配信号分级后，仍含有高置信词（文件路径、错误码、函数名/标识符、命令）或多词主题。
-- 当前 session 可以取得有效的 active branch。
-- 当前 branch 中存在带有效 ID 的 user entry。
-- 当前 user entry 之前的历史记录中存在对这些高置信词的匹配结果。
-- 默认只搜索 primary 记录，并排除 `buildContextEntries()` 中已经存在于当前请求上下文的 entry。
-
-自动召回只修改当前 provider 请求的 messages，不写入 session，也不会生成新的 session entry。同一 user turn 的多次 provider 请求会复用召回结果；新的 user entry 会重新计算。当前 turn 新产生的工具结果不会被混入该 turn 的自动召回范围。
-
-如果 branch 查询失败、没有合法 user entry 或没有命中，扩展会安静跳过自动召回。手动召回在无法取得 active lineage 时也不会扩大为整个 session；只有显式指定 `scope:all` 才跨 branch 检索。
-
-`full` 注入匹配记录的截短片段。`hint` 只注入紧凑的 `- [id] kinds=…` 行（若有已提取路径则附带 files），不含长片段。`off` 完全跳过注入，即使 `autoRecall` 仍为 `true`。搜索范围不变：只搜索当前 branch 中最新 user entry 之前的历史；自动召回不会扩大到其他 branch。
-
-在 `history.excludeInContext` 开启且 session 提供 `buildContextEntries` 时，自动召回不再把已经位于当前上下文中的 entry 再注入一遍。`full` 仍可能增加请求 token 用量。注入的 custom message 会带成本统计（`chars`、`hitCount`、`estimatedTokens`、`mode`、`sameTurnInjectionCount`），`details` 不复制原文。同一 turn 的后续 provider 请求会复用缓存文本并增加 `sameTurnInjectionCount`；工作记忆 hint 的计数同样以本回合最新 user entry id 作为回合键，新用户回合会重置计数，只有同回合内的重试才递增。若请求中已有对应 customType 的消息，则不再重复注入。召回内容会发送给当前模型提供方，可能包含原始工具输出或其他敏感文本；`raw` 不做脱敏，`scope:all` 还会包含其他分支的匹配记录。保存原文和支持精确检索并不等于模型一定会遵守记忆或自动召回所有相关细节。
+保存在 session 中的原文可精确回查；按需查询不保证模型主动召回所有相关细节，也不保证它遵守全部记忆。
 
 ## 压缩与数据边界
 
@@ -328,11 +315,11 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 压缩时：
 
-1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界，包括原生选取的 `usage`、`model_change` 等无上下文消息的元数据条目。
-2. 将边界之前的原始 entries 转换成带 ID 的记录。
+1. 使用 Pi 提供的 `firstKeptEntryId` 作为保留边界，包括无上下文消息的元数据和被 `context_edit` 省略的条目。
+2. 使用 Pi 提交前的 context projection，将边界之前的可见消息转换成带 ID 的审计记录。`context_edit` 的省略会影响 checkpoint 的计数和哈希，替换会影响派生记忆使用的投影记录内容；原始 entry 仍可通过显式召回回放。
 3. 生成只含 `compactor`、`sourceCount`、`sourceHash` 的确定性 checkpoint；不复制历史正文，checkpoint 不是 primary memory。
 4. 保存 `sourceEntryIds`、`sourceHash`、`sourceRecordCount`、`keptEntryId`、`omittedRecordCount`、`checkpointChars`、`summaryMaxChars`、`isSplitTurn`、`estimatedTokensAfter`（字符数 / 4 向上取整，不是 provider usage）。扩展不会伪造计费 `usage`；Pi 会自行计算包含完整上下文的压缩后估算值。
-5. 校验工具调用与结果的边界关系，以及保留尾部中的配对顺序；边界不安全时先回退到更早的安全边界（保留更多内容），找不到任何安全边界或请求已中止才返回 `{ cancel: true }`，不落回默认 LLM 摘要。处理出错时降级为指针型 checkpoint，而不是让 Pi 改用 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许存在无结果的工具调用，不适用于普通未完成调用。
+5. 使用 Pi 0.87.1 的 `buildSessionProjection()` 预演候选 compaction，检查应用 `context_edit` 省略与替换后的保留尾部。结果必须跟在对应调用之后，普通调用必须有结果；已被 checkpoint 替换的前缀不阻塞压缩。边界不安全时在当前 compaction window 内逐个预演更早边界；没有安全边界、无法构造投影或请求中止时取消，不落回 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许无结果调用。安全校验通过后，checkpoint 生成出错会降级为指针型 JSON；回退后重新计算 `isSplitTurn`。
 6. Pi 提交 compaction 并发出成功事件后，才在同一文件锁中生成窗口清单并写入 `.pi/pi-compact/windows.jsonl`；窗口 ID 绑定 sessionId 与实际 compaction entry，重复事件不会重复写入。规则派生记忆也在成功后写入。失败或取消不会留下窗口及派生记录。旧 checkpoint 中的 `details.window` 仍可读取，新清单以窗口日志为准。
 
 原始 session entries 才是历史事实来源；用户写入的 memory log 才是长期记忆事实来源。checkpoint 只保存计数和哈希，不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。
@@ -374,11 +361,11 @@ npm pack --dry-run
 ```text
 index.ts                 Pi 扩展入口
 src/config.ts            配置读取、归一化和初始化
-src/hooks.ts             compaction、context、工作记忆注入和 session hooks
+src/hooks.ts             压缩投影校验与 session hooks
 src/recall.ts            召回工具与 /pi-compact-recall 命令
 src/memory.ts            记忆命令与记忆/新窗口工具
 src/core/content.ts      消息文本、文件、thinking 分离和片段边界
-src/core/auto-recall.ts  自动历史召回的确定性高置信门控
+src/core/auto-recall.ts  旧自动召回门控纯函数，未接入运行时
 src/core/lock.ts         同步日志锁、owner-token 回收、跨平台启动时间身份
 src/core/ledger.ts       确定性 checkpoint 与 details
 src/core/session.ts      session entry 转换、sourceClass、搜索和原文回放
@@ -386,7 +373,7 @@ src/core/jsonl.ts        损坏安全的 JSONL 读写
 src/core/projector.ts    记忆事件纯函数投影
 src/core/store.ts        `.pi/pi-compact/` 事件日志
 src/core/window.ts       WindowManifest 与哈希链
-src/core/working.ts      pinned/active 工作记忆提示
+src/core/working.ts      旧工作记忆提示纯函数，未接入运行时
 src/core/derive.ts       无语义推断的规则派生
 src/types.ts             共享类型
 tests/                   单元测试
@@ -397,18 +384,18 @@ tests/                   单元测试
 当前已验证：
 
 - 确定性记录提取、关键词和文件搜索、原始记录保留与 hash。
-- thinking 不进入默认搜索；derived/compaction 默认不自动召回；已在上下文中的 entry 可排除。
-- 记忆事件重放确定性、supersede/pin、EOF 半行容忍与断链后拒绝追加、100 次模拟压缩后 pinned 仍注入。
-- 工作记忆预算优先级、窗口哈希链、记忆命令/工具入口、长 raw 分段读取。
+- thinking 不进入默认搜索；primary/derived 来源过滤和模型工具的当前分支限制。
+- 记忆事件重放确定性、supersede/pin、EOF 半行容忍与断链后拒绝追加。
+- 窗口哈希链、记忆命令/工具入口、长 raw 分段读取。
 - 工具调用与工具结果的压缩边界校验。
 - 配置初始化与非法配置归一化，包括 memory/history/window。
 - 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
-- 空 active lineage 不扩大搜索范围；自动召回的同轮复用、新 user 更新、去重和 branch 查询异常处理。
-- 自动召回高置信门控会拒绝 continue/ok 等泛词，同时仍注入具体 token、错误码和路径；手动召回仍能命中这些泛词。
-- 日志锁回收在 token/metadata 不匹配时不删除，也不会自动删除无效 metadata；活锁不按年龄回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
+- 空 active lineage 不扩大搜索范围；无 context hook，因此不自动注入历史与工作记忆。
+- 保留的旧自动召回门控与工作记忆渲染纯函数仍有单元测试，但不代表运行时存在注入行为。
+- 日志锁在 token/metadata 不匹配时不删除，活锁不按年龄回收；无效 metadata 在宽限期后可回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
 - 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
 
-- Pi 0.86.1 真实 SDK 的元数据切点、完整 overflow retry、并行及顺序工具换窗后续跑、用户中止、取消后的无副作用、成功事件去重和会话保存恢复。
+- Pi 0.87.1 真实 SDK 的元数据切点、完整 overflow retry、`context_edit` 省略/替换与切点预演、孤立工具结果取消、并行及顺序工具换窗后续跑、用户中止、取消后的无副作用、成功事件去重和会话保存恢复。
 - 记忆工具禁用、session 范围隔离、显式历史状态查询、长正文与 JSON 元数据预算、搜索和读取分页。
 
 尚未覆盖线上模型 API 的真实网络响应和计费，以及交互 TUI 的人工操作与长时间运行。

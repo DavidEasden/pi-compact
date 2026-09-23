@@ -52,9 +52,61 @@ test("Pi SDK：元数据边界的 overflow retry 实际恢复", async () => {
     assert.equal(sizes.length, 2);
     assert.ok(sizes[0] > 1000 && sizes[1] < 1000);
     assert.equal(h.session.getLastAssistantText(), "恢复成功");
+    const omissions = h.sm.getEntries().filter((entry) => entry.type === "context_edit" && entry.replacement === null);
+    assert.ok(omissions.length > 0);
+    assert.ok(omissions.every((edit) => h.sm.buildSessionProjection().entries
+      .every((entry) => entry.sourceEntry.id !== edit.targetId || entry.messages.length === 0)));
+    assert.deepEqual(h.session.messages, h.sm.buildSessionContext().messages);
     assert.ok(h.events.some((event) => event.type === "compaction_end" && event.reason === "overflow" && event.willRetry));
   } finally { h.close(); }
 });
+
+test("Pi 0.87.1：被省略的 toolResult 切点原样提交，恢复后无孤立工具调用", async () => {
+  const h = await createHarness({ persistent: true });
+  try {
+    h.sm.appendMessage(user("执行读取"));
+    h.sm.appendMessage(assistant(toolCall("read", { path: "src/a.ts" }, "call-1"), { stopReason: "toolUse" }));
+    const resultId = h.sm.appendMessage({ role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "读取完成" }], isError: false, timestamp: Date.now() });
+    const attemptId = h.sm.appendMessage(assistant("", { stopReason: "error", errorMessage: "prompt is too long" }));
+    h.sm.appendContextEdit(attemptId, null);
+    h.sm.appendContextEdit(resultId, null);
+    const rawResult = h.sm.getEntry(resultId);
+    h.sync();
+    const result = await h.session.compact();
+    assert.equal(h.preparations[0].firstKeptEntryId, resultId);
+    assert.equal(result.firstKeptEntryId, resultId);
+    assert.equal(h.notifications.some((text) => text.includes("回退到更早")), false);
+    assert.equal(h.session.messages.some((message) => message.role === "toolResult" || message.role === "assistant"), false);
+    assert.deepEqual(h.sm.getEntry(resultId), rawResult);
+    assert.equal(rows(h.cwd, "windows")[0].keptEntryId, resultId);
+    h.queue(assistant("继续完成任务"));
+    await h.session.prompt("继续任务");
+    assert.equal(h.session.getLastAssistantText(), "继续完成任务");
+    const restored = SessionManager.open(h.sm.getSessionFile());
+    assert.deepEqual(restored.buildSessionContext().messages, h.session.messages);
+    assert.deepEqual(h.errors, []);
+  } finally { h.close(); }
+});
+
+for (const replacement of [null, { content: "撤回工具调用" }]) {
+  test(`Pi 0.87.1：${replacement === null ? "省略" : "替换"}调用后拒绝保留孤立结果，取消无写入`, async () => {
+    const h = await createHarness();
+    try {
+      h.sm.appendMessage(user("旧任务"));
+      h.sm.appendMessage(assistant("旧任务已完成"));
+      h.sm.appendMessage(user("新的任务"));
+      const callId = h.sm.appendMessage(assistant(toolCall("read", {}, "orphan-1"), { stopReason: "toolUse" }));
+      h.sm.appendMessage({ role: "toolResult", toolCallId: "orphan-1", toolName: "read", content: [{ type: "text", text: "失去调用的结果" }], isError: false, timestamp: Date.now() });
+      h.sm.appendContextEdit(callId, replacement);
+      h.sync();
+      await assert.rejects(h.session.compact(), /Compaction cancelled/);
+      assert.equal(h.compactions().length, 0);
+      assert.equal(rows(h.cwd, "windows").length, 0);
+      assert.equal(rows(h.cwd, "memory").length, 0);
+      assert.deepEqual(h.errors, []);
+    } finally { h.close(); }
+  });
+}
 
 for (const mode of ["parallel", "sequential"]) {
   test(`Pi SDK：${mode} 同批工具完成落盘后只换窗一次并续跑`, { timeout: 10000 }, async () => {

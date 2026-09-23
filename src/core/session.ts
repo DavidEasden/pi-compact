@@ -38,10 +38,9 @@ export const classifySource = (entry: SessionEntryLike, message?: MessageLike): 
   return "primary";
 };
 
-export const entryToRecord = (entry: SessionEntryLike, sourceOrdinal: number): HistoryRecord | undefined => {
-  if (!entry.id) return undefined;
-  const message = entryMessage(entry);
-  if (!message) return undefined;
+type IdentifiedSessionEntry = SessionEntryLike & { id: string };
+
+const recordFromMessage = (entry: IdentifiedSessionEntry, message: MessageLike, sourceOrdinal: number): HistoryRecord => {
   const customType = typeof message.customType === "string"
     ? message.customType
     : typeof entry.customType === "string" ? entry.customType : undefined;
@@ -60,6 +59,25 @@ export const entryToRecord = (entry: SessionEntryLike, sourceOrdinal: number): H
     customType,
     thinkingText: thinkingText || undefined,
   };
+};
+
+export const entryToRecord = (entry: SessionEntryLike, sourceOrdinal: number): HistoryRecord | undefined => {
+  if (!entry.id) return undefined;
+  const message = entryMessage(entry);
+  return message ? recordFromMessage(entry as IdentifiedSessionEntry, message, sourceOrdinal) : undefined;
+};
+
+export const recordsFromProjectedEntries = (entries: Array<{ sourceEntry: unknown; messages: unknown[] }>): HistoryRecord[] => {
+  const result: HistoryRecord[] = [];
+  let ordinal = 0;
+  for (const projected of entries) {
+    const sourceEntry = projected.sourceEntry as SessionEntryLike;
+    const message = projected.messages.find((candidate: any) => candidate?.role !== "system") as MessageLike | undefined;
+    if (!message || !sourceEntry.id) continue;
+    result.push(recordFromMessage(sourceEntry as IdentifiedSessionEntry, message, ordinal));
+    ordinal++;
+  }
+  return result;
 };
 
 export const recordsFromEntries = (entries: SessionEntryLike[], allowedIds?: Set<string>): HistoryRecord[] => {

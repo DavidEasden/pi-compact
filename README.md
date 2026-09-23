@@ -4,28 +4,27 @@
 
 A long-term memory, deterministic session-compaction, and exact-history-recall extension for [Pi](https://pi.dev/).
 
-The core of `pi-compact` is long-term memory. Compaction is only window-capacity management: history remains recoverable, and durable memory must still be reconstructable after many compactions, restarts, and context-window switches, then appear in context automatically. The extension does not call an LLM to generate compaction summaries, and it does not treat compaction checkpoints or model-written notes as a source of truth. Original session entries are never deleted and can be re-read through the recall tool or command.
+The core of `pi-compact` is long-term memory. Compaction manages window capacity: history remains recoverable, and durable memory can be reconstructed after compactions, restarts, and context-window switches, then queried through tools on demand. The extension does not call an LLM to generate compaction summaries, and it does not treat compaction checkpoints or model-written notes as a source of truth. Original session entries are never deleted and can be re-read through the recall tool or command.
 
 ## Features
 
 - Stores an append-only memory event log under `.pi/pi-compact/`; current memory is rebuilt by a pure projector, and older events cannot silently overwrite newer state.
 - Users write authoritative memory with `/remember`, `/memories`, and `/forget`. Model proposals stay provisional and never become active or pinned by themselves.
-- Injects a deterministic pinned/active working-memory hint on every context request. Pinned items take priority in the memory budget and cannot be squeezed out by ordinary history recall. A short how-to-query hint is injected even when nothing is pinned.
+- Models query history and memory through tools on demand. The extension registers no context injection hook and adds no automatic history snippets or pinned/active hints.
 - Takes over Pi's native `/compact` command and normal `manual`, `threshold`, and `overflow` compactions.
 - Reuses Pi's own boundary calculation, token accounting, persistence, and recovery flow. The checkpoint is a deterministic pointer/audit extract, not primary memory.
 - Records a WindowManifest (`windowId`, parent window, retained boundary, `sourceCount`, `sourceHash`, `previousHash`).
 - Verifies that tool calls and tool results are fully paired before compacting; on unsafe boundaries it falls back to an earlier safe boundary first and only cancels when no safe boundary exists, to avoid breaking context.
 - Produces a deterministic event ledger and does not disguise rule-extracted records as goals, decisions, or completed tasks. Rule-derived facts only extract files, commands, exit codes, and test counts, with provenance.
-- History records distinguish `primary` vs `derived`: `compaction` and `branch_summary` stay out of automatic recall by default; thinking remains in `raw` but not in default search text.
+- History records distinguish `primary` vs `derived`: `compaction` and `branch_summary` are derived and can be filtered with `sourceClass`; thinking remains in `raw` but not in default search text.
 - Provides the `pi_compact_recall` tool with list/search/read, entry-ID lookup, keyword search, file-path and kind filters, pagination, and raw-entry replay. Long raw entries support `offset`/`rawLimit`.
-- Provides the `/pi-compact-recall` command, which sends recall results to the model as a follow-up turn.
+- Provides the `/pi-compact-recall` command, which displays results through the UI without triggering a model turn.
 - Provides `pi_memory_search`, `pi_memory_read`, `pi_memory_propose`, `pi_memory_update`, and `pi_compact_new_context`.
-- Optionally recalls primary history that is not already in the current request, from the current branch, before every provider request.
 - Automatically creates a project-level `.pi/pi-compact.json` config without overwriting existing project or global configs.
 
 ## Installation
 
-Pi must already be installed; the verified version is `0.85.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`.
+The current source requires Pi `>=0.87.1`; development and integration tests pin `0.87.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.2.0` does not include subsequent source fixes; use the local loading instructions to verify current changes.
 
 Pi packages execute extension code, so review the source before installing.
 
@@ -113,7 +112,7 @@ This writes to the global Pi settings by default. Use `-l` to write to the curre
 pi install -l /absolute/path/to/pi-compact
 ```
 
-The extension uses Pi's `@earendil-works/pi-coding-agent` API, verified against Pi `0.85.1`. Pi and `typebox` are peer dependencies provided by the Pi environment.
+The extension uses Pi's `@earendil-works/pi-coding-agent` API, verified against Pi `0.87.1` for `context_edit` and post-compaction projections. Pi and `typebox` are peer dependencies provided by the Pi environment; the development dependency pins Pi `0.87.1` for reproducible host integration tests.
 
 ## Configuration
 
@@ -165,25 +164,25 @@ Config fields:
 
 | Field | Default | Description |
 | --- | ---: | --- |
-| `enabled` | `true` | Enables compaction takeover, working-memory injection, and auto recall; the native `/compact` command, recall tool, and memory commands remain available |
+| `enabled` | `true` | Enables compaction takeover; recall tools remain available and memory is controlled by `memory.enabled` |
 | `overrideDefaultCompaction` | `true` | Whether to take over Pi's normal compaction; when disabled, the default compaction is kept |
 | `summaryMaxChars` | `12000` | Maximum character count of the deterministic checkpoint text |
-| `autoRecall` | `true` | Compatibility flag. Ignored when `autoRecallMode` is set; if the mode is unset, `false` maps to `off`, otherwise `full` |
-| `autoRecallMode` | `full` | Auto-recall mode: `full` (current full snippets), `hint` (short ID/kind lines), or `off` (disabled). A valid mode wins over `autoRecall` |
-| `autoRecallMaxChars` | `5000` | Maximum character count of a single auto-history-recall payload; independent from the memory-hint budget |
-| `recallMaxResults` | `8` | Maximum number of records returned by auto recall |
-| `recallMaxChars` | `16000` | Maximum character count of manual recall output; a single `raw` entry ID is returned as complete JSON even if it exceeds this budget |
+| `autoRecall` | `true` | Legacy compatibility field; does not enable automatic recall |
+| `autoRecallMode` | `full` | Parses legacy `full`/`hint`/`off` modes; none inject history at runtime |
+| `autoRecallMaxChars` | `5000` | Legacy auto-recall budget; no current runtime effect |
+| `recallMaxResults` | `8` | Legacy auto-recall count; no current runtime effect. Manual queries use `limit` |
+| `recallMaxChars` | `16000` | Recall output budget, always enforced for model tools. Only the UI command can explicitly request an oversized complete single raw entry |
 | `debug` | `false` | Whether to print extension debug logs (counts and character totals only; never original text) |
-| `memory.enabled` | `true` | Enables durable memory reads/writes and working-memory injection |
-| `memory.pinnedInjection` | `true` | Inject pinned/active working-memory hints on every context request |
+| `memory.enabled` | `true` | Enables durable memory commands, tool reads/writes, and rule derivation |
+| `memory.pinnedInjection` | `true` | Legacy hint-injection flag; no current runtime effect |
 | `memory.proposalsProvisionalOnly` | `true` | Model proposals can only be written as provisional; even `false` does not auto-promote them to active/pinned |
-| `memory.hintMaxChars` | `4000` | Maximum character count of the working-memory hint; pinned items take priority |
-| `memory.deriveOnCompact` | `true` | Write rule-derived provisional records (files/commands/exit codes/test counts) during compaction |
-| `history.autoRecallPrimaryOnly` | `true` | Automatic history recall uses primary records only |
-| `history.excludeInContext` | `true` | Exclude entries already present in the current request (`buildContextEntries()`) |
-| `window.manifest` | `true` | Write WindowManifest and the window event log during compaction |
+| `memory.hintMaxChars` | `4000` | Legacy working-memory hint budget; no current runtime effect |
+| `memory.deriveOnCompact` | `true` | Write rule-derived provisional records after successful compaction |
+| `history.autoRecallPrimaryOnly` | `true` | Legacy automatic recall source filter; no current runtime effect |
+| `history.excludeInContext` | `true` | Legacy automatic recall deduplication flag; no current runtime effect |
+| `window.manifest` | `true` | Write WindowManifest and the window event log after successful compaction; cancellation writes neither |
 
-Flat aliases such as `memoryEnabled`, `memoryHintMaxChars`, `historyAutoRecallPrimaryOnly`, and `windowManifest` are also accepted; nested objects win. Numeric fields must be positive safe integers. The caps for `summaryMaxChars`, `autoRecallMaxChars`, `recallMaxResults`, `recallMaxChars`, and `memory.hintMaxChars` are `100000`, `50000`, `30`, `100000`, and `50000` respectively; legal values above a cap are clamped, invalid values fall back to defaults, and unknown fields are ignored. Char budgets are not token budgets. Safe defaults: memory on, pinned injection on, model proposals provisional-only, primary-only automatic history recall.
+Flat aliases such as `memoryEnabled`, `memoryHintMaxChars`, `historyAutoRecallPrimaryOnly`, and `windowManifest` are also accepted; nested objects win. Numeric fields must be positive safe integers. The caps for `summaryMaxChars`, `autoRecallMaxChars`, `recallMaxResults`, `recallMaxChars`, and `memory.hintMaxChars` are `100000`, `50000`, `30`, `100000`, and `50000` respectively; legal values above a cap are clamped, invalid values fall back to defaults, and unknown fields are ignored. Char budgets are not token budgets. Defaults enable memory and keep model proposals provisional; history and memory are queried on demand. Legacy injection settings are still parsed, but cannot restore the removed context hook.
 
 The automatic compaction threshold and retained-tail size are still controlled by Pi's own compaction settings; this extension does not set its own trigger threshold.
 
@@ -216,7 +215,7 @@ When reading either log, events must form an unbroken chain: `seq` starts at 1 a
 /forget mem_abc
 ```
 
-`/remember` accepts `pin`, `kind:`, `scope:`, `priority:`, and `supersede:<id>`. `/memories` can filter by `status:`, `kind:`, and keywords. `/forget` marks a memory as resolved so it leaves working memory. These commands only perform deterministic local writes and UI notifications; they do not trigger a model turn.
+`/remember` accepts `pin`, `kind:`, `scope:`, `priority:`, and `supersede:<id>`. `/memories` can filter by `status:`, `kind:`, and keywords. `/forget` marks a memory as resolved so it leaves default memory queries. These commands only perform deterministic local writes and UI notifications; they do not trigger a model turn.
 
 Memory tools:
 
@@ -226,7 +225,7 @@ Memory tools:
 | `pi_memory_read` | Read by ID; long content can be sliced with `offset`/`limit` |
 | `pi_memory_propose` | Propose a provisional memory; it never becomes active/pinned automatically |
 | `pi_memory_update` | Can only edit/resolve the model's own provisional proposals |
-| `pi_compact_new_context` | Calls Pi native compact when `ctx.compact` exists; otherwise tells the model to use `/compact` (safe compatibility fallback) |
+| `pi_compact_new_context` | Requests compaction after all tools in the batch finish, then resumes the task on success; if unsupported, suggests `/compact` |
 
 Rule-derived memories have `author=rule` and provenance, stay provisional, and are not user-confirmed facts.
 
@@ -266,13 +265,13 @@ Arguments:
 | `rawLimit:N` | Character length for sliced raw reads |
 | `sourceClass:primary\\|derived\\|all` | Filter by source class |
 
-Entry IDs in the examples are placeholders; use the real IDs shown by checkpoints or recall output.
+Entry IDs in the examples are placeholders; use the real IDs shown by recall output.
 
 When `ids` is given, records are selected by ID and `scope` and `limit` apply, while the keyword, `file`, `kind`, and `page` are ignored; results are returned in original session order. Without `ids`, a keyword or `file` is required unless `action` is `list` — an empty query or a `kind`-only query does not list the full history.
 
 Keyword search is tokenized text matching; it does not support regular expressions or semantic search. File filtering only matches already-extracted paths and never reads files from disk. Paths mainly come from tool arguments and simple bash commands; paths inside message bodies are not necessarily indexed. The command splits arguments on whitespace and does not parse quoted paths with spaces; pass such paths via the tool's `file` field instead.
 
-The command sends recall content as a follow-up turn, which triggers the model to continue and enters the normal session history.
+The command displays recall content through UI notifications without sending it to the model or appending session messages. The UI command supports `scope:all` for other branches; the model tool always stays on the current branch.
 
 ### `pi_compact_recall` tool
 
@@ -292,29 +291,17 @@ The model can call it directly:
 
 Available fields mirror the `/pi-compact-recall` arguments: `query`, `entryIds`, `file`, `kind`, `scope`, `page`, `limit`, `raw`, `action`, `offset`, `rawLimit`, and `sourceClass`.
 
-`action` is `list`/`search`/`read`. With `raw: true` and a single entry ID, and without `offset`/`rawLimit`, the output is the complete JSON of that original session entry, including whatever tool arguments, tool output, timestamps, and parent/child entry relationships the entry holds. That single-entry JSON is not sliced, even if it exceeds `recallMaxChars`; if serialization fails, the tool returns a structured error object instead of truncated JSON. With `offset` and `rawLimit`, raw text is read in a character window so long raw is not dumped into context by default. With `raw: true` and multiple hits, only complete entries that fit the character budget are included, followed by an `omitted entry IDs` note; JSON is never cut in the middle. Keyword and pretty (non-raw) output is still limited by `recallMaxChars`. Pagination divides records, not the content of a single entry. For a single raw entry ID, the default result `limit` of 8 is ignored so the requested ID is not dropped. Thinking stays in `raw` but is excluded from default search text. `compaction` and `branch_summary` are derived and stay out of automatic recall by default.
+`action` is `list`/`search`/`read`. All model-tool output, including a single raw entry ID, obeys the `recallMaxChars` hard budget. An oversized single raw entry returns valid JSON containing `entryId`, `offset`, `limit`, `totalChars`, `truncated`, and `body`; use `offset`/`rawLimit` to continue reading. Only the UI command, with one explicit ID and `raw` and no slicing parameters, can return the complete original JSON without that budget.
 
-## Auto-recall and working memory
+Multiple raw hits include only complete entries that fit and list omitted IDs; JSON is never cut in the middle. Pretty output is clipped at complete result blocks. Pagination divides records; `offset`/`rawLimit` divides an individual raw entry. Raw data preserves stored tool arguments, outputs, timestamps, and parent links. Thinking stays out of default search text. `compaction` and `branch_summary` are derived and can be filtered with `sourceClass`.
 
-Every context request injects `pi-compact-memory-hint` when memory is enabled and `pinnedInjection` is true. Even with no pinned memories, the hint tells the model how to use `/remember`, `pi_memory_search`, and `pi_compact_recall`. Pinned items take priority in `memory.hintMaxChars` and cannot be squeezed out by ordinary history recall. Working-memory injection and automatic history recall are two separate messages with two budgets.
+## Query history and memory on demand
 
-Auto recall defaults to `full` (the current full-snippet injection) and is gated by `enabled && autoRecallMode !== "off"`. It is high-confidence gated: session-control, politeness, and generic words such as `continue`, `ok`, `thanks`, `请继续`, `好的`, `谢谢`, `上一步`, and `再试一次` do not by themselves inject history body. Manual `pi_compact_recall` is unchanged and still does exact keyword search, including those words. Auto recall does not use query length `>= 3` as the only threshold, and it does not call an LLM, embedding model, or network service.
+The current version registers no `context` hook and injects neither `pi-compact-auto-recall` nor `pi-compact-memory-hint`. Legacy `autoRecall*`, `memory.pinnedInjection`, `memory.hintMaxChars`, and `history.*` fields remain parseable for compatibility but cannot enable injection. Pinned/active memories are available through `pi_memory_search` and `pi_memory_read`.
 
-It triggers only when:
+The model's `pi_compact_recall` searches only the current branch. If the active lineage is unavailable, it does not expand to the whole session. Users can explicitly select `scope:all` in the `/pi-compact-recall` UI command. Tool results enter ordinary model context; UI command results only appear in the interface.
 
-- The latest user text, after deterministic normalization, stopword/stop-phrase filtering, and match-signal grading, still contains a high-confidence term (file path, error code, function name/identifier, command) or a multi-word topic.
-- The current session provides a valid active branch.
-- The current branch contains a user entry with a valid ID.
-- The history before that user entry contains matching records for those high-confidence terms.
-- By default only primary records are searched, and entries already present in `buildContextEntries()` are excluded.
-
-Auto recall only modifies the current provider request's messages; it does not write to the session and does not create a session entry. Multiple provider requests in the same user turn reuse the recall result; a new user entry recomputes it. Tool results produced during the current turn are not mixed into that turn's auto-recall scope.
-
-If the branch query fails, no valid user entry exists, or nothing matches, the extension silently skips auto recall. Manual recall does not expand to the whole session when the active lineage is unavailable either; only an explicit `scope:all` searches across branches.
-
-`full` injects clipped snippets of matched records. `hint` injects only compact `- [id] kinds=…` lines (plus extracted file paths when present) without the long snippets. `off` skips injection entirely, including when `autoRecall` is still `true`. Search scope is unchanged: only history before the latest user entry on the current branch; auto recall never widens to other branches.
-
-When `history.excludeInContext` is on and the session provides `buildContextEntries`, auto recall no longer re-injects entries already in the current context. `full` can still increase request token usage. Injected custom messages include cost stats (`chars`, `hitCount`, `estimatedTokens`, `mode`, `sameTurnInjectionCount`) without copying original entry bodies into `details`. Same-turn provider retries reuse the cached recall text and increment `sameTurnInjectionCount`; the working-memory hint counts the same way and is keyed by the current turn's latest user entry id, so the counter resets on a new user turn and only increments on retries within the same turn. If a message of that customType is already in the request, it is not injected again. Recall content is sent to the current model provider and may contain raw tool output or other sensitive text; `raw` does not redact anything, and `scope:all` also includes matching records from other branches. Keeping originals and supporting exact retrieval does not mean the model will obey memories or automatically recall every relevant detail.
+Stored originals remain available for exact retrieval. On-demand queries do not guarantee that the model recalls every relevant detail or follows every memory.
 
 ## Compaction and data boundaries
 
@@ -322,14 +309,14 @@ When `history.excludeInContext` is on and the session provides `buildContextEntr
 
 During compaction:
 
-1. Uses Pi's `firstKeptEntryId` as the retained boundary.
-2. Converts original entries before the boundary into records with IDs.
-3. Generates a checkpoint that writes pointer fields such as windowId/parentWindowId/sourceHash/previousHash, then a chronological `## Timeline` (original entry order via `sourceOrdinal`), then the existing groups: user messages, assistant messages, tool calls, tool results, commands, and other session context. Timeline and groups share the same character budget and omitted-line count. The checkpoint is explicitly not primary memory.
-4. Stores details such as `sourceEntryIds`, `sourceHash`, `sourceRecordCount`, `keptEntryId`, `omittedRecordCount`, `checkpointChars`, `summaryMaxChars`, `estimatedTokensAfter` (character count / 4, rounded up; not provider usage), and an optional `window` manifest. The extension does not invent billed `usage`; Pi computes its own context-wide post-compaction estimate.
-5. Validates the boundary relationships of tool calls and results, and the pairing order in the retained tail; on an unsafe boundary it first falls back to an earlier safe boundary (keeping more context) and returns `{ cancel: true }` only when no safe boundary exists or the request was aborted, never falling back to the default LLM summary. On handler errors it degrades to a pointer-style checkpoint instead of letting Pi use an LLM summary. Pi's `error` and `aborted` terminal assistant states allow tool calls without results; this does not apply to ordinary incomplete calls.
-6. Window events are appended to `.pi/pi-compact/windows.jsonl` as a previousHash chain, protected by the same per-log file lock and validated with the same trusted-prefix rule on read. The model can request a new window with `pi_compact_new_context`; if the current API has no `ctx.compact`, it tells the user to run `/compact`.
+1. Uses Pi's `firstKeptEntryId`, including context-invisible metadata and entries omitted by `context_edit`.
+2. Converts the entries before the boundary from Pi's pre-compaction context projection into ID-bearing audit records. `context_edit` omissions affect the checkpoint's source count and hash; replacements affect the projected record content used for derived-memory inputs. The original raw entry remains available for explicit replay.
+3. Generates a deterministic checkpoint with only `compactor`, `sourceCount`, and `sourceHash`. It copies no history body and is not primary memory.
+4. Stores `sourceEntryIds`, `sourceHash`, `sourceRecordCount`, `keptEntryId`, `omittedRecordCount`, `checkpointChars`, `summaryMaxChars`, `isSplitTurn`, and `estimatedTokensAfter` (character count / 4, rounded up; not provider usage). Pi computes its own context-wide post-compaction estimate; the extension does not invent billed usage.
+5. Previews each candidate compaction with Pi 0.87.1's `buildSessionProjection()`, checking the retained tail after omissions and replacements. Results must follow their calls, and ordinary calls must have results; the replaced prefix does not block compaction. Unsafe boundaries fall back only to earlier candidates in the current compaction window, after previewing each candidate. No safe boundary, failed projection, or an aborted request cancels compaction without falling back to LLM summarization. Pi's `error`/`aborted` assistant states may have calls without results. Once validation passes, checkpoint generation errors degrade to pointer JSON; a changed boundary gets a recomputed `isSplitTurn`.
+6. Only after Pi commits compaction and emits success does the extension generate and append a window manifest under the log lock. Window IDs bind the session and actual compaction entry, so repeated events do not append duplicates. Rule-derived memories are also written after success. Cancellation and failure leave no window or derived records. Legacy `details.window` remains readable; new manifests live in `.pi/pi-compact/windows.jsonl`.
 
-Original session entries remain the source of historical truth; the user-written memory log is the source of durable-memory truth. The checkpoint collapses whitespace, truncates long records, and omits records when the budget runs out; it is not a backup of the raw text and does not verify whether statements in history are correct. Non-text content such as images shows only placeholder information in the text extraction.
+Original session entries remain the source of historical truth; the user-written memory log is the source of durable-memory truth. The checkpoint stores only counts and a hash; it is not a backup of raw text and does not verify whether statements in history are correct. Non-text content such as images shows only placeholder information in the text extraction.
 
 The extension does not delete original session entries and does not create a separate backup; the raw text still relies on Pi's session storage. A finite context cannot display all history at once.
 
@@ -346,6 +333,8 @@ Run tests:
 ```bash
 npm test
 ```
+
+`npm test` runs unit and Pi SDK integration tests; `npm run test:integration` runs only the host lifecycle tests. Integration tests use a local Faux provider without API keys or online model requests, and write sessions and logs only to temporary directories.
 
 Run the TypeScript type check:
 
@@ -366,11 +355,11 @@ The published allowlist is `index.ts` and `src/`; npm also automatically include
 ```text
 index.ts                 Pi extension entry
 src/config.ts            Config loading, normalization, and scaffolding
-src/hooks.ts             Compaction, context, working-memory injection, and session hooks
+src/hooks.ts             Compaction projection validation and session hooks
 src/recall.ts            Recall tool and /pi-compact-recall command
 src/memory.ts            Memory commands and memory/new-window tools
 src/core/content.ts      Message text, files, thinking separation, and snippet boundaries
-src/core/auto-recall.ts  Deterministic high-confidence gate for automatic history recall
+src/core/auto-recall.ts  Legacy gate pure functions, not connected at runtime
 src/core/lock.ts         Synchronous log lock, owner-token reclaim, portable start-time identity
 src/core/ledger.ts       Deterministic checkpoint and details
 src/core/session.ts      Session entry conversion, sourceClass, search, and raw replay
@@ -378,7 +367,7 @@ src/core/jsonl.ts        Corruption-safe JSONL I/O
 src/core/projector.ts    Pure-function memory event projection
 src/core/store.ts        `.pi/pi-compact/` event logs
 src/core/window.ts       WindowManifest and hash chain
-src/core/working.ts      Pinned/active working-memory hint
+src/core/working.ts      Legacy hint pure functions, not connected at runtime
 src/core/derive.ts       Non-semantic rule derivation
 src/types.ts             Shared types
 tests/                   Unit tests
@@ -389,18 +378,21 @@ tests/                   Unit tests
 Verified so far:
 
 - Deterministic record extraction, keyword and file search, raw record preservation, and hashing.
-- Thinking stays out of default search; derived/compaction stays out of automatic recall by default; in-context entries can be excluded.
-- Deterministic memory-event replay, supersede/pin, EOF half-line tolerance plus rejected appends after a chain break, and pinned injection after 100 simulated compactions.
-- Working-memory budget priority, window hash chain, memory command/tool entry points, and sliced long-raw reads.
+- Thinking stays out of default search; primary/derived filtering and current-branch enforcement for the model tool.
+- Deterministic memory-event replay, supersede/pin, EOF half-line tolerance, and rejected appends after a chain break.
+- Window hash chain, memory command/tool entry points, and sliced long-raw reads.
 - Compaction boundary checks for tool calls and tool results.
 - Config scaffolding and normalization of invalid configs, including memory/history/window.
 - `manual`, `threshold`, and `overflow` compaction reasons plus aborted requests, via simulated hook events.
-- Empty active lineage does not widen the search; auto-recall same-turn reuse, new-user updates, deduplication, and branch-query error handling.
-- Auto-recall high-confidence gating rejects generic continue/ok phrases while still injecting concrete tokens, error codes, and paths; manual recall still matches those generic words.
-- Log-lock reclaim refuses token/metadata mismatches and never auto-deletes invalid metadata; live owners are not reclaimed by age. Portable start-time identity (Linux `/proc`, Unix `ps`, Windows `Get-Process`) vs conservative unverified fallback is unit-tested without switching `process.platform` or recycling real PIDs.
+- Empty active lineage does not widen the search; no context hook is registered, so history and working memory are not injected automatically.
+- Legacy auto-recall gates and working-memory renderers retain unit tests; these do not imply runtime injection.
+- Log locks refuse token/metadata mismatches and do not reclaim live owners by age. Invalid metadata can be reclaimed after the grace period. Portable start-time identity (Linux `/proc`, Unix `ps`, Windows `Get-Process`) and conservative unverified fallback are unit-tested without changing `process.platform` or recycling real PIDs.
 - Clean dependency installation, TypeScript type checking, and real Pi CLI extension loading.
 
-Not yet verified as full end-to-end scenarios: real model responses, the complete overflow-retry run, and long-running behavior across session or branch switches.
+- Pi 0.87.1 SDK metadata boundaries, full overflow retry, `context_edit` omissions/replacements and candidate projections, cancellation of orphan tool results, parallel/sequential tool-batch continuation, user abort, cancellation without side effects, success-event deduplication, and session persistence/restoration.
+- Memory-tool disablement, session isolation, explicit historical status queries, long-content/JSON budgets, and search/read pagination.
+
+Online model API responses and billing, manual TUI interactions, and long-running behavior remain outside these tests.
 
 ## License
 
