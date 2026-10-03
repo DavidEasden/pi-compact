@@ -1,7 +1,7 @@
 import { buildSessionProjection, type ExtensionAPI, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { toolCallIds } from "./core/content.ts";
-import { deriveFacts } from "./core/derive.ts";
+import { deriveFacts, derivedFactKey } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
 import { hashRecords, recordsFromProjectedEntries } from "./core/session.ts";
 import { appendMemoryEvent, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
@@ -118,9 +118,15 @@ const sessionIdOf = (ctx: any): string | undefined => {
 
 const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromProjectedEntries>, sourceHash: string, sessionId?: string): void => {
   withMemoryLogLock(cwd, () => {
-    const existing = new Set(loadMemories(cwd).map((record) => record.id));
+    const existingRecords = loadMemories(cwd);
+    const existing = new Set(existingRecords.map((record) => record.id));
+    // 兼容升级前 provenance 含 entryId 的规则记忆，避免按新 ID 再写入相同事实。
+    const existingFacts = new Set(existingRecords
+      .filter((record) => record.author === "rule")
+      .map((record) => derivedFactKey(record.content)));
     for (const draft of deriveFacts(records, sourceHash)) {
-      if (existing.has(draft.recordId)) continue;
+      const factKey = derivedFactKey(draft.payload.content);
+      if (existing.has(draft.recordId) || existingFacts.has(factKey)) continue;
       appendMemoryEvent(cwd, {
         type: "create",
         recordId: draft.recordId,
@@ -129,6 +135,7 @@ const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromProje
         payload: draft.payload,
       });
       existing.add(draft.recordId);
+      existingFacts.add(factKey);
     }
   });
 };
