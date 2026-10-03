@@ -2,8 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { registerNewContext } from "./new-context.ts";
 import { loadConfig } from "./config.ts";
-import { clip, queryTerms } from "./core/content.ts";
+import { clip } from "./core/content.ts";
 import { formatMemoryRead, formatMemorySearch } from "./core/memory-output.ts";
+import { searchMemoryRecords, sortMemoryRecords } from "./core/memory-search.ts";
 import { appendMemoryEvent, contentHash, loadMemories, newMemoryId, withMemoryLogLock } from "./core/store.ts";
 import type { MemoryKind, MemoryPriority, MemoryRecord, MemoryScope, MemoryStatus } from "./types.ts";
 
@@ -80,20 +81,6 @@ const parseTokens = (args: string): MemoryCommandInput => {
 const formatRecord = (record: MemoryRecord): string => (
   `- [${record.id}] ${record.status} ${record.kind} prio=${record.priority} author=${record.author} v${record.version}${record.supersedes ? ` supersedes=${record.supersedes}` : ""}\n  ${record.content}`
 );
-
-const searchMemoryRecords = (records: MemoryRecord[], query: string): MemoryRecord[] => {
-  const terms = queryTerms(query);
-  if (terms.length === 0) return records;
-  return records
-    .map((record) => {
-      const haystack = `${record.content}\n${record.id}\n${record.kind}\n${record.provenance ?? ""}`.toLocaleLowerCase();
-      const matched = terms.filter((term) => haystack.includes(term));
-      return { record, score: matched.length };
-    })
-    .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score || right.record.updatedAt.localeCompare(left.record.updatedAt))
-    .map((item) => item.record);
-};
 
 const createUserMemory = (cwd: string, ctx: any, input: MemoryCommandInput, pin: boolean): MemoryRecord | undefined => {
   const content = input.content.trim();
@@ -209,6 +196,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       else records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
       if (input.kind) records = records.filter((record) => record.kind === input.kind);
       if (input.query) records = searchMemoryRecords(records, input.query);
+      else records = sortMemoryRecords(records);
       records = records.slice(0, 30);
       if (records.length === 0) {
         notify(ctx, "pi-compact: 没有匹配的记忆。使用 /remember 写入权威事实。");
@@ -281,6 +269,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       if (input.kind && KINDS.has(input.kind as MemoryKind)) records = records.filter((record) => record.kind === input.kind);
       if (input.query?.trim()) records = searchMemoryRecords(records, input.query);
       else if (!explicitStatus) records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
+      records = sortMemoryRecords(records);
       const offset = input.offset ?? 0;
       const total = records.length;
       records = records.slice(offset, offset + (input.limit ?? 8));

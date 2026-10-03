@@ -389,6 +389,19 @@ test("规则派生只提取文件、命令、退出码和测试计数", () => {
   assert.ok(facts.some((fact) => fact.payload.content === "tests: 3 passed, 1 failed"));
   assert.equal(facts.every((fact) => fact.payload.status === "provisional" && fact.payload.kind === "derived"), true);
   assert.equal(facts.some((fact) => fact.payload.content.includes("目标")), false);
+
+  const repeatedWindow = recordsFromEntries([
+    { type: "message", id: "a2", message: { role: "assistant", content: [{ type: "toolCall", id: "c2", name: "read", arguments: { path: "src/a.ts" } }] } },
+    { type: "message", id: "b2", message: { role: "bashExecution", command: "npm test", output: "3 passed, 1 failed", exitCode: 1 } },
+  ]);
+  const repeatedFacts = deriveFacts(repeatedWindow, "later-hash");
+  for (const content of ["file: src/a.ts", "command: npm test exitCode=1", "tests: 3 passed, 1 failed"]) {
+    const first = facts.find((fact) => fact.payload.content === content)!;
+    const later = repeatedFacts.find((fact) => fact.payload.content === content)!;
+    assert.equal(later.recordId, first.recordId, `${content} keeps a stable identity across windows`);
+    assert.equal(later.payload.provenance, first.payload.provenance);
+  }
+  assert.equal(repeatedFacts.filter((fact) => fact.payload.content === "file: src/a.ts").length, 1);
 });
 
 test("窗口 manifest 写入哈希链并可 round-trip", () => {
@@ -583,6 +596,42 @@ test("session 范围记忆只在同一会话可搜读改，project 仍项目内�
     // project 记录在 B 会话可读。
     const readProjectB = await runTool(tools, "pi_memory_read", { recordId: projectRecord.id }, sessionB, "s8");
     assert.equal(JSON.parse(readProjectB.content[0].text).content, "项目共享约束");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("默认 memory search 优先返回 pinned 与用户权威记忆", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId: "mem_rule_old",
+      author: "rule",
+      ts: "2024-01-01T00:00:00.000Z",
+      payload: { kind: "derived", content: "旧派生信息", scope: "project", status: "provisional", priority: "low", sourceEntryIds: [], sourceHash: "r" },
+    });
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId: "mem_user_active",
+      author: "user",
+      ts: "2025-01-01T00:00:00.000Z",
+      payload: { kind: "constraint", content: "项目用户约束", scope: "project", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: "a" },
+    });
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId: "mem_user_pin",
+      author: "user",
+      ts: "2025-06-01T00:00:00.000Z",
+      payload: { kind: "constraint", content: "固定用户约束", scope: "project", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: "p" },
+    });
+    appendMemoryEvent(cwd, { type: "pin", recordId: "mem_user_pin", author: "user", payload: {} });
+
+    const result = await runTool(tools, "pi_memory_search", {}, ctx, "ordered-list");
+    const ids = [...result.content[0].text.matchAll(/^- \[([^\]]+)\]/gm)].map((match: RegExpMatchArray) => match[1]);
+    assert.deepEqual(ids, ["mem_user_pin", "mem_user_active", "mem_rule_old"]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
