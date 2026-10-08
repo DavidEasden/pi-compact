@@ -1,15 +1,16 @@
 import { buildSessionProjection, type ExtensionAPI, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
-import { toolCallIds } from "./core/content.ts";
+import { estimateTokensFromChars, toolCallIds } from "./core/content.ts";
 import { deriveFacts, derivedFactKey } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
 import { hashRecords, recordsFromProjectedEntries } from "./core/session.ts";
 import { appendMemoryEvent, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
+import { MEMORY_HINT_TYPE, renderWorkingHint } from "./core/working.ts";
 import type { SessionEntryLike } from "./types.ts";
 
 export const AUTO_RECALL_TYPE = "pi-compact-auto-recall";
-export const MEMORY_HINT_TYPE = "pi-compact-memory-hint";
+export { MEMORY_HINT_TYPE };
 
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TERMINAL_ASSISTANT_REASONS = new Set(["error", "aborted"]);
@@ -163,6 +164,74 @@ const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: n
 });
 
 export const registerHooks = (pi: ExtensionAPI): void => {
+  // 不注册 context 注入：历史正文和旧工作记忆提示不会自动注入，旧配置也不能重新开启。
+  // before_agent_start 只追加扩展自写的可信指针与用户权威记忆，不复制任何历史正文（方案 A+B）。
+  pi.on("before_agent_start", (event: any, ctx: any) => {
+    const config = loadConfig(ctx.cwd);
+    if (!config.enabled) return;
+
+    // 方案 A：压缩指针提示——仅在当前分支存在 pi-compact compaction 时追加，内容全部由扩展生成。
+    // 不含任何历史正文、工具输出或用户数据，不会重新引入提示词注入面。
+    let compactionPointer = "";
+    try {
+      const branch: SessionEntryLike[] = ctx.sessionManager?.getBranch?.() ?? [];
+      const lastCompaction = [...branch].reverse().find(
+        (entry) => entry.type === "compaction" && (entry as any).details?.compactor === "pi-compact",
+      );
+      if (lastCompaction) {
+        const d = (lastCompaction as any).details ?? {};
+        const meta = [
+          d.windowId ? `windowId=${d.windowId}` : "",
+          `sourceCount=${d.sourceCount ?? d.sourceRecordCount ?? "?"}`,
+          `sourceHash=${String(d.sourceHash ?? "").slice(0, 16)}…`,
+          `keptEntryId=${d.keptEntryId ?? (lastCompaction as any).firstKeptEntryId ?? "?"}`,
+        ].filter(Boolean).join(" ");
+        compactionPointer = [
+          "[pi-compact] 本会话已发生上下文压缩，压缩前的历史已从当前上下文移除。",
+          meta ? `最近压缩：${meta}` : "",
+          "• 如需恢复之前的工作内容，请调用 pi_compact_recall（支持 query/file/entryIds/action:list）。",
+          "• 如需查询长期记忆（用户通过 /remember 写入的权威记忆），请调用 pi_memory_search。",
+          "• 不要假设之前的工作已丢失或需要重做——先召回再判断。",
+          "• 压缩 checkpoint 只是指针/哈希，不是历史摘要；原始记录仍可通过召回工具读取。",
+        ].filter(Boolean).join("\n");
+      }
+    } catch {
+      // 压缩检测失败不应阻断请求。
+    }
+
+    // 方案 B：只注入 author=user 且 pinned/active 的权威记忆，不注入 provisional/rule/model。
+    // 这些记录是用户通过 /remember 显式写入的，符合安全报告建议 2（仅显式批准的数据）。
+    let memoryHint = "";
+    if (config.memory.enabled && config.memory.pinnedInjection) {
+      try {
+        const sid = sessionIdOf(ctx);
+        const userAuthority = loadMemories(ctx.cwd).filter((record) => (
+          record.author === "user"
+          && (record.status === "pinned" || record.status === "active")
+          && (record.scope !== "session" || record.sessionId === sid)
+        ));
+        if (userAuthority.length > 0) {
+          const hint = renderWorkingHint(userAuthority, config.memory.hintMaxChars);
+          if (hint.content) memoryHint = hint.content;
+        }
+      } catch {
+        // 记忆读取失败不应阻断请求。
+      }
+    }
+
+    if (!compactionPointer && !memoryHint) return;
+
+    const combined = [compactionPointer, memoryHint].filter(Boolean).join("\n\n");
+    const chars = combined.length;
+    if (config.debug) {
+      console.log(`[pi-compact] before_agent_start: compactionPointer=${compactionPointer.length > 0} memoryHint=${memoryHint.length > 0} chars=${chars}`);
+    }
+    // promptGuidelines 被追加到系统提示末尾，内容为扩展自写的可信文本，不含历史正文。
+    event.systemPromptOptions.promptGuidelines.push(
+      `[pi-compact context pointer — ${estimateTokensFromChars(chars)} est. tokens]\n${combined}`,
+    );
+  });
+
   pi.on("session_before_compact", async (event: any, ctx: any) => {
     const config = loadConfig(ctx.cwd);
     if (!config.enabled || !config.overrideDefaultCompaction) return;
@@ -194,6 +263,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       // 审计与派生记忆都使用宿主相同的 context projection；只有工具链安全检查使用候选 compaction 预览。
       const records = recordsBeforeCut(branch, keptEntryId);
       // 准备阶段只计算。窗口与派生记忆在宿主确认提交之后才持久化。
+      // 窗口 ID 此时尚未确认，传入 undefined；session_compact 成功后才写入最终 windowId。
       const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
       const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars);
       details.isSplitTurn = keptEntryId === proposedKeptEntryId ? isSplitTurn : isSplitAt(branch, keptEntryId);
@@ -211,8 +281,6 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       return fallbackCheckpoint(event.reason, keptEntryId, event.preparation?.tokensBefore ?? 0, config.summaryMaxChars);
     }
   });
-
-  // 不注册 context 注入：旧配置也不能重新开启历史正文或工作记忆提示。
 
   pi.on("session_compact", (event: any, ctx: any) => {
     if (!event.fromExtension) return;

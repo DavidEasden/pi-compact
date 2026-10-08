@@ -92,7 +92,7 @@ test("ledger 只写入不含历史正文的可验证 checkpoint", () => {
   const records = recordsFromEntries(entries);
   const result = renderLedger(records, "threshold", "tail", 800);
   const checkpoint = JSON.parse(result.text);
-  assert.deepEqual(Object.keys(checkpoint).sort(), ["compactor", "sourceCount", "sourceHash"]);
+  assert.deepEqual(Object.keys(checkpoint).sort(), ["compactor", "keptEntryId", "sourceCount", "sourceHash"]);
   assert.equal(checkpoint.compactor, "pi-compact");
   assert.equal(checkpoint.sourceCount, records.length);
   assert.equal(checkpoint.sourceHash, hashRecords(records));

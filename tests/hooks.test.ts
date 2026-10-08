@@ -268,3 +268,128 @@ test("扩展不注册 context hook，历史和记忆不会自动注入请求", (
     rmSync(cwd, { recursive: true, force: true });
   }
 });
+
+test("before_agent_start 在分支有 pi-compact compaction 时追加压缩指针（方案 A）", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    assert.ok(handler, "before_agent_start handler 应已注册");
+
+    const compactionEntry = {
+      type: "compaction",
+      id: "cp1",
+      parentId: "u1",
+      firstKeptEntryId: "u2",
+      summary: '{"compactor":"pi-compact","sourceCount":5,"sourceHash":"abc123"}',
+      details: {
+        compactor: "pi-compact",
+        sourceHash: "abc1234567890000xyz",
+        sourceCount: 5,
+        sourceRecordCount: 5,
+        keptEntryId: "u2",
+      },
+    };
+    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const ctx = {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [compactionEntry] },
+    };
+    handler({ systemPromptOptions }, ctx);
+    assert.equal(systemPromptOptions.promptGuidelines.length, 1);
+    const added = systemPromptOptions.promptGuidelines[0];
+    assert.match(added, /pi-compact.*上下文压缩/);
+    assert.match(added, /pi_compact_recall/);
+    assert.match(added, /pi_memory_search/);
+    assert.match(added, /keptEntryId=u2/);
+    // sourceHash 截取前 16 位，截断后的值不等于完整哈希
+    assert.equal(added.includes("sourceHash=abc1234567890000xyz"), false);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("before_agent_start 无 pi-compact compaction 时不追加任何内容", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const ctx = {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [
+        { type: "message", id: "u1", message: { role: "user", content: "hello" } },
+      ] },
+    };
+    handler({ systemPromptOptions }, ctx);
+    assert.equal(systemPromptOptions.promptGuidelines.length, 0);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("before_agent_start 注入 author=user pinned/active 记忆（方案 B），不注入 provisional/rule", async () => {
+  const harness = createHarness();
+  try {
+    const { appendMemoryEvent: appendEvt, newMemoryId } = await import("../src/core/store.ts");
+    registerHooks(harness.pi as any);
+
+    // 写入一条 user active 记忆
+    const recordId = newMemoryId();
+    appendEvt(harness.cwd, {
+      type: "create",
+      recordId,
+      author: "user",
+      sessionId: undefined,
+      payload: {
+        kind: "fact",
+        content: "使用 pnpm 而非 npm",
+        scope: "project",
+        status: "active",
+        priority: "normal",
+        sourceEntryIds: [],
+        sourceHash: "test",
+        provenance: "user:/remember",
+      },
+    });
+
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const compactionEntry = {
+      type: "compaction",
+      id: "cp1",
+      parentId: "u1",
+      firstKeptEntryId: "u2",
+      summary: "{}",
+      details: { compactor: "pi-compact", sourceHash: "x", keptEntryId: "u2", sourceCount: 1 },
+    };
+    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [compactionEntry], getSessionId: () => undefined },
+    });
+    assert.equal(systemPromptOptions.promptGuidelines.length, 1);
+    const added = systemPromptOptions.promptGuidelines[0];
+    assert.match(added, /pnpm/);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("before_agent_start 在 enabled=false 时不追加任何内容", () => {
+  const harness = createHarness();
+  try {
+    writeFileSync(join(harness.cwd, ".pi", "pi-compact.json"), JSON.stringify({ enabled: false }));
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [
+        { type: "compaction", id: "cp1", details: { compactor: "pi-compact", keptEntryId: "u1" } },
+      ] },
+    });
+    assert.equal(systemPromptOptions.promptGuidelines.length, 0);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
