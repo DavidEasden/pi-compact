@@ -3,23 +3,28 @@ import { estimateTokensFromChars } from "./content.ts";
 import { hashRecords } from "./session.ts";
 
 /**
- * checkpoint 只保留计数和计算所得哈希。正文、路径、ID、自定义类型以及旧摘要
- * 均可能携带不可信文本，只存入本地 details，不复制进模型上下文。
+ * checkpoint 只保留计数、哈希和扩展生成的结构化元数据（方案 C）。
+ * 正文、路径、用户数据等不可信文本均不进入 summary；windowId/keptEntryId 均为扩展生成，不复制历史内容。
  * 保留调用签名以兼容现有调用方；旧 header 参数不再渲染。
  */
 export const renderLedger = (
   records: HistoryRecord[],
   _reason: CompactReason,
-  _keptEntryId: string,
+  keptEntryId: string,
   maxChars: number,
-  _options?: { extraHeaderLines?: string[] },
+  options?: { extraHeaderLines?: string[]; windowId?: string },
 ): { text: string; omitted: number } => {
   const omitted = new Set(records.map((record) => record.entryId)).size;
-  const text = JSON.stringify({
+  const sourceHash = hashRecords(records);
+  // windowId 和 keptEntryId 均为扩展自身生成的标识符，不包含任何历史正文。
+  const payload: Record<string, unknown> = {
     compactor: "pi-compact",
     sourceCount: omitted,
-    sourceHash: hashRecords(records),
-  });
+    sourceHash,
+    keptEntryId,
+  };
+  if (options?.windowId) payload.windowId = options.windowId;
+  const text = JSON.stringify(payload);
   // 不截断 JSON，也不在预算不足或异常时回填历史正文或行为提示词。
   return { text: text.length <= maxChars ? text : maxChars >= 2 ? "{}" : "", omitted };
 };
