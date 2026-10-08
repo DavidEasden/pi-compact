@@ -10,7 +10,7 @@
 
 - 在项目 `.pi/pi-compact/` 中维护 append-only 记忆事件日志；当前记忆状态由纯函数从事件重放，旧事件不能静默覆盖。
 - 用户通过 `/remember`、`/memories`、`/forget` 写入权威记忆；模型只能提出 provisional 提议，不会自动变成 active 或 pinned。
-- 模型通过工具按需查询历史与记忆；扩展不注册 context 注入，不自动附加历史正文或 pinned/active 提示。
+- 模型通过工具按需查询历史，任何历史正文都不会被自动注入；扩展不注册 `context` hook。`before_agent_start` 只向系统提示追加扩展自写的文本：取自 checkpoint 元数据的压缩指针，以及在 `memory.pinnedInjection` 开启时注入用户通过 `/remember` 写入、状态为 pinned/active 的权威记忆。provisional、规则派生与模型提议记录永不注入。
 - 接管 Pi 原生的 `/compact` 命令，以及普通的 `manual`、`threshold` 和 `overflow` compaction。
 - 使用 Pi 自己计算的压缩边界、token accounting、持久化和恢复流程；checkpoint 是确定性指针/审计内容，不是 primary memory。
 - 记录 WindowManifest（windowId、父窗口、保留边界、sourceCount、sourceHash、previousHash）。
@@ -24,7 +24,7 @@
 
 ## 安装
 
-当前源码要求 Pi `>=0.87.1`，开发与集成测试固定在 `0.87.1`；该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。已发布的 `v0.4.0` 与当前源码一致。
+当前源码要求 Pi `>=0.87.1`，开发与集成测试固定在 `0.87.1`；该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。已发布的 `v0.5.0` 与当前源码一致。
 
 Pi package 会执行扩展代码，请在安装前审查源代码。
 
@@ -33,7 +33,7 @@ Pi package 会执行扩展代码，请在安装前审查源代码。
 推荐固定到发布 tag（固定后的 ref 不会被 `pi update --extensions` 或 `pi update --all` 移动）：
 
 ```bash
-pi install git:github.com/DavidEasden/pi-compact@v0.4.0
+pi install git:github.com/DavidEasden/pi-compact@v0.5.0
 ```
 
 或者不固定 ref，直接跟踪默认分支：
@@ -45,14 +45,14 @@ pi install git:github.com/DavidEasden/pi-compact
 也支持 SSH 简写与原始 HTTPS URL：
 
 ```bash
-pi install git:git@github.com:DavidEasden/pi-compact@v0.4.0
-pi install https://github.com/DavidEasden/pi-compact@v0.4.0
+pi install git:git@github.com:DavidEasden/pi-compact@v0.5.0
+pi install https://github.com/DavidEasden/pi-compact@v0.5.0
 ```
 
 说明：
 
 - `git:` 前缀启用 `host/user/repo` 与 `git@host:user/repo` 简写；不带前缀时只接受协议 URL（`https://`、`http://`、`ssh://`、`git://`）。
-- `v0.4.0` 必须是已存在的 tag 或 commit（首次可用 `git tag v0.4.0 && git push origin v0.4.0` 创建并推送）。以后升级到新 tag，重新执行 `pi install git:github.com/DavidEasden/pi-compact@<新tag>`。
+- `v0.5.0` 必须是已存在的 tag 或 commit（首次可用 `git tag v0.5.0 && git push origin v0.5.0` 创建并推送）。以后升级到新 tag，重新执行 `pi install git:github.com/DavidEasden/pi-compact@<新tag>`。
 - 全局安装会克隆到 `~/.pi/agent/git/github.com/DavidEasden/pi-compact`；使用 `-l`（项目 settings）时克隆位于 `.pi/git/github.com/DavidEasden/pi-compact`，项目信任后启动时会自动安装缺失的 package。
 - 不安装也可以临时试用：
 
@@ -65,7 +65,7 @@ pi -e git:github.com/DavidEasden/pi-compact
 同一份代码已发布到 npm，包名为 `pi-compact`：
 
 ```bash
-pi install npm:pi-compact@0.4.0
+pi install npm:pi-compact@0.5.0
 ```
 
 或者跟踪最新发布版本：
@@ -82,7 +82,7 @@ pi -e npm:pi-compact
 
 说明：
 
-- 形如 `npm:pi-compact@0.4.0` 的带版本 spec 会被固定，`pi update --extensions` 与 `pi update --all` 会跳过它。
+- 形如 `npm:pi-compact@0.5.0` 的带版本 spec 会被固定，`pi update --extensions` 与 `pi update --all` 会跳过它。
 - 全局安装位于 `~/.pi/agent/npm/`；使用 `-l`（项目 settings）时位于 `.pi/npm/`。
 
 ### 临时加载本地版本
@@ -174,15 +174,15 @@ pi install -l /absolute/path/to/pi-compact
 | `recallMaxChars` | `16000` | 召回输出字符预算；模型工具始终遵守，只有 UI 命令可显式读取超预算的单条完整 raw |
 | `debug` | `false` | 是否输出扩展调试日志（只输出计数和字符数，不输出原文） |
 | `memory.enabled` | `true` | 是否启用长期记忆命令、工具读写与规则派生 |
-| `memory.pinnedInjection` | `true` | 旧提示注入开关，当前无运行时作用 |
+| `memory.pinnedInjection` | `true` | 是否在 `before_agent_start` 把用户写入的 pinned/active 权威记忆追加到系统提示；provisional、规则派生与模型提议记录永不注入。需要 `memory.enabled` |
 | `memory.proposalsProvisionalOnly` | `true` | 模型提议只能以 provisional 写入；即使设为 `false` 也不会自动升级为 active/pinned |
-| `memory.hintMaxChars` | `4000` | 旧工作记忆提示预算，当前无运行时作用 |
+| `memory.hintMaxChars` | `4000` | `before_agent_start` 注入权威记忆提示的字符预算 |
 | `memory.deriveOnCompact` | `true` | 压缩成功提交后是否写入规则派生的 provisional 记录（文件/命令/退出码/测试计数） |
 | `history.autoRecallPrimaryOnly` | `true` | 旧自动召回来源过滤，当前无运行时作用 |
 | `history.excludeInContext` | `true` | 旧自动召回去重开关，当前无运行时作用 |
 | `window.manifest` | `true` | 压缩成功提交后是否写入 WindowManifest 与窗口事件日志；取消不写入 |
 
-也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史与记忆都通过工具按需查询。旧注入配置仍可解析，但不会重新启用已移除的 context hook。
+也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史与记忆都通过工具按需查询。旧注入配置仍可解析，但不会重新启用已移除的 `context` hook，历史正文始终不会被自动注入。
 
 自动压缩阈值和保留尾部大小仍由 Pi 自身的 compaction settings 控制，本扩展不另设触发阈值。
 
@@ -303,7 +303,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 ## 历史与记忆的按需查询
 
-当前版本不注册 `context` hook，不自动注入 `pi-compact-auto-recall` 或 `pi-compact-memory-hint`。旧的 `autoRecall*`、`memory.pinnedInjection`、`memory.hintMaxChars` 和 `history.*` 字段保留配置兼容性，不能重新开启注入。pinned/active 记忆可通过 `pi_memory_search` 和 `pi_memory_read` 查询。
+当前版本不注册 `context` hook，也不注入历史正文；`pi-compact-auto-recall` 与 `pi-compact-memory-hint` 始终不被使用。改为在 `before_agent_start` 向系统提示追加扩展自写的文本：当前分支存在 pi-compact compaction 时追加静态压缩指针（windowId、sourceCount、sourceHash 前缀、keptEntryId，不含任何历史正文）；在 `memory.pinnedInjection` 开启时追加用户写入的 pinned/active 权威记忆，受 `memory.hintMaxChars` 限制。旧的 `autoRecall*`、`memory.hintMaxChars` 和 `history.*` 字段保留配置兼容性，但不能重新开启历史注入。所有记忆仍可通过 `pi_memory_search` 和 `pi_memory_read` 查询。
 
 模型调用 `pi_compact_recall` 时只搜索当前 branch；active lineage 无法取得时不会扩大到整个 session。用户可在 `/pi-compact-recall` 命令中显式指定 `scope:all` 查看其他 branch。工具返回内容会作为普通工具结果进入模型上下文，UI 命令返回内容只显示在界面中。
 
@@ -390,8 +390,9 @@ tests/                   单元测试
 - 工具调用与工具结果的压缩边界校验。
 - 配置初始化与非法配置归一化，包括 memory/history/window。
 - 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
-- 空 active lineage 不扩大搜索范围；无 context hook，因此不自动注入历史与工作记忆。
-- 保留的旧自动召回门控与工作记忆渲染纯函数仍有单元测试，但不代表运行时存在注入行为。
+- 空 active lineage 不扩大搜索范围；无 `context` hook，因此历史正文始终不会被自动注入。
+- `before_agent_start` 的压缩指针与权威记忆注入，包括 provisional/规则/模型记录的排除与 `pinnedInjection` 关闭开关。
+- 保留的旧自动召回门控与工作记忆渲染纯函数仍有单元测试，但它们不再位于注入路径上。
 - 日志锁在 token/metadata 不匹配时不删除，活锁不按年龄回收；无效 metadata 在宽限期后可回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
 - 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
 

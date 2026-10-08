@@ -10,7 +10,7 @@ The core of `pi-compact` is long-term memory. Compaction manages window capacity
 
 - Stores an append-only memory event log under `.pi/pi-compact/`; current memory is rebuilt by a pure projector, and older events cannot silently overwrite newer state.
 - Users write authoritative memory with `/remember`, `/memories`, and `/forget`. Model proposals stay provisional and never become active or pinned by themselves.
-- Models query history and memory through tools on demand. The extension registers no context injection hook and adds no automatic history snippets or pinned/active hints.
+- Models query history through tools on demand, and no history body text is ever auto-injected. The extension registers no `context` hook. On `before_agent_start` it appends only extension-authored text to the system prompt: a static compaction pointer derived from checkpoint metadata, and — when `memory.pinnedInjection` is enabled — memories the user wrote with `/remember` and marked pinned or active. Provisional, rule-derived, and model-proposed records are never injected.
 - Takes over Pi's native `/compact` command and normal `manual`, `threshold`, and `overflow` compactions.
 - Reuses Pi's own boundary calculation, token accounting, persistence, and recovery flow. The checkpoint is a deterministic pointer/audit extract, not primary memory.
 - Records a WindowManifest (`windowId`, parent window, retained boundary, `sourceCount`, `sourceHash`, `previousHash`).
@@ -24,7 +24,7 @@ The core of `pi-compact` is long-term memory. Compaction manages window capacity
 
 ## Installation
 
-The current source requires Pi `>=0.87.1`; development and integration tests pin `0.87.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.4.0` matches the current source.
+The current source requires Pi `>=0.87.1`; development and integration tests pin `0.87.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.5.0` matches the current source.
 
 Pi packages execute extension code, so review the source before installing.
 
@@ -33,7 +33,7 @@ Pi packages execute extension code, so review the source before installing.
 Pin to a release tag (recommended — pinned refs are not moved by `pi update --extensions` or `pi update --all`):
 
 ```bash
-pi install git:github.com/DavidEasden/pi-compact@v0.4.0
+pi install git:github.com/DavidEasden/pi-compact@v0.5.0
 ```
 
 Or track the default branch without pinning:
@@ -45,14 +45,14 @@ pi install git:github.com/DavidEasden/pi-compact
 SSH shorthand and raw HTTPS URLs work too:
 
 ```bash
-pi install git:git@github.com:DavidEasden/pi-compact@v0.4.0
-pi install https://github.com/DavidEasden/pi-compact@v0.4.0
+pi install git:git@github.com:DavidEasden/pi-compact@v0.5.0
+pi install https://github.com/DavidEasden/pi-compact@v0.5.0
 ```
 
 Notes:
 
 - The `git:` prefix enables `host/user/repo` and `git@host:user/repo` shorthands; without it, only protocol URLs (`https://`, `http://`, `ssh://`, `git://`) are accepted.
-- `v0.4.0` must be an existing tag or commit (create and push it once with `git tag v0.4.0 && git push origin v0.4.0`). To move to a newer tag later, re-run `pi install git:github.com/DavidEasden/pi-compact@<new-tag>`.
+- `v0.5.0` must be an existing tag or commit (create and push it once with `git tag v0.5.0 && git push origin v0.5.0`). To move to a newer tag later, re-run `pi install git:github.com/DavidEasden/pi-compact@<new-tag>`.
 - Global installs are cloned to `~/.pi/agent/git/github.com/DavidEasden/pi-compact`; with `-l` (project settings), the clone lives at `.pi/git/github.com/DavidEasden/pi-compact` and the project auto-installs any missing packages on startup after being trusted.
 - Try the package without installing it:
 
@@ -65,7 +65,7 @@ pi -e git:github.com/DavidEasden/pi-compact
 The same code is published to npm as `pi-compact`:
 
 ```bash
-pi install npm:pi-compact@0.4.0
+pi install npm:pi-compact@0.5.0
 ```
 
 Or track the latest published version:
@@ -82,7 +82,7 @@ pi -e npm:pi-compact
 
 Notes:
 
-- A versioned spec such as `npm:pi-compact@0.4.0` is pinned, so `pi update --extensions` and `pi update --all` skip it.
+- A versioned spec such as `npm:pi-compact@0.5.0` is pinned, so `pi update --extensions` and `pi update --all` skip it.
 - Global installs go under `~/.pi/agent/npm/`; with `-l` (project settings) they go under `.pi/npm/`.
 
 ### Try locally
@@ -174,15 +174,15 @@ Config fields:
 | `recallMaxChars` | `16000` | Recall output budget, always enforced for model tools. Only the UI command can explicitly request an oversized complete single raw entry |
 | `debug` | `false` | Whether to print extension debug logs (counts and character totals only; never original text) |
 | `memory.enabled` | `true` | Enables durable memory commands, tool reads/writes, and rule derivation |
-| `memory.pinnedInjection` | `true` | Legacy hint-injection flag; no current runtime effect |
+| `memory.pinnedInjection` | `true` | Append user-authored pinned/active authoritative memories to the system prompt on `before_agent_start`. Provisional, rule-derived, and model-proposed records are never injected. Requires `memory.enabled` |
 | `memory.proposalsProvisionalOnly` | `true` | Model proposals can only be written as provisional; even `false` does not auto-promote them to active/pinned |
-| `memory.hintMaxChars` | `4000` | Legacy working-memory hint budget; no current runtime effect |
+| `memory.hintMaxChars` | `4000` | Character budget for the authoritative-memory hint injected on `before_agent_start` |
 | `memory.deriveOnCompact` | `true` | Write rule-derived provisional records after successful compaction |
 | `history.autoRecallPrimaryOnly` | `true` | Legacy automatic recall source filter; no current runtime effect |
 | `history.excludeInContext` | `true` | Legacy automatic recall deduplication flag; no current runtime effect |
 | `window.manifest` | `true` | Write WindowManifest and the window event log after successful compaction; cancellation writes neither |
 
-Flat aliases such as `memoryEnabled`, `memoryHintMaxChars`, `historyAutoRecallPrimaryOnly`, and `windowManifest` are also accepted; nested objects win. Numeric fields must be positive safe integers. The caps for `summaryMaxChars`, `autoRecallMaxChars`, `recallMaxResults`, `recallMaxChars`, and `memory.hintMaxChars` are `100000`, `50000`, `30`, `100000`, and `50000` respectively; legal values above a cap are clamped, invalid values fall back to defaults, and unknown fields are ignored. Char budgets are not token budgets. Defaults enable memory and keep model proposals provisional; history and memory are queried on demand. Legacy injection settings are still parsed, but cannot restore the removed context hook.
+Flat aliases such as `memoryEnabled`, `memoryHintMaxChars`, `historyAutoRecallPrimaryOnly`, and `windowManifest` are also accepted; nested objects win. Numeric fields must be positive safe integers. The caps for `summaryMaxChars`, `autoRecallMaxChars`, `recallMaxResults`, `recallMaxChars`, and `memory.hintMaxChars` are `100000`, `50000`, `30`, `100000`, and `50000` respectively; legal values above a cap are clamped, invalid values fall back to defaults, and unknown fields are ignored. Char budgets are not token budgets. Defaults enable memory and keep model proposals provisional; history and memory are queried on demand. Legacy injection settings are still parsed, but cannot restore the removed `context` hook, so history body text is never injected automatically.
 
 The automatic compaction threshold and retained-tail size are still controlled by Pi's own compaction settings; this extension does not set its own trigger threshold.
 
@@ -297,7 +297,7 @@ Multiple raw hits include only complete entries that fit and list omitted IDs; J
 
 ## Query history and memory on demand
 
-The current version registers no `context` hook and injects neither `pi-compact-auto-recall` nor `pi-compact-memory-hint`. Legacy `autoRecall*`, `memory.pinnedInjection`, `memory.hintMaxChars`, and `history.*` fields remain parseable for compatibility but cannot enable injection. Pinned/active memories are available through `pi_memory_search` and `pi_memory_read`.
+The current version registers no `context` hook and never injects history body text; `pi-compact-auto-recall` and `pi-compact-memory-hint` stay unused. Instead, `before_agent_start` appends extension-authored text to the system prompt: a static compaction pointer when the current branch contains a pi-compact compaction (window ID, source count, source hash prefix, retained entry ID — never history body text), plus user-authored pinned/active memories when `memory.pinnedInjection` is enabled, bounded by `memory.hintMaxChars`. Legacy `autoRecall*`, `memory.hintMaxChars`, and `history.*` fields remain parseable for compatibility but cannot re-enable history injection. Every memory stays reachable through `pi_memory_search` and `pi_memory_read`.
 
 The model's `pi_compact_recall` searches only the current branch. If the active lineage is unavailable, it does not expand to the whole session. Users can explicitly select `scope:all` in the `/pi-compact-recall` UI command. Tool results enter ordinary model context; UI command results only appear in the interface.
 
@@ -384,8 +384,9 @@ Verified so far:
 - Compaction boundary checks for tool calls and tool results.
 - Config scaffolding and normalization of invalid configs, including memory/history/window.
 - `manual`, `threshold`, and `overflow` compaction reasons plus aborted requests, via simulated hook events.
-- Empty active lineage does not widen the search; no context hook is registered, so history and working memory are not injected automatically.
-- Legacy auto-recall gates and working-memory renderers retain unit tests; these do not imply runtime injection.
+- Empty active lineage does not widen the search; no `context` hook is registered, so history body text is never injected automatically.
+- `before_agent_start` compaction-pointer and authority-memory injection, including exclusion of provisional/rule/model records and the `pinnedInjection` off switch.
+- Legacy auto-recall gates and working-memory renderers retain unit tests; they are no longer reachable from the injection path.
 - Log locks refuse token/metadata mismatches and do not reclaim live owners by age. Invalid metadata can be reclaimed after the grace period. Portable start-time identity (Linux `/proc`, Unix `ps`, Windows `Get-Process`) and conservative unverified fallback are unit-tested without changing `process.platform` or recycling real PIDs.
 - Clean dependency installation, TypeScript type checking, and real Pi CLI extension loading.
 
