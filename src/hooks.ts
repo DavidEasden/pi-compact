@@ -187,12 +187,13 @@ export const registerHooks = (pi: ExtensionAPI): void => {
           `keptEntryId=${d.keptEntryId ?? (lastCompaction as any).firstKeptEntryId ?? "?"}`,
         ].filter(Boolean).join(" ");
         compactionPointer = [
-          "[pi-compact] 本会话已发生上下文压缩，压缩前的历史已从当前上下文移除。",
+          "[pi-compact] 本会话使用了上下文压缩。较早的消息已从当前上下文移出，但原始记录完整保留。",
           meta ? `最近压缩：${meta}` : "",
-          "• 如需恢复之前的工作内容，请调用 pi_compact_recall（支持 query/file/entryIds/action:list）。",
-          "• 如需查询长期记忆（用户通过 /remember 写入的权威记忆），请调用 pi_memory_search。",
-          "• 不要假设之前的工作已丢失或需要重做——先召回再判断。",
-          "• 压缩 checkpoint 只是指针/哈希，不是历史摘要；原始记录仍可通过召回工具读取。",
+          "• 执行任务前，先判断当前上下文是否包含所需信息：",
+          "  - 若当前上下文已有足够信息（文件内容、讨论结论、具体需求），直接执行任务。",
+          "  - 若缺少关键信息（之前的代码、命令输出、讨论细节、具体要求），先用 pi_compact_recall 召回相关历史，再执行。",
+          "• 用户说'继续'时：根据上下文判断任务是什么；若不清楚或缺少信息，先召回或询问。",
+          "• 长期记忆（用户通过 /remember 写入）用 pi_memory_search；压缩 checkpoint 是指针而非摘要。",
         ].filter(Boolean).join("\n");
       }
     } catch {
