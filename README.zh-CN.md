@@ -24,7 +24,7 @@
 
 ## 安装
 
-当前源码要求 Pi `>=0.87.1`，开发与集成测试固定在 `0.87.1`；该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。已发布的 `v0.5.0` 与当前源码一致。
+当前源码要求 Pi `>=0.87.1`，开发与集成测试固定在 `0.87.1`；该版本要求 Node.js `>=22.19.0`。以下内容假设该仓库位于 `github.com/DavidEasden/pi-compact`。已发布的 `v0.5.1` 与当前源码一致。
 
 Pi package 会执行扩展代码，请在安装前审查源代码。
 
@@ -33,7 +33,7 @@ Pi package 会执行扩展代码，请在安装前审查源代码。
 推荐固定到发布 tag（固定后的 ref 不会被 `pi update --extensions` 或 `pi update --all` 移动）：
 
 ```bash
-pi install git:github.com/DavidEasden/pi-compact@v0.5.0
+pi install git:github.com/DavidEasden/pi-compact@v0.5.1
 ```
 
 或者不固定 ref，直接跟踪默认分支：
@@ -45,14 +45,14 @@ pi install git:github.com/DavidEasden/pi-compact
 也支持 SSH 简写与原始 HTTPS URL：
 
 ```bash
-pi install git:git@github.com:DavidEasden/pi-compact@v0.5.0
-pi install https://github.com/DavidEasden/pi-compact@v0.5.0
+pi install git:git@github.com:DavidEasden/pi-compact@v0.5.1
+pi install https://github.com/DavidEasden/pi-compact@v0.5.1
 ```
 
 说明：
 
 - `git:` 前缀启用 `host/user/repo` 与 `git@host:user/repo` 简写；不带前缀时只接受协议 URL（`https://`、`http://`、`ssh://`、`git://`）。
-- `v0.5.0` 必须是已存在的 tag 或 commit（首次可用 `git tag v0.5.0 && git push origin v0.5.0` 创建并推送）。以后升级到新 tag，重新执行 `pi install git:github.com/DavidEasden/pi-compact@<新tag>`。
+- `v0.5.1` 必须是已存在的 tag 或 commit（首次可用 `git tag v0.5.1 && git push origin v0.5.1` 创建并推送）。以后升级到新 tag，重新执行 `pi install git:github.com/DavidEasden/pi-compact@<新tag>`。
 - 全局安装会克隆到 `~/.pi/agent/git/github.com/DavidEasden/pi-compact`；使用 `-l`（项目 settings）时克隆位于 `.pi/git/github.com/DavidEasden/pi-compact`，项目信任后启动时会自动安装缺失的 package。
 - 不安装也可以临时试用：
 
@@ -65,7 +65,7 @@ pi -e git:github.com/DavidEasden/pi-compact
 同一份代码已发布到 npm，包名为 `pi-compact`：
 
 ```bash
-pi install npm:pi-compact@0.5.0
+pi install npm:pi-compact@0.5.1
 ```
 
 或者跟踪最新发布版本：
@@ -82,7 +82,7 @@ pi -e npm:pi-compact
 
 说明：
 
-- 形如 `npm:pi-compact@0.5.0` 的带版本 spec 会被固定，`pi update --extensions` 与 `pi update --all` 会跳过它。
+- 形如 `npm:pi-compact@0.5.1` 的带版本 spec 会被固定，`pi update --extensions` 与 `pi update --all` 会跳过它。
 - 全局安装位于 `~/.pi/agent/npm/`；使用 `-l`（项目 settings）时位于 `.pi/npm/`。
 
 ### 临时加载本地版本
