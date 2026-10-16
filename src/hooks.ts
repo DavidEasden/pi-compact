@@ -141,6 +141,12 @@ const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromProje
   });
 };
 
+// 模块级注入缓存：保证 before_agent_start 在输入不变时输出字节完全一致，避免不必要的 provider prompt cache 失效。
+// 这是从 magic-context 的稳定性原则（SOFT+ pass 字节完全一致重放）提炼的轻量实现——
+// 不依赖 LLM 或 SQLite，仅用内存 Map 跟踪 cache key。
+const injectionCache = new Map<string, string>();
+const INJECTION_CACHE_MAX = 32; // 覆盖多个并发 session，超出时整体清空（简单淘汰）
+
 const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: number, summaryMaxChars: number) => ({
   compaction: {
     // 降级路径也不复制历史、ID 或异常文本，不添加行为提示词。
@@ -170,67 +176,105 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const config = loadConfig(ctx.cwd);
     if (!config.enabled) return;
 
-    // 方案 A：压缩指针提示——仅在当前分支存在 pi-compact compaction 时追加，内容全部由扩展生成。
+    const sessionId = sessionIdOf(ctx);
+
+    // 步骤 1：加载原始输入——分支末尾的 pi-compact compaction entry，以及用户权威记忆。
+    // 将加载与渲染分离，是实现注入缓存的前提：必须先拿到 cache key 所需的数据，
+    // 再决定是否需要重新渲染（magic-context 稳定性原则：输入不变 → 字节完全一致重放）。
+
+    // 方案 A：压缩指针——仅在当前分支存在 pi-compact compaction 时追加，内容全部由扩展生成。
     // 不含任何历史正文、工具输出或用户数据，不会重新引入提示词注入面。
-    let compactionPointer = "";
+    let lastPiCompactEntry: any = undefined;
     try {
       const branch: SessionEntryLike[] = ctx.sessionManager?.getBranch?.() ?? [];
-      const lastCompaction = [...branch].reverse().find(
+      lastPiCompactEntry = [...branch].reverse().find(
         (entry) => entry.type === "compaction" && (entry as any).details?.compactor === "pi-compact",
       );
-      if (lastCompaction) {
-        const d = (lastCompaction as any).details ?? {};
-        const meta = [
-          d.windowId ? `windowId=${d.windowId}` : "",
-          `sourceCount=${d.sourceCount ?? d.sourceRecordCount ?? "?"}`,
-          `sourceHash=${String(d.sourceHash ?? "").slice(0, 16)}…`,
-          `keptEntryId=${d.keptEntryId ?? (lastCompaction as any).firstKeptEntryId ?? "?"}`,
-        ].filter(Boolean).join(" ");
-        compactionPointer = [
-          "[pi-compact] 本会话使用了上下文压缩。较早的消息已从当前上下文移出，但原始记录完整保留。",
-          meta ? `最近压缩：${meta}` : "",
-          "• 执行任务前，先判断当前上下文是否包含所需信息：",
-          "  - 若当前上下文已有足够信息（文件内容、讨论结论、具体需求），直接执行任务。",
-          "  - 若缺少关键信息（之前的代码、命令输出、讨论细节、具体要求），先用 pi_compact_recall 召回相关历史，再执行。",
-          "• 用户说'继续'时：根据上下文判断任务是什么；若不清楚或缺少信息，先召回或询问。",
-          "• 长期记忆（用户通过 /remember 写入）用 pi_memory_search；压缩 checkpoint 是指针而非摘要。",
-        ].filter(Boolean).join("\n");
-      }
     } catch {
       // 压缩检测失败不应阻断请求。
     }
 
-    // 方案 B：只注入 author=user 且 pinned/active 的权威记忆，不注入 provisional/rule/model。
+    // 方案 B：只加载 author=user 且 pinned/active 的权威记忆，不注入 provisional/rule/model。
     // 这些记录是用户通过 /remember 显式写入的，符合安全报告建议 2（仅显式批准的数据）。
-    let memoryHint = "";
+    let userAuthorityRecords: ReturnType<typeof loadMemories> = [];
     if (config.memory.enabled && config.memory.pinnedInjection) {
       try {
-        const sid = sessionIdOf(ctx);
-        const userAuthority = loadMemories(ctx.cwd).filter((record) => (
+        userAuthorityRecords = loadMemories(ctx.cwd).filter((record) => (
           record.author === "user"
           && (record.status === "pinned" || record.status === "active")
-          && (record.scope !== "session" || record.sessionId === sid)
+          && (record.scope !== "session" || record.sessionId === sessionId)
         ));
-        if (userAuthority.length > 0) {
-          const hint = renderWorkingHint(userAuthority, config.memory.hintMaxChars);
-          if (hint.content) memoryHint = hint.content;
-        }
       } catch {
         // 记忆读取失败不应阻断请求。
       }
     }
 
-    if (!compactionPointer && !memoryHint) return;
+    // 步骤 2：计算注入 cache key。
+    // key = sessionId | 最近 compaction entry id | 记忆指纹（id:status:priority:content前32字符 排序后拼接）
+    // 任一输入变化（新压缩、记忆增删改）都会产生新 key，触发重新渲染；输入不变则字节完全一致地重放。
+    const compactionEntryId = typeof lastPiCompactEntry?.id === "string" ? lastPiCompactEntry.id : "";
+    const memFp = userAuthorityRecords
+      .map((r) => `${r.id}:${r.status}:${r.priority}:${r.content.slice(0, 32)}`)
+      .sort()
+      .join("|");
+    const cacheKey = `${sessionId ?? ""}|${compactionEntryId}|${memFp}`;
+
+    const cached = injectionCache.get(cacheKey);
+    if (cached !== undefined) {
+      // cache hit：输入未变，字节完全一致地重放上次渲染结果，不触发 provider cache 失效。
+      if (config.debug) {
+        console.log(`[pi-compact] before_agent_start: cache hit key=${cacheKey.slice(0, 64)}`);
+      }
+      if (cached) event.systemPromptOptions.promptGuidelines.push(cached);
+      return;
+    }
+
+    // 步骤 3：cache miss，重新渲染。
+    let compactionPointer = "";
+    if (lastPiCompactEntry) {
+      const d = (lastPiCompactEntry as any).details ?? {};
+      const meta = [
+        d.windowId ? `windowId=${d.windowId}` : "",
+        `sourceCount=${d.sourceCount ?? d.sourceRecordCount ?? "?"}`,
+        `sourceHash=${String(d.sourceHash ?? "").slice(0, 16)}…`,
+        `keptEntryId=${d.keptEntryId ?? (lastPiCompactEntry as any).firstKeptEntryId ?? "?"}`,
+      ].filter(Boolean).join(" ");
+      compactionPointer = [
+        "[pi-compact] 本会话使用了上下文压缩。较早的消息已从当前上下文移出，但原始记录完整保留。",
+        meta ? `最近压缩：${meta}` : "",
+        "• 执行任务前，先判断当前上下文是否包含所需信息：",
+        "  - 若当前上下文已有足够信息（文件内容、讨论结论、具体需求），直接执行任务。",
+        "  - 若缺少关键信息（之前的代码、命令输出、讨论细节、具体要求），先用 pi_compact_recall 召回相关历史，再执行。",
+        "• 用户说'继续'时：根据上下文判断任务是什么；若不清楚或缺少信息，先召回或询问。",
+        "• 长期记忆（用户通过 /remember 写入）用 pi_memory_search；压缩 checkpoint 是指针而非摘要。",
+      ].filter(Boolean).join("\n");
+    }
+
+    let memoryHint = "";
+    if (userAuthorityRecords.length > 0) {
+      const hint = renderWorkingHint(userAuthorityRecords, config.memory.hintMaxChars);
+      if (hint.content) memoryHint = hint.content;
+    }
+
+    // 步骤 4：写入 cache（超出上限时整体清空，简单淘汰）。
+    // 空字符串同样缓存，避免每轮走加载逻辑后才得出「无内容注入」的结论。
+    if (injectionCache.size >= INJECTION_CACHE_MAX) injectionCache.clear();
+
+    if (!compactionPointer && !memoryHint) {
+      injectionCache.set(cacheKey, "");
+      return;
+    }
 
     const combined = [compactionPointer, memoryHint].filter(Boolean).join("\n\n");
     const chars = combined.length;
-    if (config.debug) {
-      console.log(`[pi-compact] before_agent_start: compactionPointer=${compactionPointer.length > 0} memoryHint=${memoryHint.length > 0} chars=${chars}`);
-    }
     // promptGuidelines 被追加到系统提示末尾，内容为扩展自写的可信文本，不含历史正文。
-    event.systemPromptOptions.promptGuidelines.push(
-      `[pi-compact context pointer — ${estimateTokensFromChars(chars)} est. tokens]\n${combined}`,
-    );
+    const entry = `[pi-compact context pointer — ${estimateTokensFromChars(chars)} est. tokens]\n${combined}`;
+    injectionCache.set(cacheKey, entry);
+
+    if (config.debug) {
+      console.log(`[pi-compact] before_agent_start: cache miss → rendered compactionPointer=${compactionPointer.length > 0} memoryHint=${memoryHint.length > 0} chars=${chars}`);
+    }
+    event.systemPromptOptions.promptGuidelines.push(entry);
   });
 
   pi.on("session_before_compact", async (event: any, ctx: any) => {
