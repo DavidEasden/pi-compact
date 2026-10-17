@@ -213,6 +213,31 @@ test("Pi SDK：成功后提交窗口，重复事件去重，摘要相同也绑�
   } finally { h.close(); }
 });
 
+test("Pi SDK：workspace 记忆跨同 cwd session 共享，但不同 cwd 隔离", async () => {
+  const workspaceA = await createHarness();
+  let sessionB;
+  let workspaceC;
+  const call = (h, name, args) => h.tool(name).execute("workspace-test", args, new AbortController().signal);
+  try {
+    const created = await call(workspaceA, "pi_memory_propose", {
+      content: "实际运行时工作区边界探针",
+      scope: "workspace",
+    });
+    assert.equal(created.details.status, "provisional");
+
+    sessionB = await createHarness({ cwd: workspaceA.cwd });
+    const visible = await call(sessionB, "pi_memory_search", { query: "工作区边界探针" });
+    assert.equal(visible.details.count, 1);
+    assert.match(visible.content[0].text, new RegExp(created.details.recordId));
+
+    workspaceC = await createHarness();
+    assert.notEqual(workspaceC.cwd, workspaceA.cwd);
+    const isolated = await call(workspaceC, "pi_memory_search", { query: "工作区边界探针" });
+    assert.equal(isolated.details.count, 0);
+    assert.match(isolated.content[0].text, /未找到匹配记忆/);
+  } finally { workspaceC?.close(); sessionB?.close(); workspaceA.close(); }
+});
+
 test("Pi SDK：真实工具包装执行记忆隔离、预算、状态查询与禁用检查", async () => {
   const a = await createHarness();
   const call = (h, name, args) => h.tool(name).execute("test", args, new AbortController().signal);
