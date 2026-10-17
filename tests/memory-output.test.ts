@@ -4,7 +4,7 @@ import { formatMemoryRead, formatMemorySearch, MEMORY_TOOL_MAX_CHARS } from "../
 import type { MemoryRecord } from "../src/types.ts";
 
 const record: MemoryRecord = {
-  id: "mem_test", kind: "fact", scope: "project", status: "active", priority: "normal", author: "user",
+  id: "mem_test", kind: "fact", scope: "workspace", status: "active", priority: "normal", author: "user",
   content: "正文\"\\\n".repeat(10000), sourceEntryIds: [], sourceHash: "hash",
   createdAt: "2026-01-01", updatedAt: "2026-01-01", version: 1, pinned: false,
 };

@@ -7,6 +7,7 @@ import type {
   MemoryPriority,
   MemoryRecord,
   MemoryScope,
+  StoredMemoryScope,
   MemoryStatus,
   MemorySupersedePayload,
 } from "../types.ts";
@@ -14,7 +15,11 @@ import type {
 const EVENT_TYPES = new Set<MemoryEventType>(["create", "supersede", "pin", "unpin", "resolve"]);
 const AUTHORS = new Set<MemoryAuthor>(["user", "model", "rule"]);
 const KINDS = new Set<MemoryKind>(["fact", "preference", "constraint", "decision", "working", "derived"]);
-const SCOPES = new Set<MemoryScope>(["project", "session", "user"]);
+const SCOPES = new Set<StoredMemoryScope>(["workspace", "session", "project", "user"]);
+
+const normalizedScope = (scope: StoredMemoryScope): MemoryScope => (
+  scope === "session" ? "session" : "workspace"
+);
 const PRIORITIES = new Set<MemoryPriority>(["low", "normal", "high"]);
 const CREATE_STATUSES = new Set<MemoryStatus>(["provisional", "active"]);
 
@@ -40,7 +45,7 @@ export const isMemoryEvent = (value: unknown): value is MemoryEvent => {
 const validCreatePayload = (payload: Record<string, unknown>): payload is MemoryCreatePayload & Record<string, unknown> => (
   typeof payload.kind === "string" && KINDS.has(payload.kind as MemoryKind)
   && typeof payload.content === "string"
-  && typeof payload.scope === "string" && SCOPES.has(payload.scope as MemoryScope)
+  && typeof payload.scope === "string" && SCOPES.has(payload.scope as StoredMemoryScope)
   && typeof payload.status === "string" && CREATE_STATUSES.has(payload.status as MemoryStatus)
   && typeof payload.priority === "string" && PRIORITIES.has(payload.priority as MemoryPriority)
   && typeof payload.sourceHash === "string"
@@ -78,7 +83,7 @@ export const projectMemories = (events: MemoryEvent[]): MemoryRecord[] => {
         id: event.recordId,
         kind: payload.kind,
         content: payload.content,
-        scope: payload.scope,
+        scope: normalizedScope(payload.scope),
         status: payload.status,
         priority: payload.priority,
         author: event.author,
@@ -130,7 +135,7 @@ export const projectMemories = (events: MemoryEvent[]): MemoryRecord[] => {
         id: payload.newRecordId,
         kind: typeof payload.kind === "string" && KINDS.has(payload.kind as MemoryKind) ? payload.kind as MemoryKind : current.kind,
         content: payload.content,
-        scope: typeof payload.scope === "string" && SCOPES.has(payload.scope as MemoryScope) ? payload.scope as MemoryScope : current.scope,
+        scope: typeof payload.scope === "string" && SCOPES.has(payload.scope as StoredMemoryScope) ? normalizedScope(payload.scope as StoredMemoryScope) : current.scope,
         status: nextStatus,
         priority: typeof payload.priority === "string" && PRIORITIES.has(payload.priority as MemoryPriority) ? payload.priority as MemoryPriority : current.priority,
         author: event.author,

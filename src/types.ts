@@ -6,7 +6,9 @@ export type AutoRecallMode = "full" | "hint" | "off";
 export type SourceClass = "primary" | "derived";
 export type MemoryKind = "fact" | "preference" | "constraint" | "decision" | "working" | "derived";
 export type MemoryStatus = "provisional" | "active" | "pinned" | "superseded" | "resolved";
-export type MemoryScope = "project" | "session" | "user";
+export type MemoryScope = "workspace" | "session";
+export type LegacyMemoryScope = "project" | "user";
+export type StoredMemoryScope = MemoryScope | LegacyMemoryScope;
 export type MemoryAuthor = "user" | "model" | "rule";
 export type MemoryPriority = "low" | "normal" | "high";
 export type MemoryEventType = "create" | "supersede" | "pin" | "unpin" | "resolve";
@@ -146,7 +148,7 @@ export interface MemoryRecord {
 export interface MemoryCreatePayload {
   kind: MemoryKind;
   content: string;
-  scope: MemoryScope;
+  scope: StoredMemoryScope;
   status: "provisional" | "active";
   priority: MemoryPriority;
   sourceEntryIds: string[];
@@ -158,7 +160,7 @@ export interface MemorySupersedePayload {
   newRecordId: string;
   content: string;
   kind?: MemoryKind;
-  scope?: MemoryScope;
+  scope?: StoredMemoryScope;
   status?: "provisional" | "active";
   priority?: MemoryPriority;
   sourceEntryIds?: string[];

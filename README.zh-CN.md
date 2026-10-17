@@ -8,7 +8,7 @@
 
 ## 功能
 
-- 在项目 `.pi/pi-compact/` 中维护 append-only 记忆事件日志；当前记忆状态由纯函数从事件重放，旧事件不能静默覆盖。
+- 在当前 Pi 工作区 `.pi/pi-compact/` 中维护 append-only 记忆事件日志；当前记忆状态由纯函数从事件重放，旧事件不能静默覆盖。
 - 用户通过 `/remember`、`/memories`、`/forget` 写入权威记忆；模型只能提出 provisional 提议，不会自动变成 active 或 pinned。
 - 模型通过工具按需查询历史，任何历史正文都不会被自动注入；扩展不注册 `context` hook。`before_agent_start` 只向系统提示追加扩展自写的文本：取自 checkpoint 元数据的压缩指针，以及在 `memory.pinnedInjection` 开启时注入用户通过 `/remember` 写入、状态为 pinned/active 的权威记忆。provisional、规则派生与模型提议记录永不注入。
 - 接管 Pi 原生的 `/compact` 命令，以及普通的 `manual`、`threshold` 和 `overflow` compaction。
@@ -200,7 +200,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 ### 权威长期记忆
 
-长期记忆存放在项目目录 `.pi/pi-compact/memory.jsonl`（append-only 事件日志）。当前状态由纯函数 projector 重放得到。用户写入是权威来源；模型提议默认且始终为 provisional，必须由用户 `/remember` 确认后才成为 active/pinned。扩展不能保证模型一定遵守这些记忆。
+长期记忆存放在 Pi `ctx.cwd` 对应工作区的 `.pi/pi-compact/memory.jsonl`（append-only 事件日志），不按用户全局共享。相同 `ctx.cwd` 启动的 session 共享 `workspace` 记忆；不同 `ctx.cwd` 使用各自独立的日志，即使 sessionId 相同也不会互通。扩展不自动推断 Git 根目录。`session` 记忆仅在创建它的同一 session 内可见。新接口只提供 `workspace` 与 `session` 两种范围；旧日志中的 `project` 和 `user` 会在读取时映射为 `workspace`，不会重写日志。当前状态由纯函数 projector 重放得到。用户写入是权威来源；模型提议默认且始终为 provisional，必须由用户 `/remember` 确认后才成为 active/pinned。扩展不能保证模型一定遵守这些记忆。
 
 `memory.jsonl`（及 `windows.jsonl`）的追加受按日志文件的同步文件锁（`.pi/pi-compact/memory.jsonl.lock`、`windows.jsonl.lock`）保护，避免多个 Pi 进程交叉执行「读末条 → 算 seq → 追加」而丢失事件。`PI_COMPACT_LOCK_TIMEOUT_MS` 只是有限等待超时（主要供测试），不是活锁租约：持有者 PID 仍存活时，不会因为锁文件年龄而回收。崩溃恢复只在以下情况删除锁：所有者 PID 明确死亡；锁内 startTime 与实时启动时间都能读到且明确不同（PID 复用）；或能用当前进程的 startTime 证明这是本进程遗留且当前未持有。Linux 读取 `/proc/<pid>/stat`；macOS 和其他可用 Unix 平台尝试设置 `TZ=UTC` 后同步执行 `ps`；Windows 尝试标准系统能力（如 PowerShell `Get-Process` StartTime）。启动时间身份是尽力而为——并非所有平台都能读到，失败一律视为无法验证。无法解析、空的或缺少有效 owner token/pid 的锁在宽限期内不会被自动删除（可能正处在创建写入窗口）；超过宽限期（`PI_COMPACT_STALE_LOCK_GRACE_MS`，默认 1000 毫秒，主要供测试覆盖）后按崩溃遗留自动回收，避免空锁文件把写入永久卡死。宽限期内无法验证身份时会等到超时，并抛出明确错误：所有者 metadata 无法验证或锁仍被持有，且本次写入未完成。人工删除 `.lock` 文件仍是明确的恢复途径。锁在进程内可重入，事务结束时必然释放。释放与回收必须核对锁文件中的 owner token，并在存在 pid/startTime 时一并核对；expected metadata 缺失或不匹配时不会删除他人的新锁。写入失败会显式报错并告知用户或模型，失败后不会声称写入成功。
 
@@ -215,19 +215,19 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 /forget mem_abc
 ```
 
-`/remember` 支持 `pin`、`kind:`、`scope:`、`priority:`、`supersede:<id>`。`/memories` 可按 `status:`、`kind:` 和关键词过滤。`/forget` 将记忆标记为 resolved，不再出现在默认记忆查询中。这些命令只做本地确定性写入并通过 UI 通知，不触发模型 turn。
+`/remember` 支持 `pin`、`kind:`、`scope:workspace|session`、`priority:`、`supersede:<id>`；默认 scope 为 `workspace`。旧命令中的 `scope:project` 与 `scope:user` 作为兼容别名映射为 `workspace`，不代表跨工作区共享。`/memories` 可按 `status:`、`kind:` 和关键词过滤。`/forget` 将记忆标记为 resolved，不再出现在默认记忆查询中。这些命令只做本地确定性写入并通过 UI 通知，不触发模型 turn。
 
 记忆工具：
 
 | 工具 | 说明 |
 | --- | --- |
-| `pi_memory_search` | 搜索记忆；无关键词且无显式 status 时列出 pinned/active/provisional；支持 offset/limit 分页 |
+| `pi_memory_search` | 搜索当前工作区记忆；无关键词且无显式 status 时列出 pinned/active/provisional；支持 offset/limit 分页 |
 | `pi_memory_read` | 按 ID 读取；默认读取 4000 字符，长内容通过 offset/limit 分段 |
-| `pi_memory_propose` | 模型提出 provisional 记忆，不会自动变成 active/pinned |
+| `pi_memory_propose` | 模型提出当前工作区或当前 session 的 provisional 记忆，不会自动变成 active/pinned |
 | `pi_memory_update` | 只能 edit/resolve 模型自己的 provisional 提议 |
 | `pi_compact_new_context` | 登记换窗请求；同批工具全部完成后压缩，成功后继续当前任务；不支持时提示使用 `/compact` |
 
-`memory.enabled=false` 会同时禁用记忆命令、搜索、读取、提议和修改。`scope:session` 的记录仅在创建它的同一 sessionId 下可见、可修改；没有有效 sessionId 时不能创建或访问会话范围记录。`project` 和 `user` 保持当前项目内共享的行为，不会转存到用户全局目录。
+`memory.enabled=false` 会同时禁用记忆命令、搜索、读取、提议和修改。`scope:session` 的记录仅在创建它的同一 sessionId 下可见、可修改；没有有效 sessionId 时不能创建或访问会话范围记录。`workspace` 记忆在同一 Pi `ctx.cwd` 下的 session 间共享，不会转存到用户全局目录。不同 cwd 是不同工作区；扩展不自动将仓库子目录归并到 Git 根目录。
 
 记忆搜索和读取的总文本输出上限固定为 16000 字符，包含 JSON 元数据与转义。搜索对每条正文生成最多 600 字符的片段，省略的完整内容可按 ID 读取；读取默认段长为 4000，显式大 limit 也受总预算限制。搜索的 `details.nextOffset` 是下一页记录偏移；读取 JSON 的 `nextOffset` 是下一段正文字符偏移。显式查询 `status:resolved` 或 `status:superseded` 无需同时提供关键词。过大的元数据会标记 `metadataTruncated`，原始记忆仍保留在日志中。
 
