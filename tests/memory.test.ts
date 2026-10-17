@@ -342,7 +342,7 @@ test("工作记忆预算优先保留 pinned，不会被 active 挤掉", () => {
     id: "mem_pin",
     kind: "fact",
     content: "必须保留的固定事实",
-    scope: "project",
+    scope: "workspace",
     status: "pinned",
     priority: "high",
     author: "user",
@@ -541,7 +541,53 @@ test("memory.enabled=false 时 read/update 不生效也不追加日志", async (
   }
 });
 
-test("session 范围记忆只在同一会话可搜读改，project 仍项目内共享", async () => {
+test("旧 project/user 记忆事件均投影为 workspace 记忆", () => {
+  const cwd = tempCwd();
+  try {
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId: "mem_legacy_project",
+      author: "user",
+      payload: { ...createPayload("旧项目记忆"), scope: "project" },
+    });
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId: "mem_legacy_user",
+      author: "user",
+      payload: { ...createPayload("旧 user 记忆"), scope: "user" },
+    });
+
+    assert.deepEqual(loadMemories(cwd).map((record) => [record.id, record.scope]), [
+      ["mem_legacy_project", "workspace"],
+      ["mem_legacy_user", "workspace"],
+    ]);
+    assert.equal((readMemoryEvents(cwd)[0].payload as { scope?: string }).scope, "project");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("不同 Pi cwd 的工作区记忆互不可见，即使 sessionId 相同", async () => {
+  const cwdA = tempCwd();
+  const cwdB = tempCwd();
+  try {
+    const { tools, commands } = registerMemoryHarness();
+    const sessionA = memoryCtx(cwdA, "same-session-id");
+    const sessionB = memoryCtx(cwdB, "same-session-id");
+    await commands.get("remember").handler("kind:constraint 仅属于工作区 A", sessionA);
+    await commands.get("remember").handler("scope:user 旧范围输入也只属于工作区 A", sessionA);
+    assert.equal(loadMemories(cwdA).every((record) => record.scope === "workspace"), true);
+
+    const result = await runTool(tools, "pi_memory_search", { query: "仅属于工作区 A" }, sessionB, "workspace-isolation");
+    assert.match(result.content[0].text, /未找到匹配记忆/);
+    assert.equal(loadMemories(cwdB).length, 0);
+  } finally {
+    rmSync(cwdA, { recursive: true, force: true });
+    rmSync(cwdB, { recursive: true, force: true });
+  }
+});
+
+test("session 范围记忆只在同一会话可搜读改，workspace 记忆在工作区内共享", async () => {
   const cwd = tempCwd();
   try {
     const { tools, commands } = registerMemoryHarness();
@@ -557,9 +603,10 @@ test("session 范围记忆只在同一会话可搜读改，project 仍项目内�
     const projectRecord = loadMemories(cwd).find((record) => record.content === "项目共享约束")!;
     assert.equal(sessionRecord.scope, "session");
     assert.equal(sessionRecord.sessionId, "session-a");
-    assert.equal(projectRecord.scope, "project");
+    assert.equal(projectRecord.scope, "workspace");
+    assert.equal((readMemoryEvents(cwd).find((event) => event.recordId === projectRecord.id)?.payload as { scope?: string }).scope, "workspace");
 
-    // /memories：B 会话看不到 A 的 session 记录，但 project 记录共享可见。
+    // /memories：B 会话看不到 A 的 session 记录，但 workspace 记录共享可见。
     await commands.get("memories").handler("", sessionB);
     const listB = notesB.at(-1) ?? "";
     assert.equal(listB.includes(sessionRecord.id), false);

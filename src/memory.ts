@@ -9,7 +9,12 @@ import { appendMemoryEvent, contentHash, loadMemories, newMemoryId, withMemoryLo
 import type { MemoryKind, MemoryPriority, MemoryRecord, MemoryScope, MemoryStatus } from "./types.ts";
 
 const KINDS = new Set<MemoryKind>(["fact", "preference", "constraint", "decision", "working", "derived"]);
-const SCOPES = new Set<MemoryScope>(["project", "session", "user"]);
+const SCOPES = new Set<MemoryScope>(["workspace", "session"]);
+const normalizeScopeInput = (value: string): MemoryScope | undefined => {
+  if (SCOPES.has(value as MemoryScope)) return value as MemoryScope;
+  if (value === "project" || value === "user") return "workspace";
+  return undefined;
+};
 const PRIORITIES = new Set<MemoryPriority>(["low", "normal", "high"]);
 const STATUSES = new Set<MemoryStatus>(["provisional", "active", "pinned", "superseded", "resolved"]);
 
@@ -38,7 +43,7 @@ const sessionIdOf = (ctx: any): string | undefined => {
   }
 };
 
-/** session 范围记忆只在创建它的同一非空会话可见；缺失或不同 sessionId 都不匹配。project/user 仍在项目内共享。 */
+/** session 记忆仅对创建它的 session 可见；workspace 记忆共享给同一 Pi cwd 下的 session。 */
 const visibleToSession = (record: MemoryRecord, sessionId: string | undefined): boolean => (
   record.scope !== "session" || (sessionId !== undefined && record.sessionId === sessionId)
 );
@@ -66,8 +71,11 @@ const parseTokens = (args: string): MemoryCommandInput => {
     const value = token.slice(separator + 1);
     if (key === "id" || key === "recordid") result.recordId = value;
     else if (key === "kind" && KINDS.has(value as MemoryKind)) result.kind = value as MemoryKind;
-    else if (key === "scope" && SCOPES.has(value as MemoryScope)) result.scope = value as MemoryScope;
-    else if (key === "priority" && PRIORITIES.has(value as MemoryPriority)) result.priority = value as MemoryPriority;
+    else if (key === "scope") {
+      const scope = normalizeScopeInput(value);
+      if (scope) result.scope = scope;
+      else plain.push(token);
+    } else if (key === "priority" && PRIORITIES.has(value as MemoryPriority)) result.priority = value as MemoryPriority;
     else if (key === "status" && STATUSES.has(value as MemoryStatus)) result.status = value as MemoryStatus;
     else if (key === "supersede") result.supersede = value;
     else if (key === "pin" && (value === "true" || value === "1")) result.pin = true;
@@ -96,7 +104,7 @@ const createUserMemory = (cwd: string, ctx: any, input: MemoryCommandInput, pin:
       payload: {
         kind: input.kind ?? "fact",
         content,
-        scope: input.scope ?? "project",
+        scope: input.scope ?? "workspace",
         status: "active",
         priority: input.priority ?? "normal",
         sourceEntryIds: [],
@@ -161,7 +169,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
         return;
       }
       if (!input.content && !input.supersede && !input.recordId) {
-        notify(ctx, "用法：/remember [pin] [kind:fact] [scope:project] 文本  或  /remember supersede:<id> 新文本", "warning");
+        notify(ctx, "用法：/remember [pin] [kind:fact] [scope:workspace] 文本  或  /remember supersede:<id> 新文本", "warning");
         return;
       }
       const target = input.supersede ?? input.recordId;
@@ -247,7 +255,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
   pi.registerTool({
     name: "pi_memory_search",
     label: "Search long-term memory",
-    description: "搜索项目长期记忆。结果可能包含用户权威记忆与模型 provisional 提议；不要把 provisional 当成已确认事实。",
+    description: "搜索当前工作区记忆。结果可能包含用户权威记忆与模型 provisional 提议；不要把 provisional 当成已确认事实。",
     promptSnippet: "搜索跨压缩仍保留的长期记忆",
     promptGuidelines: ["使用 pi_memory_search 查找长期记忆，不要把压缩 checkpoint 或模型自己的提议当成用户已确认事实。"],
     parameters: Type.Object({
@@ -347,7 +355,7 @@ export const registerMemory = (pi: ExtensionAPI): void => {
         return { content: [{ type: "text", text: "pi-compact: content 不能为空。" }], details: { count: 0 } };
       }
       const sessionId = sessionIdOf(ctx);
-      const scope = input.scope && SCOPES.has(input.scope as MemoryScope) ? input.scope as MemoryScope : "project";
+      const scope = input.scope && SCOPES.has(input.scope as MemoryScope) ? input.scope as MemoryScope : "workspace";
       if (scope === "session" && !sessionId) {
         return { content: [{ type: "text", text: "pi-compact: 当前会话没有 sessionId，不能创建 session 范围记忆。" }], details: { count: 0, rejected: true } };
       }

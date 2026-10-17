@@ -30,7 +30,7 @@ export const deriveFacts = (records: HistoryRecord[], windowSourceHash: string):
       payload: {
         kind: "derived",
         content: canonicalContent,
-        scope: "project",
+        scope: "workspace",
         status: "provisional",
         priority: "low",
         sourceEntryIds: [record.entryId],

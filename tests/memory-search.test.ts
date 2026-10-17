@@ -7,7 +7,7 @@ const memory = (overrides: Partial<MemoryRecord> = {}): MemoryRecord => ({
   id: "mem_default",
   kind: "fact",
   content: "token refresh",
-  scope: "project",
+  scope: "workspace",
   status: "active",
   priority: "normal",
   author: "user",
