@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 import { createHarness, assistant, toolCall, user, usage, estimateTokens, SessionManager, untilEvent } from "./helpers/pi-session.mjs";
+
+const sessionSummaryRows = (cwd) => {
+  const dir = join(cwd, ".pi", "pi-compact", "sessions");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((name) => name.endsWith(".jsonl")).flatMap((name) => (
+    readFileSync(join(dir, name), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+  ));
+};
 
 const rows = (cwd, name) => {
   const path = join(cwd, ".pi", "pi-compact", `${name}.jsonl`);
@@ -203,9 +211,14 @@ test("Pi SDK：成功后提交窗口，重复事件去重，摘要相同也绑�
     assert.equal(windows[1].parentWindowId, windows[0].windowId);
     assert.equal(windows[1].previousHash, windows[0].hash);
     assert.ok(rows(h.cwd, "memory").length > 0);
+    const summaries = sessionSummaryRows(h.cwd);
+    assert.equal(summaries.length, 2);
+    assert.equal(summaries[1].parentCompactionEntryId, summaries[0].compactionEntryId);
+    assert.ok(summaries.some((item) => item.evidence.some((evidence) => evidence.excerpt.includes("检查 src/example.ts"))));
     // 重放同一成功事件，验证事件去重不依赖内存中的一次性标记。
     await h.session._extensionRunner.emit(savedEvent);
     assert.equal(rows(h.cwd, "windows").length, 2);
+    assert.equal(sessionSummaryRows(h.cwd).length, 2);
     const restored = SessionManager.open(h.sm.getSessionFile());
     assert.deepEqual(restored.buildSessionContext().messages, h.session.messages);
     assert.deepEqual(h.errors, []);

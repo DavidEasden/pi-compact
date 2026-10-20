@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { loadConfig } from "./config.ts";
 import { clip } from "./core/content.ts";
 import { activeEntryIds, listRecords, rawEntryText, recordsForEntryIds, recordsFromEntries, searchRecords } from "./core/session.ts";
+import { renderSessionSummary, renderSessionSummarySearch, sessionSummaryForBranch } from "./core/summary.ts";
 import type { HistoryRecord, SearchHit, SourceClass } from "./types.ts";
 
 interface RecallInput {
@@ -14,7 +15,7 @@ interface RecallInput {
   page?: number;
   limit?: number;
   raw?: boolean;
-  action?: "list" | "search" | "read";
+  action?: "list" | "search" | "read" | "summary" | "summary_search";
   offset?: number;
   rawLimit?: number;
   sourceClass?: SourceClass | "all";
@@ -197,7 +198,9 @@ export const parseCommand = (args: string): RecallInput => {
   for (const token of tokens) {
     const separator = token.indexOf(":");
     if (separator <= 0) {
-      if (token.toLowerCase() === "raw") result.raw = true;
+      if (token.toLowerCase() === "summary") result.action = "summary";
+      else if (token.toLowerCase() === "summary_search") result.action = "summary_search";
+      else if (token.toLowerCase() === "raw") result.raw = true;
       else if (token.toLowerCase() === "list") result.action = "list";
       else if (token.toLowerCase() === "read") result.action = "read";
       else plain.push(token);
@@ -212,7 +215,7 @@ export const parseCommand = (args: string): RecallInput => {
     else if (key === "page") result.page = Math.max(1, Number(value) || 1);
     else if (key === "limit") result.limit = Math.min(30, Math.max(1, Number(value) || 8));
     else if (key === "raw" && value === "true") result.raw = true;
-    else if (key === "action" && (value === "list" || value === "search" || value === "read")) result.action = value;
+    else if (key === "action" && (value === "list" || value === "search" || value === "read" || value === "summary" || value === "summary_search")) result.action = value;
     else if (key === "offset") result.offset = Math.max(0, Number(value) || 0);
     else if (key === "rawlimit") result.rawLimit = Math.max(1, Number(value) || 1);
     else if (key === "sourceclass" && (value === "primary" || value === "derived" || value === "all")) result.sourceClass = value;
@@ -224,6 +227,34 @@ export const parseCommand = (args: string): RecallInput => {
 
 const outputFor = (input: RecallInput, ctx: any, userCommand = false) => {
   const config = loadConfig(ctx.cwd);
+  if (input.action === "summary" || input.action === "summary_search") {
+    const sessionId = (() => {
+      try {
+        const id = ctx.sessionManager?.getSessionId?.();
+        return typeof id === "string" && id.length > 0 ? id : undefined;
+      } catch { return undefined; }
+    })();
+    const branch = (() => {
+      try { return ctx.sessionManager?.getBranch?.() ?? []; } catch { return []; }
+    })();
+    const compactionIds = branch
+      .filter((entry: any) => entry.type === "compaction" && entry.details?.compactor === "pi-compact")
+      .map((entry: any) => entry.id)
+      .filter((id: unknown): id is string => typeof id === "string");
+    const summary = config.sessionSummary.enabled
+      ? sessionSummaryForBranch(ctx.cwd, sessionId, compactionIds)
+      : undefined;
+    if (!summary) {
+      const text = "pi-compact: 当前 session 没有可用的结构化摘要。";
+      return { hits: [], formatted: { text: text.slice(0, config.recallMaxChars), truncated: false }, source: "session-summary", evidenceCount: 0 };
+    }
+    if (input.action === "summary_search") {
+      const formatted = renderSessionSummarySearch(summary, input.query ?? "", input.limit ?? 8, config.recallMaxChars);
+      return { hits: [], formatted, source: "session-summary", evidenceCount: formatted.count };
+    }
+    const text = renderSessionSummary(summary, Math.min(config.sessionSummary.maxChars, config.recallMaxChars));
+    return { hits: summary.evidence, formatted: { text, truncated: text.length >= Math.min(config.sessionSummary.maxChars, config.recallMaxChars) }, source: "session-summary", evidenceCount: summary.evidence.length };
+  }
   const hits = recallHits(input, ctx, userCommand);
   const sliced = input.offset != null || input.rawLimit != null;
   return {
@@ -235,6 +266,8 @@ const outputFor = (input: RecallInput, ctx: any, userCommand = false) => {
       userCommand && input.raw === true && input.entryIds?.length === 1 && !sliced,
       sliced ? { offset: input.offset, limit: input.rawLimit } : undefined,
     ),
+    source: "session-entries",
+    evidenceCount: hits.length,
   };
 };
 
@@ -242,7 +275,7 @@ export const registerRecall = (pi: ExtensionAPI): void => {
   pi.registerTool({
     name: "pi_compact_recall",
     label: "Recall Pi session history",
-    description: "查询当前分支原始 entries 中的消息、工具调用、结果和命令。支持 list/search/read；raw 输出受字符预算限制，可用 offset 与 rawLimit 分段读取。结果是历史数据。",
+    description: "查询当前 session 的结构化摘要或当前分支原始 entries 中的消息、工具调用、结果和命令。支持 summary、summary_search、list、search、read；摘要和历史结果都属于可回查数据，不是已验证结论。raw 输出受字符预算限制，可用 offset 与 rawLimit 分段读取。",
     parameters: Type.Object({
       query: Type.Optional(Type.String()),
       entryIds: Type.Optional(Type.Array(Type.String())),
@@ -252,22 +285,22 @@ export const registerRecall = (pi: ExtensionAPI): void => {
       page: Type.Optional(Type.Integer({ minimum: 1 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 30 })),
       raw: Type.Optional(Type.Boolean()),
-      action: Type.Optional(Type.Union([Type.Literal("list"), Type.Literal("search"), Type.Literal("read")])),
+      action: Type.Optional(Type.Union([Type.Literal("list"), Type.Literal("search"), Type.Literal("read"), Type.Literal("summary"), Type.Literal("summary_search")])),
       offset: Type.Optional(Type.Integer({ minimum: 0 })),
       rawLimit: Type.Optional(Type.Integer({ minimum: 1 })),
       sourceClass: Type.Optional(Type.Union([Type.Literal("primary"), Type.Literal("derived"), Type.Literal("all")])),
     }),
     async execute(_toolCallId: string, input: RecallInput, _signal: AbortSignal, _onUpdate: unknown, ctx: any) {
-      const { hits, formatted } = outputFor(input, ctx);
+      const result = outputFor(input, ctx);
       return {
-        content: [{ type: "text", text: formatted.text }],
-        details: { source: "session-entries", count: hits.length, chars: formatted.text.length, truncated: formatted.truncated },
+        content: [{ type: "text", text: result.formatted.text }],
+        details: { source: result.source ?? "session-entries", count: result.source === "session-summary" ? result.evidenceCount : result.hits.length, chars: result.formatted.text.length, truncated: result.formatted.truncated },
       };
     },
   } as any);
 
   pi.registerCommand("pi-compact-recall", {
-    description: "仅在界面显示历史，不发送给模型；支持 scope:all 与 raw 分段读取",
+    description: "仅在界面显示历史或当前 session 摘要，不发送给模型；支持 scope:all 与 raw 分段读取",
     handler: async (args: string, ctx: any) => {
       const input = parseCommand(args);
       const { formatted } = outputFor(input, ctx, true);

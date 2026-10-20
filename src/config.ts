@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AutoRecallMode, HistorySettings, MemorySettings, PiCompactConfig, WindowSettings } from "./types.ts";
+import type { AutoRecallMode, HistorySettings, MemorySettings, PiCompactConfig, SessionSummarySettings, WindowSettings } from "./types.ts";
 
 export const DEFAULT_CONFIG: PiCompactConfig = {
   enabled: true,
@@ -26,6 +26,12 @@ export const DEFAULT_CONFIG: PiCompactConfig = {
   },
   window: {
     manifest: true,
+  },
+  sessionSummary: {
+    enabled: true,
+    inject: true,
+    maxChars: 6000,
+    maxEvidence: 80,
   },
 };
 
@@ -89,6 +95,16 @@ const normalizeWindow = (parsed: Record<string, unknown>): WindowSettings => {
   };
 };
 
+const normalizeSessionSummary = (parsed: Record<string, unknown>): SessionSummarySettings => {
+  const nested = asRecord(parsed.sessionSummary) ?? {};
+  return {
+    enabled: booleanField(nested.enabled, DEFAULT_CONFIG.sessionSummary.enabled),
+    inject: booleanField(nested.inject, DEFAULT_CONFIG.sessionSummary.inject),
+    maxChars: positiveInteger(nested.maxChars, DEFAULT_CONFIG.sessionSummary.maxChars, 30_000),
+    maxEvidence: Math.max(2, positiveInteger(nested.maxEvidence, DEFAULT_CONFIG.sessionSummary.maxEvidence, 500)),
+  };
+};
+
 const normalizeConfig = (value: unknown): PiCompactConfig => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return DEFAULT_CONFIG;
   const parsed = value as Record<string, unknown>;
@@ -107,6 +123,7 @@ const normalizeConfig = (value: unknown): PiCompactConfig => {
     memory: normalizeMemory(parsed),
     history: normalizeHistory(parsed),
     window: normalizeWindow(parsed),
+    sessionSummary: normalizeSessionSummary(parsed),
   };
 };
 

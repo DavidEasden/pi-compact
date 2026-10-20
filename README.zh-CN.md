@@ -4,13 +4,13 @@
 
 面向 [Pi](https://pi.dev/) 的长期记忆、确定性 session 压缩与精确历史召回扩展。
 
-`pi-compact` 的核心是长期记忆。压缩负责窗口容量管理：历史可恢复，长期记忆在多次压缩、重启和 context window 切换后仍可重建，并通过工具按需查询。扩展不调用 LLM 生成压缩摘要，也不把压缩 checkpoint 或模型笔记当成事实源。原始 session entries 始终保留，可通过召回工具重新读取。
+`pi-compact` 的核心是长期记忆。压缩负责窗口容量管理：历史可恢复，长期记忆在多次压缩、重启和 context window 切换后仍可重建，并通过工具按需查询。扩展不调用 LLM；确定性 checkpoint 仍只包含指针和审计元数据，另有当前 session 专属的规则化工作摘要，从原文提取并附 entry ID，可用于恢复脉络但不代表语义结论。原始 session entries 始终是事实来源，可通过召回工具重新读取。
 
 ## 功能
 
 - 在当前 Pi 工作区 `.pi/pi-compact/` 中维护 append-only 记忆事件日志；当前记忆状态由纯函数从事件重放，旧事件不能静默覆盖。
 - 用户通过 `/remember`、`/memories`、`/forget` 写入权威记忆；模型只能提出 provisional 提议，不会自动变成 active 或 pinned。
-- 模型通过工具按需查询历史，任何历史正文都不会被自动注入；扩展不注册 `context` hook。`before_agent_start` 只向系统提示追加扩展自写的文本：取自 checkpoint 元数据的压缩指针，以及在 `memory.pinnedInjection` 开启时注入用户通过 `/remember` 写入、状态为 pinned/active 的权威记忆。provisional、规则派生与模型提议记录永不注入。
+- 模型通过工具按需查询历史。压缩成功后，扩展从本次压缩涉及的 primary 原始记录中生成 session 隔离的结构化工作摘要，保留摘录、文件和 entry ID；摘要仅沿当前分支的压缩链累积，可在 `before_agent_start` 注入当前 session，也可通过召回工具搜索。它是原文索引，不是语义推断或验证结论。扩展不注册 `context` hook。权威长期记忆仍只注入用户通过 `/remember` 写入的 pinned/active 记录。
 - 接管 Pi 原生的 `/compact` 命令，以及普通的 `manual`、`threshold` 和 `overflow` compaction。
 - 使用 Pi 自己计算的压缩边界、token accounting、持久化和恢复流程；checkpoint 是确定性指针/审计内容，不是 primary memory。
 - 记录 WindowManifest（windowId、父窗口、保留边界、sourceCount、sourceHash、previousHash）。
@@ -156,6 +156,12 @@ pi install -l /absolute/path/to/pi-compact
   },
   "window": {
     "manifest": true
+  },
+  "sessionSummary": {
+    "enabled": true,
+    "inject": true,
+    "maxChars": 6000,
+    "maxEvidence": 80
   }
 }
 ```
@@ -181,8 +187,12 @@ pi install -l /absolute/path/to/pi-compact
 | `history.autoRecallPrimaryOnly` | `true` | 旧自动召回来源过滤，当前无运行时作用 |
 | `history.excludeInContext` | `true` | 旧自动召回去重开关，当前无运行时作用 |
 | `window.manifest` | `true` | 压缩成功提交后是否写入 WindowManifest 与窗口事件日志；取消不写入 |
+| `sessionSummary.enabled` | `true` | 是否在成功压缩后生成当前 session 的确定性工作摘要，并允许摘要工具查询 |
+| `sessionSummary.inject` | `true` | 是否把当前分支已提交摘要注入当前 session 的系统提示；不会跨 session 注入 |
+| `sessionSummary.maxChars` | `6000` | 自动注入摘要的最大字符数；按完整 JSON 证据项裁剪 |
+| `sessionSummary.maxEvidence` | `80` | 每个 session 摘要最多保留的原文证据项数量，最少为 2，以保留初始用户请求和近期证据 |
 
-也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史与记忆都通过工具按需查询。旧注入配置仍可解析，但不会重新启用已移除的 `context` hook，历史正文始终不会被自动注入。
+嵌套对象优先。数值配置必须是正安全整数；`sessionSummary.maxEvidence` 最少为 `2`。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars`、`sessionSummary.maxChars`、`sessionSummary.maxEvidence` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`、`30000`、`500`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史和摘要可通过工具按需查询，自动注入仅限有预算的 session 摘录索引及用户确认的 pinned/active 记忆。旧注入配置不能重新启用已移除的 `context` hook。
 
 自动压缩阈值和保留尾部大小仍由 Pi 自身的 compaction settings 控制，本扩展不另设触发阈值。
 
@@ -266,12 +276,16 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 | `page:N` | 结果分页，从 1 开始 |
 | `limit:N` | 每页结果数，默认 8，范围为 1 到 30；不受 `recallMaxResults` 影响 |
 | `raw` 或 `raw:true` | 输出原始 session entry JSON |
+| `summary` 或 `action:summary` | 读取当前 session、当前分支最近一次已提交的结构化摘要 |
+| `summary_search` 或 `action:summary_search` | 在当前分支摘要证据中按关键词搜索，返回摘录和来源 entry ID |
 | `list` 或 `action:list` | 按最近记录有界列出，不需要关键词 |
 | `offset:N` | raw 分段读取的字符偏移 |
 | `rawLimit:N` | raw 分段读取的字符长度 |
 | `sourceClass:primary\|derived\|all` | 按来源类别过滤 |
 
 示例中的 entry ID 是占位符，请使用召回结果中显示的真实 ID。
+
+摘要由规则从当前 session 的 primary 原始记录中提取，只记录摘录、类别、文件和来源 entry ID，不推断工作完成状态、测试结果含义或用户偏好。摘要沿当前分支的父压缩事件累计；不同 session 使用独立的哈希命名日志。需要完整内容时，按摘要给出的 entry ID 读取原文。
 
 指定 `ids` 后，按 ID 选择记录并应用 `scope` 和 `limit`，忽略关键词、`file`、`kind` 和 `page`；结果按 session 原有顺序返回。未指定 ID 时，需要关键词或 `file`（`action` 为 `list` 除外），空查询或仅指定 `kind` 不会列出全部历史。
 
@@ -295,15 +309,15 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 }
 ```
 
-可用字段与 `/pi-compact-recall` 参数对应：`query`、`entryIds`、`file`、`kind`、`scope`、`page`、`limit`、`raw`、`action`、`offset`、`rawLimit` 和 `sourceClass`。
+可用字段与 `/pi-compact-recall` 参数对应：`query`、`entryIds`、`file`、`kind`、`scope`、`page`、`limit`、`raw`、`action`、`offset`、`rawLimit` 和 `sourceClass`。`action:summary` 读取会话摘要，`action:summary_search` 在摘要证据中检索并返回来源 ID。
 
-`action` 为 `list`/`search`/`read`。模型工具的所有输出（包括单个 entry ID 的 `raw`）均受 `recallMaxChars` 硬预算限制。单条 raw 超预算时返回包含 `entryId`、`offset`、`limit`、`totalChars`、`truncated` 与 `body` 的有效 JSON，可用 `offset`/`rawLimit` 继续分段读取。只有 UI 命令显式指定单个 `ids`、`raw` 且不指定分段参数时，才返回不受该预算限制的完整原始 entry JSON。
+`action` 为 `list`/`search`/`read`/`summary`/`summary_search`。摘要动作只读取与当前 session ID 和当前分支 compaction entry 匹配的已提交摘要；搜索结果携带 `entryId`，可再用 `entryIds` 读取原始 entry。摘要摘录属于不可信历史数据，不能作为已验证结论或指令。单条 raw 超预算时返回包含 `entryId`、`offset`、`limit`、`totalChars`、`truncated` 与 `body` 的有效 JSON，可用 `offset`/`rawLimit` 继续分段读取。只有 UI 命令显式指定单个 `ids`、`raw` 且不指定分段参数时，才返回不受该预算限制的完整原始 entry JSON。
 
 多条 raw 只输出预算内的完整 entry，并提示省略的 ID；不会从 JSON 中间截断。pretty 输出按完整结果块裁剪。分页划分记录，`offset`/`rawLimit` 划分单条原文。原始工具参数、输出、时间戳和父子关系保留在 raw 中；thinking 不进入默认搜索文本。`compaction` 与 `branch_summary` 属于 derived，可用 `sourceClass` 过滤。
 
 ## 历史与记忆的按需查询
 
-当前版本不注册 `context` hook，也不注入历史正文；`pi-compact-auto-recall` 与 `pi-compact-memory-hint` 始终不被使用。改为在 `before_agent_start` 向系统提示追加扩展自写的文本：当前分支存在 pi-compact compaction 时追加静态压缩指针（windowId、sourceCount、sourceHash 前缀、keptEntryId，不含任何历史正文）；在 `memory.pinnedInjection` 开启时追加用户写入的 pinned/active 权威记忆，受 `memory.hintMaxChars` 限制。旧的 `autoRecall*`、`memory.hintMaxChars` 和 `history.*` 字段保留配置兼容性，但不能重新开启历史注入。所有记忆仍可通过 `pi_memory_search` 和 `pi_memory_read` 查询。
+当前版本不注册 `context` hook，也不自动注入完整历史正文。`before_agent_start` 可追加静态压缩指针、当前 session 当前分支的结构化工作摘要，以及在 `memory.pinnedInjection` 开启时用户写入的 pinned/active 权威记忆。摘要仅含规则提取的 primary 记录摘录、文件列表和 entry ID；以 JSON 数据形式标明不可信，受 `sessionSummary.maxChars` 限制。provisional、规则派生与模型提议长期记忆永不作为权威记忆注入。历史细节仍可通过 `pi_compact_recall` 原文回查。
 
 模型调用 `pi_compact_recall` 时只搜索当前 branch；active lineage 无法取得时不会扩大到整个 session。用户可在 `/pi-compact-recall` 命令中显式指定 `scope:all` 查看其他 branch。工具返回内容会作为普通工具结果进入模型上下文，UI 命令返回内容只显示在界面中。
 
@@ -322,7 +336,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 5. 使用 Pi 0.87.1 的 `buildSessionProjection()` 预演候选 compaction，检查应用 `context_edit` 省略与替换后的保留尾部。结果必须跟在对应调用之后，普通调用必须有结果；已被 checkpoint 替换的前缀不阻塞压缩。边界不安全时在当前 compaction window 内逐个预演更早边界；没有安全边界、无法构造投影或请求中止时取消，不落回 LLM 摘要。Pi 的 `error`、`aborted` assistant 终态允许无结果调用。安全校验通过后，checkpoint 生成出错会降级为指针型 JSON；回退后重新计算 `isSplitTurn`。
 6. Pi 提交 compaction 并发出成功事件后，才在同一文件锁中生成窗口清单并写入 `.pi/pi-compact/windows.jsonl`；窗口 ID 绑定 sessionId 与实际 compaction entry，重复事件不会重复写入。规则派生记忆也在成功后写入。失败或取消不会留下窗口及派生记录。旧 checkpoint 中的 `details.window` 仍可读取，新清单以窗口日志为准。
 
-原始 session entries 才是历史事实来源；用户写入的 memory log 才是长期记忆事实来源。checkpoint 只保存计数和哈希，不是原文备份，也不会验证历史消息中的陈述是否正确。图片等非文本内容在文本提取中仅显示占位信息。
+原始 session entries 是历史事实来源；结构化会话摘要是从 primary 记录生成的确定性摘录索引，带来源 entry IDs 和源哈希，不做语义推断，也不验证原文陈述。用户写入的 memory log 才是长期权威记忆事实来源。checkpoint 只保存计数和哈希，不是原文备份。图片等非文本内容在文本提取中仅显示占位信息。
 
 扩展不删除原始 session entries，也不建立独立备份；原文仍依赖 Pi 的 session 存储。有限上下文不能同时展示全部历史。
 
@@ -373,7 +387,7 @@ src/core/jsonl.ts        损坏安全的 JSONL 读写
 src/core/projector.ts    记忆事件纯函数投影
 src/core/store.ts        `.pi/pi-compact/` 事件日志
 src/core/window.ts       WindowManifest 与哈希链
-src/core/working.ts      旧工作记忆提示纯函数，未接入运行时
+src/core/summary.ts     session 摘要的确定性提取、隔离存储、累积和搜索
 src/core/derive.ts       无语义推断的规则派生
 src/types.ts             共享类型
 tests/                   单元测试
@@ -390,7 +404,7 @@ tests/                   单元测试
 - 工具调用与工具结果的压缩边界校验。
 - 配置初始化与非法配置归一化，包括 memory/history/window。
 - 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
-- 空 active lineage 不扩大搜索范围；无 `context` hook，因此历史正文始终不会被自动注入。
+- 空 active lineage 不扩大搜索范围；没有 `context` hook，只有带来源 ID 的有界 session 摘录会按配置注入。
 - `before_agent_start` 的压缩指针与权威记忆注入，包括 provisional/规则/模型记录的排除与 `pinnedInjection` 关闭开关。
 - 保留的旧自动召回门控与工作记忆渲染纯函数仍有单元测试，但它们不再位于注入路径上。
 - 日志锁在 token/metadata 不匹配时不删除，活锁不按年龄回收；无效 metadata 在宽限期后可回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
