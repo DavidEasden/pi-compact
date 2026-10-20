@@ -31,6 +31,13 @@ export interface WindowSettings {
   manifest: boolean;
 }
 
+export interface SessionSummarySettings {
+  enabled: boolean;
+  inject: boolean;
+  maxChars: number;
+  maxEvidence: number;
+}
+
 export interface PiCompactConfig {
   enabled: boolean;
   overrideDefaultCompaction: boolean;
@@ -44,6 +51,7 @@ export interface PiCompactConfig {
   memory: MemorySettings;
   history: HistorySettings;
   window: WindowSettings;
+  sessionSummary: SessionSummarySettings;
 }
 
 export interface HistoryRecord {

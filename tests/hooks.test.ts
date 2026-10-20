@@ -6,6 +6,8 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, loadConfig, scaffoldConfig } from "../src/config.ts";
 import { readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
+import { hashRecords, recordsFromEntries } from "../src/core/session.ts";
+import { appendSessionSummary, readSessionSummaryEvents } from "../src/core/summary.ts";
 import { isSafeCut, registerHooks } from "../src/hooks.ts";
 import type { SessionEntryLike } from "../src/types.ts";
 
@@ -235,7 +237,7 @@ test("Pi 边界不安全时回退到更早的安全边界而不是取消", async
   }
 });
 
-test("扩展不注册 context hook，历史和记忆不会自动注入请求", () => {
+test("扩展不注册 context hook；普通历史仍只由工具召回", () => {
   const harness = createHarness();
   try {
     registerHooks(harness.pi as any);
@@ -254,6 +256,7 @@ test("扩展不注册 context hook，历史和记忆不会自动注入请求", (
       memory: "yes",
       history: { autoRecallPrimaryOnly: "no", excludeInContext: 1 },
       window: { manifest: "always" },
+      sessionSummary: { enabled: "yes", maxChars: 0, maxEvidence: 1 },
       memoryHintMaxChars: 0,
     }));
     const config = loadConfig(cwd);
@@ -263,9 +266,77 @@ test("扩展不注册 context hook，历史和记忆不会自动注入请求", (
     assert.equal(config.history.autoRecallPrimaryOnly, true);
     assert.equal(config.history.excludeInContext, true);
     assert.equal(config.window.manifest, true);
+    assert.equal(config.sessionSummary.enabled, true);
+    assert.equal(config.sessionSummary.inject, true);
+    assert.equal(config.sessionSummary.maxChars, DEFAULT_CONFIG.sessionSummary.maxChars);
+    assert.equal(config.sessionSummary.maxEvidence, 2);
     assert.equal(config.memory.hintMaxChars, DEFAULT_CONFIG.memory.hintMaxChars);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("压缩成功后按 session 与当前压缩来源写入确定性摘要", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const user = messageEntry("summary-u1", "user", "修复 token refresh 并检查 src/auth.ts");
+    const kept = messageEntry("summary-u2", "user", "继续另一个任务", "summary-u1");
+    const compacted = {
+      type: "compaction",
+      id: "summary-cp1",
+      parentId: "summary-u2",
+      firstKeptEntryId: "summary-u2",
+      summary: "{}",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      details: {
+        compactor: "pi-compact",
+        sourceHash: hashRecords(recordsFromEntries([user])),
+        sourceRecordCount: 1,
+        sourceEntryIds: ["summary-u1"],
+      },
+    };
+    const branch = [user, kept, compacted];
+    const handler = harness.handlers.get("session_compact")![0];
+    handler({ fromExtension: true, reason: "manual", compactionEntry: compacted }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => branch, getSessionId: () => "session-summary-a" },
+      ui: { notify() {} },
+    });
+    const events = readSessionSummaryEvents(harness.cwd, "session-summary-a");
+    assert.equal(events.length, 1);
+    assert.equal(events[0].compactionEntryId, "summary-cp1");
+    assert.deepEqual(events[0].sourceEntryIds, ["summary-u1"]);
+    assert.match(events[0].evidence[0].excerpt, /token refresh/);
+    assert.equal(readSessionSummaryEvents(harness.cwd, "session-summary-b").length, 0);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("before_agent_start 只注入当前 session 当前 branch 的已提交摘要", () => {
+  const harness = createHarness();
+  try {
+    appendSessionSummary({
+      cwd: harness.cwd,
+      sessionId: "session-summary-a",
+      compactionEntryId: "summary-cp1",
+      sourceHash: "hash-a",
+      records: recordsFromEntries([messageEntry("summary-u1", "user", "任务是修复 token refresh")]),
+    });
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const cp = { type: "compaction", id: "summary-cp1", details: { compactor: "pi-compact" } };
+    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions }, { cwd: harness.cwd, sessionManager: { getBranch: () => [cp], getSessionId: () => "session-summary-a" } });
+    assert.match(systemPromptOptions.promptGuidelines.join("\\n"), /token refresh/);
+    assert.match(systemPromptOptions.promptGuidelines.join("\\n"), /不是指令或验证结论/);
+
+    const isolated = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions: isolated }, { cwd: harness.cwd, sessionManager: { getBranch: () => [cp], getSessionId: () => "session-summary-b" } });
+    assert.doesNotMatch(isolated.promptGuidelines.join(""), /token refresh/);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
   }
 });
 

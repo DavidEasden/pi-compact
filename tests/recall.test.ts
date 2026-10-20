@@ -189,6 +189,49 @@ test("长 raw 支持 offset/limit 分段读取", () => {
   assert.ok(parsed.totalChars > 12);
 });
 
+test("pi_compact_recall 可读写入当前 session 的摘要并按关键词搜索来源", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-compact-recall-summary-"));
+  try {
+    mkdirSync(join(cwd, ".pi"));
+    writeFileSync(join(cwd, ".pi", "pi-compact.json"), JSON.stringify(DEFAULT_CONFIG));
+    const { appendSessionSummary } = await import("../src/core/summary.ts");
+    appendSessionSummary({
+      cwd,
+      sessionId: "summary-session-a",
+      compactionEntryId: "summary-cp-a",
+      sourceHash: "summary-hash",
+      records: recordsFromEntries([
+        { type: "message", id: "summary-u1", message: { role: "user", content: "修复 token refresh" } },
+        { type: "message", id: "summary-u2", message: { role: "user", content: "运行认证测试" } },
+      ]),
+    });
+    let tool: any;
+    registerRecall({ registerTool(definition: any) { tool = definition; }, registerCommand() {} } as any);
+    const ctx = {
+      cwd,
+      sessionManager: {
+        getSessionId: () => "summary-session-a",
+        getBranch: () => [{ type: "compaction", id: "summary-cp-a", details: { compactor: "pi-compact" } }],
+        getEntries: () => [],
+      },
+    };
+    const summary = await tool.execute("call-summary", { action: "summary" }, new AbortController().signal, undefined, ctx);
+    assert.equal(summary.details.source, "session-summary");
+    assert.match(summary.content[0].text, /summary-u1/);
+    const hits = await tool.execute("call-summary-search", { action: "summary_search", query: "token" }, new AbortController().signal, undefined, ctx);
+    assert.equal(hits.details.count, 1);
+    assert.match(hits.content[0].text, /summary-u1/);
+    assert.match(parseCommand("summary_search token").query ?? "", /token/);
+    const otherSession = await tool.execute("call-other", { action: "summary" }, new AbortController().signal, undefined, {
+      ...ctx,
+      sessionManager: { ...ctx.sessionManager, getSessionId: () => "summary-session-b" },
+    });
+    assert.equal(otherSession.details.count, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("注册的召回工具对单条 raw 也执行硬预算并固定当前 branch", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-compact-recall-"));
   try {
