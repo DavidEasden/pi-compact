@@ -439,7 +439,6 @@ export const registerHooks = (pi: ExtensionAPI): void => {
             .map((item) => item.id)
             .filter((id): id is string => typeof id === "string");
           const previous = sessionSummaryForBranch(ctx.cwd, sessionId, currentCompactionIds);
-          const summaryStartedAt = Date.now();
           const summary = appendSessionSummary({
             cwd: ctx.cwd,
             sessionId,
