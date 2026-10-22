@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, loadConfig, scaffoldConfig } from "../src/config.ts";
-import { loadMemories, readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
+import { appendMemoryEvent, loadMemories, readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
 import { hashRecords, recordsFromEntries } from "../src/core/session.ts";
 import { appendSessionSummary, readSessionSummaryEvents } from "../src/core/summary.ts";
 import { isSafeCut, registerHooks } from "../src/hooks.ts";
@@ -306,6 +306,15 @@ test("压缩成功后按 session 与当前压缩来源写入确定性摘要", ()
   const harness = createHarness();
   try {
     registerHooks(harness.pi as any);
+    appendMemoryEvent(harness.cwd, {
+      type: "create",
+      recordId: "mem_rule_legacy_workspace",
+      author: "rule",
+      payload: {
+        kind: "derived", content: "legacy workspace fact", scope: "workspace", status: "provisional", priority: "low",
+        sourceEntryIds: [], sourceHash: "legacy-hash", provenance: "rule:command",
+      },
+    });
     const user = messageEntry("summary-u1", "user", "修复 token refresh 并检查 src/auth.ts");
     const command = messageEntry("summary-b1", "bashExecution", "3 passed, 0 failed", "summary-u1", {
       command: "npm test", output: "3 passed, 0 failed", exitCode: 0,
@@ -337,10 +346,11 @@ test("压缩成功后按 session 与当前压缩来源写入确定性摘要", ()
     assert.equal(events[0].compactionEntryId, "summary-cp1");
     assert.deepEqual(events[0].sourceEntryIds, ["summary-u1", "summary-b1"]);
     assert.match(events[0].evidence[0].excerpt, /token refresh/);
-    const facts = loadMemories(harness.cwd).filter((record) => record.author === "rule");
+    const facts = loadMemories(harness.cwd).filter((record) => record.author === "rule" && record.status === "provisional");
     assert.ok(facts.length > 0);
     assert.ok(facts.every((record) => record.scope === "session" && record.sessionId === "session-summary-a" && record.status === "provisional"));
     assert.ok(facts.some((record) => record.content === "command: npm test exitCode=0"));
+    assert.equal(loadMemories(harness.cwd).find((record) => record.id === "mem_rule_legacy_workspace")?.status, "resolved");
     const memoryCount = readMemoryEvents(harness.cwd).length;
     handler({ fromExtension: true, reason: "manual", compactionEntry: compacted }, {
       cwd: harness.cwd,

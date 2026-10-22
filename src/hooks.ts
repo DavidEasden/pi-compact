@@ -123,11 +123,18 @@ const persistDerived = (
   records: ReturnType<typeof recordsFromProjectedEntries>,
   sourceHash: string,
   sessionId: string | undefined,
-): { candidateCount: number; createdCount: number; candidateChars: number } => {
+): { candidateCount: number; createdCount: number; candidateChars: number; migratedCount: number } => {
   // 自动派生事实是会话工作记忆；没有可验证的 session 身份时不写入，避免退化成 workspace 记忆。
-  if (!sessionId) return { candidateCount: 0, createdCount: 0, candidateChars: 0 };
+  if (!sessionId) return { candidateCount: 0, createdCount: 0, candidateChars: 0, migratedCount: 0 };
   return withMemoryLogLock(cwd, () => {
     const existingRecords = loadMemories(cwd);
+    // 升级时关闭旧版可能跨 session 可见的规则派生 workspace 记录；用户确认过的 author=user 记录不受影响。
+    const legacyWorkspaceRules = existingRecords.filter((record) => (
+      record.author === "rule" && record.scope === "workspace" && record.status === "provisional" && record.provenance?.startsWith("rule:")
+    ));
+    for (const record of legacyWorkspaceRules) {
+      appendMemoryEvent(cwd, { type: "resolve", recordId: record.id, author: "rule", sessionId, payload: {} });
+    }
     const existing = new Set(existingRecords.map((record) => record.id));
     // 只在同一 session 内按事实内容去重；其他 session 的同内容事实仍需各自可见。
     const existingFacts = new Set(existingRecords
@@ -153,6 +160,7 @@ const persistDerived = (
       candidateCount: drafts.length,
       createdCount,
       candidateChars: drafts.reduce((total, draft) => total + draft.payload.content.length, 0),
+      migratedCount: legacyWorkspaceRules.length,
     };
   });
 };
@@ -197,7 +205,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       const messages = Array.isArray(request.messages) ? request.messages : Array.isArray(request.input) ? request.input : [];
       const leadingMessages = messages.filter((message: any) => message?.role === "system" || message?.role === "developer");
       const prefix = {
-        system: request.system ?? leadingMessages,
+        system: request.system ?? request.instructions ?? leadingMessages,
         tools: request.tools ?? request.functions ?? [],
       };
       const prefixText = JSON.stringify(prefix);
@@ -456,7 +464,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
         try {
           const stats = persistDerived(ctx.cwd, records, details.sourceHash, sessionId);
           if (config.debug) {
-            console.log(`[pi-compact] derived-memory: candidates=${stats.candidateCount} created=${stats.createdCount} candidateChars=${stats.candidateChars} estimatedTokens=${estimateTokensFromChars(stats.candidateChars)} durationMs=${Date.now() - startedAt} scope=session`);
+            console.log(`[pi-compact] derived-memory: candidates=${stats.candidateCount} created=${stats.createdCount} migrated=${stats.migratedCount} candidateChars=${stats.candidateChars} estimatedTokens=${estimateTokensFromChars(stats.candidateChars)} durationMs=${Date.now() - startedAt} scope=session`);
           }
         } catch (error) {
           if (config.debug) console.log(`[pi-compact] derived-memory: result=error reason=${error instanceof Error ? error.name : "unknown"} durationMs=${Date.now() - startedAt}`);

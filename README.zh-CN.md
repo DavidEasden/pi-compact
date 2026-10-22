@@ -243,7 +243,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 换窗工具只在压缩成功回调之后发起一次续跑。工具批次被用户中止、压缩失败或取消、会话切换，或已有新输入时，不会擅自续跑；失败仍可使用 Pi 原生 `/compact` 重试。
 
-规则派生记忆带 `author=rule` 与 provenance，状态为 provisional，不是用户确认的事实；它们使用 `scope=session`，只在生成它们的 session 中可见。除文件、命令、测试计数外，提取器只从用户原文中挑选带有“偏好/默认/始终/本项目”等持续性标记的短句，归类为 preference、constraint 或 decision；不分析 assistant 自述，不从普通请求推断长期偏好，也会跳过疑似凭据内容。没有有效 sessionId 时不会自动生成。候选必须由用户检查后通过 `/remember` 另行确认，不能自动升级或注入。
+规则派生记忆带 `author=rule` 与 provenance，状态为 provisional，不是用户确认的事实；它们使用 `scope=session`，只在生成它们的 session 中可见。除文件、命令、测试计数外，提取器只从用户原文中挑选带有“偏好/默认/始终/本项目”等持续性标记的短句，归类为 preference、constraint 或 decision；不分析 assistant 自述，不从普通请求推断长期偏好，也会跳过疑似凭据内容。没有有效 sessionId 时不会自动生成。用户确认前始终保持 provisional，不会自动升级或注入；旧版写入的规则型 workspace provisional 记录会在下次成功压缩时标记为 resolved，用户写入的记录不受影响。
 
 `debug=true` 时会记录摘要/派生候选计数、字符及 token 估算、处理耗时、失败类别，以及 Pi `before_provider_request` 边界上的 payload/稳定前缀哈希与长度；assistant usage 中会记录 provider 报告的 input/output/cacheRead/cacheWrite。日志不含 prompt 或记忆正文。哈希/前缀稳定只验证扩展实际观察到的 provider payload；cacheRead/cacheWrite 是 provider 报告值，是否产生真实成本收益仍取决于 provider 与服务端实现，不由扩展保证。
 
