@@ -53,7 +53,7 @@ export async function createHarness(options = {}) {
     getExtensions: () => loaded,
     getSkills: () => ({ skills: [], diagnostics: [] }), getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }), getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => "仅用于本地集成测试。", getSystemPromptSource: () => undefined,
+    getSystemPrompt: () => options.systemPrompt === null ? undefined : options.systemPrompt ?? "仅用于本地集成测试。", getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [], extendResources() {}, async reload() {},
   };
   const sm = options.persistent ? SessionManager.create(cwd, join(cwd, "sessions")) : SessionManager.inMemory(cwd);

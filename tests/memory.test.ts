@@ -383,18 +383,21 @@ test("规则派生只提取文件、命令、退出码和测试计数", () => {
     { type: "message", id: "a1", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "src/a.ts" } }] } },
     { type: "message", id: "b1", message: { role: "bashExecution", command: "npm test", output: "3 passed, 1 failed", exitCode: 1 } },
   ]);
-  const facts = deriveFacts(records, "hash");
+  const facts = deriveFacts(records, "hash", "session-a");
   assert.ok(facts.some((fact) => fact.payload.content === "file: src/a.ts"));
   assert.ok(facts.some((fact) => fact.payload.content === "command: npm test exitCode=1"));
   assert.ok(facts.some((fact) => fact.payload.content === "tests: 3 passed, 1 failed"));
   assert.equal(facts.every((fact) => fact.payload.status === "provisional" && fact.payload.kind === "derived"), true);
+  assert.equal(facts.every((fact) => fact.payload.scope === "session"), true);
+  assert.equal(facts.every((fact) => fact.recordId.startsWith("mem_rule_")), true);
+  assert.equal(deriveFacts(records, "hash", "session-b")[0].recordId === facts[0].recordId, false);
   assert.equal(facts.some((fact) => fact.payload.content.includes("目标")), false);
 
   const repeatedWindow = recordsFromEntries([
     { type: "message", id: "a2", message: { role: "assistant", content: [{ type: "toolCall", id: "c2", name: "read", arguments: { path: "src/a.ts" } }] } },
     { type: "message", id: "b2", message: { role: "bashExecution", command: "npm test", output: "3 passed, 1 failed", exitCode: 1 } },
   ]);
-  const repeatedFacts = deriveFacts(repeatedWindow, "later-hash");
+  const repeatedFacts = deriveFacts(repeatedWindow, "later-hash", "session-a");
   for (const content of ["file: src/a.ts", "command: npm test exitCode=1", "tests: 3 passed, 1 failed"]) {
     const first = facts.find((fact) => fact.payload.content === content)!;
     const later = repeatedFacts.find((fact) => fact.payload.content === content)!;
@@ -402,6 +405,26 @@ test("规则派生只提取文件、命令、退出码和测试计数", () => {
     assert.equal(later.payload.provenance, first.payload.provenance);
   }
   assert.equal(repeatedFacts.filter((fact) => fact.payload.content === "file: src/a.ts").length, 1);
+});
+
+test("只从用户明确且带持续性标记的原文提取偏好、约束和决策候选", () => {
+  const records = recordsFromEntries([
+    { type: "message", id: "u-pref", message: { role: "user", content: "我偏好 TypeScript；以后请默认使用 pnpm。" } },
+    { type: "message", id: "u-rule", message: { role: "user", content: "本项目的代码注释必须使用中文。" } },
+    { type: "message", id: "u-decision", message: { role: "user", content: "本项目决定采用 Node.js 22。" } },
+    { type: "message", id: "u-weak", message: { role: "user", content: "请使用 npm 执行这次测试。" } },
+    { type: "message", id: "a-fake", message: { role: "assistant", content: "本项目必须使用错误的选择。" } },
+    { type: "message", id: "u-secret", message: { role: "user", content: "本项目保存 api_key: abc123。" } },
+  ]);
+  const drafts = deriveFacts(records, "source-hash", "session-a");
+  const candidates = drafts.filter((draft) => draft.payload.kind !== "derived");
+  assert.deepEqual(candidates.map((draft) => [draft.payload.kind, draft.payload.content, draft.payload.sourceEntryIds]), [
+    ["preference", "我偏好 TypeScript;", ["u-pref"]],
+    ["preference", "以后请默认使用 pnpm。", ["u-pref"]],
+    ["constraint", "本项目的代码注释必须使用中文。", ["u-rule"]],
+    ["decision", "本项目决定采用 Node.js 22。", ["u-decision"]],
+  ]);
+  assert.ok(candidates.every((draft) => draft.payload.scope === "session" && draft.payload.status === "provisional" && draft.payload.priority === "low"));
 });
 
 test("窗口 manifest 写入哈希链并可 round-trip", () => {

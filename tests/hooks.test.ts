@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, loadConfig, scaffoldConfig } from "../src/config.ts";
-import { readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
+import { loadMemories, readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
 import { hashRecords, recordsFromEntries } from "../src/core/session.ts";
 import { appendSessionSummary, readSessionSummaryEvents } from "../src/core/summary.ts";
 import { isSafeCut, registerHooks } from "../src/hooks.ts";
@@ -27,6 +27,32 @@ const createHarness = () => {
   };
   return { cwd, handlers, pi };
 };
+
+test("provider 调试只记录实际请求 payload 指纹与 provider usage，不记录正文", () => {
+  const harness = createHarness();
+  const messages: string[] = [];
+  const originalLog = console.log;
+  try {
+    writeFileSync(join(harness.cwd, ".pi", "pi-compact.json"), `${JSON.stringify({ ...DEFAULT_CONFIG, debug: true })}\n`);
+    registerHooks(harness.pi as any);
+    console.log = (...args: unknown[]) => messages.push(args.join(" "));
+    const request = harness.handlers.get("before_provider_request")![0];
+    const payload = { system: "private system prompt", messages: [{ role: "user", content: "private user prompt" }], tools: [{ name: "private_tool" }] };
+    request({ type: "before_provider_request", payload }, { cwd: harness.cwd });
+    request({ type: "before_provider_request", payload }, { cwd: harness.cwd });
+    harness.handlers.get("message_end")![0]({ message: { role: "assistant", api: "test-api", model: "local", usage: { input: 12, output: 4, cacheRead: 8, cacheWrite: 2 } } }, { cwd: harness.cwd });
+    assert.equal(messages.length, 3);
+    assert.match(messages[0], /payloadHash=[a-f0-9]{16} .*prefixHash=[a-f0-9]{16}/);
+    assert.equal(messages[0], messages[1], "identical provider payload has a stable fingerprint");
+    assert.match(messages[2], /cacheRead=8 cacheWrite=2/);
+    assert.equal(messages.join("\n").includes("private system prompt"), false);
+    assert.equal(messages.join("\n").includes("private user prompt"), false);
+    assert.equal(messages.join("\n").includes("private_tool"), false);
+  } finally {
+    console.log = originalLog;
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
 
 test("配置初始化会递归创建项目级 .pi 配置", () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-compact-config-"));
@@ -281,7 +307,10 @@ test("压缩成功后按 session 与当前压缩来源写入确定性摘要", ()
   try {
     registerHooks(harness.pi as any);
     const user = messageEntry("summary-u1", "user", "修复 token refresh 并检查 src/auth.ts");
-    const kept = messageEntry("summary-u2", "user", "继续另一个任务", "summary-u1");
+    const command = messageEntry("summary-b1", "bashExecution", "3 passed, 0 failed", "summary-u1", {
+      command: "npm test", output: "3 passed, 0 failed", exitCode: 0,
+    });
+    const kept = messageEntry("summary-u2", "user", "继续另一个任务", "summary-b1");
     const compacted = {
       type: "compaction",
       id: "summary-cp1",
@@ -291,12 +320,12 @@ test("压缩成功后按 session 与当前压缩来源写入确定性摘要", ()
       timestamp: "2026-01-01T00:00:00.000Z",
       details: {
         compactor: "pi-compact",
-        sourceHash: hashRecords(recordsFromEntries([user])),
-        sourceRecordCount: 1,
-        sourceEntryIds: ["summary-u1"],
+        sourceHash: hashRecords(recordsFromEntries([user, command])),
+        sourceRecordCount: 2,
+        sourceEntryIds: ["summary-u1", "summary-b1"],
       },
     };
-    const branch = [user, kept, compacted];
+    const branch = [user, command, kept, compacted];
     const handler = harness.handlers.get("session_compact")![0];
     handler({ fromExtension: true, reason: "manual", compactionEntry: compacted }, {
       cwd: harness.cwd,
@@ -306,8 +335,27 @@ test("压缩成功后按 session 与当前压缩来源写入确定性摘要", ()
     const events = readSessionSummaryEvents(harness.cwd, "session-summary-a");
     assert.equal(events.length, 1);
     assert.equal(events[0].compactionEntryId, "summary-cp1");
-    assert.deepEqual(events[0].sourceEntryIds, ["summary-u1"]);
+    assert.deepEqual(events[0].sourceEntryIds, ["summary-u1", "summary-b1"]);
     assert.match(events[0].evidence[0].excerpt, /token refresh/);
+    const facts = loadMemories(harness.cwd).filter((record) => record.author === "rule");
+    assert.ok(facts.length > 0);
+    assert.ok(facts.every((record) => record.scope === "session" && record.sessionId === "session-summary-a" && record.status === "provisional"));
+    assert.ok(facts.some((record) => record.content === "command: npm test exitCode=0"));
+    const memoryCount = readMemoryEvents(harness.cwd).length;
+    handler({ fromExtension: true, reason: "manual", compactionEntry: compacted }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => branch, getSessionId: () => "session-summary-a" },
+      ui: { notify() {} },
+    });
+    assert.equal(readMemoryEvents(harness.cwd).length, memoryCount, "replayed commit does not duplicate derived facts");
+    handler({ fromExtension: true, reason: "manual", compactionEntry: compacted }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => branch },
+      ui: { notify() {} },
+    });
+    assert.equal(readMemoryEvents(harness.cwd).length, memoryCount, "missing session identity does not create shared derived facts");
+    const isolated = loadMemories(harness.cwd).filter((record) => record.scope === "session" && record.sessionId === "session-summary-b");
+    assert.equal(isolated.length, 0);
     assert.equal(readSessionSummaryEvents(harness.cwd, "session-summary-b").length, 0);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });

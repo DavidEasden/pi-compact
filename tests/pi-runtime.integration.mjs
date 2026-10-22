@@ -201,7 +201,7 @@ test("Pi SDK：成功后提交窗口，重复事件去重，摘要相同也绑�
   try {
     h.sm.appendMessage({ role: "bashExecution", command: "npm test", output: "12 passed, 0 failed", exitCode: 0, cancelled: false, truncated: false, timestamp: Date.now() });
     h.sync();
-    h.queue(assistant("回复")); await h.session.prompt("检查 src/example.ts");
+    h.queue(assistant("回复")); await h.session.prompt("本项目的代码注释必须使用中文。请检查 src/example.ts");
     await h.session.compact();
     h.sm.appendMessage(user("第二次请求")); h.sm.appendMessage(assistant("第二次回复")); h.sync();
     await h.session.compact();
@@ -211,6 +211,10 @@ test("Pi SDK：成功后提交窗口，重复事件去重，摘要相同也绑�
     assert.equal(windows[1].parentWindowId, windows[0].windowId);
     assert.equal(windows[1].previousHash, windows[0].hash);
     assert.ok(rows(h.cwd, "memory").length > 0);
+    const derivedEvents = rows(h.cwd, "memory").filter((event) => event.author === "rule");
+    assert.ok(derivedEvents.length > 0);
+    assert.ok(derivedEvents.every((event) => event.payload.scope === "session" && event.sessionId === h.sm.getSessionId()));
+    assert.ok(derivedEvents.some((event) => event.payload.kind === "constraint" && event.payload.content === "本项目的代码注释必须使用中文。" && event.payload.status === "provisional"));
     const summaries = sessionSummaryRows(h.cwd);
     assert.equal(summaries.length, 2);
     assert.equal(summaries[1].parentCompactionEntryId, summaries[0].compactionEntryId);
@@ -223,6 +227,40 @@ test("Pi SDK：成功后提交窗口，重复事件去重，摘要相同也绑�
     assert.deepEqual(restored.buildSessionContext().messages, h.session.messages);
     assert.deepEqual(h.errors, []);
     assert.ok(emitSaved);
+  } finally { h.close(); }
+});
+
+test("Pi SDK：before_provider_request 观察 provider payload，稳定前缀可跨请求比较", async () => {
+  const payloads = [];
+  const h = await createHarness({
+    persistent: true,
+    config: { debug: true },
+    systemPrompt: null,
+    after: (pi) => pi.on("before_provider_request", (event) => payloads.push(structuredClone(event.payload))),
+  });
+  try {
+    h.sm.appendMessage(user("压缩前用户请求"));
+    h.sm.appendMessage(assistant("压缩前助手回复"));
+    h.sm.appendMessage(user("保留尾部"));
+    h.sync();
+    await h.session.compact();
+    const respond = async (context, options) => {
+      const payload = { messages: context.messages };
+      await options.onPayload?.(payload, options.model);
+      return assistant("本地 provider 回复");
+    };
+    h.queue(respond, respond);
+    await h.session.prompt("第一轮请求");
+    await h.session.prompt("第二轮请求");
+    assert.equal(payloads.length, 2);
+    const systemPrefix = (payload) => payload.messages.filter((message) => message.role === "system" || message.role === "developer");
+    assert.deepEqual(systemPrefix(payloads[0]), systemPrefix(payloads[1]));
+    assert.match(JSON.stringify(systemPrefix(payloads[0])), /pi-compact context pointer/);
+    assert.notDeepEqual(payloads[0].messages, payloads[1].messages, "变化的对话正文不属于稳定前缀");
+    const assistantResponses = h.events.filter((event) => event.type === "message_end" && event.message?.role === "assistant");
+    assert.equal(assistantResponses.length, 2);
+    assert.ok(assistantResponses[1].message.usage.cacheRead > 0, "记录 provider 报告的缓存读取量");
+    assert.deepEqual(h.errors, []);
   } finally { h.close(); }
 });
 

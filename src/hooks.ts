@@ -118,15 +118,24 @@ const sessionIdOf = (ctx: any): string | undefined => {
   }
 };
 
-const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromProjectedEntries>, sourceHash: string, sessionId?: string): void => {
-  withMemoryLogLock(cwd, () => {
+const persistDerived = (
+  cwd: string,
+  records: ReturnType<typeof recordsFromProjectedEntries>,
+  sourceHash: string,
+  sessionId: string | undefined,
+): { candidateCount: number; createdCount: number; candidateChars: number } => {
+  // 自动派生事实是会话工作记忆；没有可验证的 session 身份时不写入，避免退化成 workspace 记忆。
+  if (!sessionId) return { candidateCount: 0, createdCount: 0, candidateChars: 0 };
+  return withMemoryLogLock(cwd, () => {
     const existingRecords = loadMemories(cwd);
     const existing = new Set(existingRecords.map((record) => record.id));
-    // 兼容升级前 provenance 含 entryId 的规则记忆，避免按新 ID 再写入相同事实。
+    // 只在同一 session 内按事实内容去重；其他 session 的同内容事实仍需各自可见。
     const existingFacts = new Set(existingRecords
-      .filter((record) => record.author === "rule")
+      .filter((record) => record.author === "rule" && record.scope === "session" && record.sessionId === sessionId)
       .map((record) => derivedFactKey(record.content)));
-    for (const draft of deriveFacts(records, sourceHash)) {
+    const drafts = deriveFacts(records, sourceHash, sessionId);
+    let createdCount = 0;
+    for (const draft of drafts) {
       const factKey = derivedFactKey(draft.payload.content);
       if (existing.has(draft.recordId) || existingFacts.has(factKey)) continue;
       appendMemoryEvent(cwd, {
@@ -138,7 +147,13 @@ const persistDerived = (cwd: string, records: ReturnType<typeof recordsFromProje
       });
       existing.add(draft.recordId);
       existingFacts.add(factKey);
+      createdCount += 1;
     }
+    return {
+      candidateCount: drafts.length,
+      createdCount,
+      candidateChars: drafts.reduce((total, draft) => total + draft.payload.content.length, 0),
+    };
   });
 };
 
@@ -172,6 +187,35 @@ const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: n
 
 export const registerHooks = (pi: ExtensionAPI): void => {
   // before_agent_start 追加静态压缩指针、带来源的 session 摘录索引，以及用户写入的权威记忆。
+  pi.on("before_provider_request", (event: any, ctx: any) => {
+    const config = loadConfig(ctx.cwd);
+    if (!config.debug) return;
+    try {
+      const payload = event.payload;
+      const serialized = JSON.stringify(payload);
+      const request = payload && typeof payload === "object" ? payload as Record<string, any> : {};
+      const messages = Array.isArray(request.messages) ? request.messages : Array.isArray(request.input) ? request.input : [];
+      const leadingMessages = messages.filter((message: any) => message?.role === "system" || message?.role === "developer");
+      const prefix = {
+        system: request.system ?? leadingMessages,
+        tools: request.tools ?? request.functions ?? [],
+      };
+      const prefixText = JSON.stringify(prefix);
+      console.log(`[pi-compact] provider-request: payloadChars=${serialized.length} payloadHash=${contentHash(serialized).slice(0, 16)} prefixChars=${prefixText.length} prefixHash=${contentHash(prefixText).slice(0, 16)} prefixEstimatedTokens=${estimateTokensFromChars(prefixText.length)}`);
+    } catch {
+      console.log("[pi-compact] provider-request: payload inspection failed");
+    }
+  });
+
+  pi.on("message_end", (event: any, ctx: any) => {
+    if (event.message?.role !== "assistant") return;
+    const config = loadConfig(ctx.cwd);
+    if (!config.debug) return;
+    const usage = event.message.usage;
+    if (!usage) return;
+    console.log(`[pi-compact] provider-usage: api=${event.message.api ?? "unknown"} model=${event.message.model ?? "unknown"} input=${usage.input ?? 0} output=${usage.output ?? 0} cacheRead=${usage.cacheRead ?? 0} cacheWrite=${usage.cacheWrite ?? 0}`);
+  });
+
   pi.on("before_agent_start", (event: any, ctx: any) => {
     const config = loadConfig(ctx.cwd);
     if (!config.enabled) return;
@@ -227,7 +271,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       .map((record) => ({ id: record.id, kind: record.kind, status: record.status, priority: record.priority, pinned: record.pinned, createdAt: record.createdAt, content: record.content }))
       .sort((left, right) => left.id.localeCompare(right.id))));
     const summaryHash = summaryText ? contentHash(summaryText) : "";
-    const cacheKey = `${sessionId ?? ""}|${compactionEntryId}|${pointerFp}|${summaryHash}|${memFp}|${config.memory.hintMaxChars}|${config.sessionSummary.maxChars}`;
+    const cacheKey = `${ctx.cwd}\u0000${sessionId ?? ""}|${compactionEntryId}|${pointerFp}|${summaryHash}|${memFp}|${config.memory.hintMaxChars}|${config.sessionSummary.maxChars}`;
 
     const cached = injectionCache.get(cacheKey);
     if (cached !== undefined) {
@@ -380,13 +424,15 @@ export const registerHooks = (pi: ExtensionAPI): void => {
         }
       }
       if (config.sessionSummary.enabled && sessionId) {
+        const summaryStartedAt = Date.now();
         try {
           const currentCompactionIds = branch
             .filter((item) => item.type === "compaction" && item.id !== entry.id && (item as any).details?.compactor === "pi-compact")
             .map((item) => item.id)
             .filter((id): id is string => typeof id === "string");
           const previous = sessionSummaryForBranch(ctx.cwd, sessionId, currentCompactionIds);
-          appendSessionSummary({
+          const summaryStartedAt = Date.now();
+          const summary = appendSessionSummary({
             cwd: ctx.cwd,
             sessionId,
             compactionEntryId: entry.id,
@@ -396,14 +442,24 @@ export const registerHooks = (pi: ExtensionAPI): void => {
             maxEvidence: config.sessionSummary.maxEvidence,
             createdAt: entry.timestamp,
           });
-        } catch {
+          if (config.debug) {
+            const summaryChars = JSON.stringify(summary).length;
+            console.log(`[pi-compact] session-summary: evidence=${summary.evidence.length} sourceEntries=${summary.sourceEntryIds.length} chars=${summaryChars} estimatedTokens=${estimateTokensFromChars(summaryChars)} durationMs=${Date.now() - summaryStartedAt} result=ok`);
+          }
+        } catch (error) {
+          if (config.debug) console.log(`[pi-compact] session-summary: result=error reason=${error instanceof Error ? error.name : "unknown"} durationMs=${Date.now() - summaryStartedAt}`);
           ctx.ui?.notify?.("pi-compact: 压缩已完成，但会话摘要更新失败；之前的有效摘要仍保留。", "warning");
         }
       }
       if (config.memory.enabled && config.memory.deriveOnCompact) {
+        const startedAt = Date.now();
         try {
-          persistDerived(ctx.cwd, records, details.sourceHash, sessionId);
-        } catch {
+          const stats = persistDerived(ctx.cwd, records, details.sourceHash, sessionId);
+          if (config.debug) {
+            console.log(`[pi-compact] derived-memory: candidates=${stats.candidateCount} created=${stats.createdCount} candidateChars=${stats.candidateChars} estimatedTokens=${estimateTokensFromChars(stats.candidateChars)} durationMs=${Date.now() - startedAt} scope=session`);
+          }
+        } catch (error) {
+          if (config.debug) console.log(`[pi-compact] derived-memory: result=error reason=${error instanceof Error ? error.name : "unknown"} durationMs=${Date.now() - startedAt}`);
           ctx.ui?.notify?.("pi-compact: 压缩已完成，但派生记忆写入失败。", "warning");
         }
       }
