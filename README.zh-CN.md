@@ -192,7 +192,7 @@ pi install -l /absolute/path/to/pi-compact
 | `sessionSummary.maxChars` | `6000` | 自动注入摘要的最大字符数；按完整 JSON 证据项裁剪 |
 | `sessionSummary.maxEvidence` | `80` | 每个 session 摘要最多保留的原文证据项数量，最少为 2，以保留初始用户请求和近期证据 |
 
-嵌套对象优先。数值配置必须是正安全整数；`sessionSummary.maxEvidence` 最少为 `2`。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars`、`sessionSummary.maxChars`、`sessionSummary.maxEvidence` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`、`30000`、`500`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史和摘要可通过工具按需查询，自动注入仅限有预算的 session 摘录索引及用户确认的 pinned/active 记忆。旧注入配置不能重新启用已移除的 `context` hook。
+也接受扁平别名，例如 `memoryEnabled`、`memoryHintMaxChars`、`historyAutoRecallPrimaryOnly`、`windowManifest`。嵌套对象优先。数值配置必须是正安全整数；`sessionSummary.maxEvidence` 最少为 `2`。`summaryMaxChars`、`autoRecallMaxChars`、`recallMaxResults`、`recallMaxChars`、`memory.hintMaxChars`、`sessionSummary.maxChars`、`sessionSummary.maxEvidence` 的上限依次为 `100000`、`50000`、`30`、`100000`、`50000`、`30000`、`500`；超过上限的合法值会被截断，非法值会回退到默认值；未知配置项会被忽略。字符预算不是 token 预算。默认策略：记忆开启、模型提议仅 provisional；历史和摘要可通过工具按需查询，自动注入仅限有预算的 session 摘录索引及用户确认的 pinned/active 记忆。旧注入配置不能重新启用已移除的 `context` hook。
 
 自动压缩阈值和保留尾部大小仍由 Pi 自身的 compaction settings 控制，本扩展不另设触发阈值。
 
@@ -389,7 +389,8 @@ src/core/jsonl.ts        损坏安全的 JSONL 读写
 src/core/projector.ts    记忆事件纯函数投影
 src/core/store.ts        `.pi/pi-compact/` 事件日志
 src/core/window.ts       WindowManifest 与哈希链
-src/core/summary.ts     session 摘要的确定性提取、隔离存储、累积和搜索
+src/core/summary.ts      session 摘要的确定性提取、隔离存储、累积和搜索
+src/core/working.ts      权威记忆提示渲染
 src/core/derive.ts       无语义推断的规则派生
 src/types.ts             共享类型
 tests/                   单元测试
@@ -408,7 +409,7 @@ tests/                   单元测试
 - 通过模拟 hook 事件检查 `manual`、`threshold`、`overflow` 三种 compaction reason 及已中止请求。
 - 空 active lineage 不扩大搜索范围；没有 `context` hook，只有带来源 ID 的有界 session 摘录会按配置注入。
 - `before_agent_start` 的压缩指针与权威记忆注入，包括 provisional/规则/模型记录的排除与 `pinnedInjection` 关闭开关。
-- 保留的旧自动召回门控与工作记忆渲染纯函数仍有单元测试，但它们不再位于注入路径上。
+- 旧的自动召回门控仍有单元测试，但运行时未接入；`working.ts` 仅用于渲染权威记忆提示，不再产生旧的 `pi-compact-memory-hint` 消息。
 - 日志锁在 token/metadata 不匹配时不删除，活锁不按年龄回收；无效 metadata 在宽限期后可回收。跨平台启动时间身份（Linux `/proc`、Unix `ps`、Windows `Get-Process`）与无法验证时的保守等待均有不依赖切换 `process.platform` 或真实 PID 复用的单测。
 - 干净依赖安装、TypeScript 类型检查和真实 Pi CLI 扩展加载。
 
