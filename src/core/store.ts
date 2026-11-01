@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { MemoryEvent, MemoryRecord, WindowEvent, WindowManifest } from "../types.ts";
-import { appendJsonl, ensureDir, hashText, readJsonl, stableHash } from "./jsonl.ts";
+import { appendJsonl, appendJsonlBatch, ensureDir, hashText, readJsonl, stableHash } from "./jsonl.ts";
 import { withLogLock } from "./lock.ts";
 import { isMemoryEvent, projectMemories } from "./projector.ts";
 
@@ -126,23 +126,33 @@ export const loadMemories = (cwd: string): MemoryRecord[] => projectMemories(rea
 
 export type MemoryEventInput = Omit<MemoryEvent, "seq" | "ts" | "prevHash" | "hash"> & { ts?: string };
 
-export const appendMemoryEvent = (cwd: string, input: MemoryEventInput): MemoryEvent => {
+export const appendMemoryEvents = (cwd: string, inputs: MemoryEventInput[]): MemoryEvent[] => {
+  if (inputs.length === 0) return [];
   ensureStore(cwd);
-  return withMemoryLogLock(cwd, (): MemoryEvent => {
+  // 一次写入事务内完成读取、校验、算链和批量追加；
+  // appendableEvents 仍对现有完整日志做可信前缀校验，坏行后拒绝追加的规则不变。
+  return withMemoryLogLock(cwd, (): MemoryEvent[] => {
     const existing = appendableEvents(memoryLogPath(cwd), "memory.jsonl", isMemoryEvent, hashMemoryEvent);
-    const last = existing.at(-1);
-    const event: MemoryEvent = {
-      ...input,
-      seq: (last?.seq ?? 0) + 1,
-      ts: input.ts ?? new Date().toISOString(),
-      prevHash: last?.hash ?? "",
-      hash: "",
-    };
-    event.hash = hashMemoryEvent(event);
-    appendJsonl(memoryLogPath(cwd), event);
-    return event;
+    let last = existing.at(-1);
+    const events: MemoryEvent[] = [];
+    for (const input of inputs) {
+      const event: MemoryEvent = {
+        ...input,
+        seq: (last?.seq ?? 0) + 1,
+        ts: input.ts ?? new Date().toISOString(),
+        prevHash: last?.hash ?? "",
+        hash: "",
+      };
+      event.hash = hashMemoryEvent(event);
+      events.push(event);
+      last = event;
+    }
+    appendJsonlBatch(memoryLogPath(cwd), events);
+    return events;
   });
 };
+
+export const appendMemoryEvent = (cwd: string, input: MemoryEventInput): MemoryEvent => appendMemoryEvents(cwd, [input])[0];
 
 export const appendWindowEvent = (cwd: string, manifest: WindowManifest): WindowEvent => {
   ensureStore(cwd);

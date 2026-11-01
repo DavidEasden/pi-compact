@@ -4,7 +4,8 @@ import { estimateTokensFromChars, toolCallIds } from "./core/content.ts";
 import { deriveFacts, derivedFactKey } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
 import { hashRecords, recordsFromProjectedEntries } from "./core/session.ts";
-import { appendMemoryEvent, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
+import { appendMemoryEvents, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
+import type { MemoryEventInput } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
 import { MEMORY_HINT_TYPE, renderWorkingHint } from "./core/working.ts";
 import { appendSessionSummary, renderSessionSummary, sessionSummaryForBranch } from "./core/summary.ts";
@@ -132,8 +133,9 @@ const persistDerived = (
     const legacyWorkspaceRules = existingRecords.filter((record) => (
       record.author === "rule" && record.scope === "workspace" && record.status === "provisional" && record.provenance?.startsWith("rule:")
     ));
+    const pending: MemoryEventInput[] = [];
     for (const record of legacyWorkspaceRules) {
-      appendMemoryEvent(cwd, { type: "resolve", recordId: record.id, author: "rule", sessionId, payload: {} });
+      pending.push({ type: "resolve", recordId: record.id, author: "rule", sessionId, payload: {} });
     }
     const existing = new Set(existingRecords.map((record) => record.id));
     // 只在同一 session 内按事实内容去重；其他 session 的同内容事实仍需各自可见。
@@ -145,7 +147,7 @@ const persistDerived = (
     for (const draft of drafts) {
       const factKey = derivedFactKey(draft.payload.content);
       if (existing.has(draft.recordId) || existingFacts.has(factKey)) continue;
-      appendMemoryEvent(cwd, {
+      pending.push({
         type: "create",
         recordId: draft.recordId,
         author: "rule",
@@ -156,6 +158,8 @@ const persistDerived = (
       existingFacts.add(factKey);
       createdCount += 1;
     }
+    // 一次事务追加本批次全部事件，避免每条事件都重读并重新校验整份日志。
+    if (pending.length > 0) appendMemoryEvents(cwd, pending);
     return {
       candidateCount: drafts.length,
       createdCount,

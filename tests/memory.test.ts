@@ -12,6 +12,7 @@ import { projectMemories } from "../src/core/projector.ts";
 import { recordsFromEntries } from "../src/core/session.ts";
 import {
   appendMemoryEvent,
+  appendMemoryEvents,
   appendWindowEvent,
   hashMemoryEvent,
   hashWindowEvent,
@@ -830,6 +831,59 @@ test("search 多条命中超过总预算时截断并给出 nextOffset", async ()
     const nextIds = [...next.content[0].text.matchAll(/^- \[([^\]]+)\]/gm)].map((match: RegExpMatchArray) => match[1]);
     assert.equal(firstIds.some((id: string) => nextIds.includes(id)), false);
     assert.equal(next.details.nextOffset, undefined);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("批量追加在同一事务内生成连续 seq、prevHash 与 hash", () => {
+  const cwd = tempCwd();
+  try {
+    const events = appendMemoryEvents(cwd, [
+      { type: "create", recordId: "mem_batch_1", author: "model", payload: { kind: "fact", content: "batch one", scope: "workspace", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "h1" } },
+      { type: "create", recordId: "mem_batch_2", author: "model", payload: { kind: "fact", content: "batch two", scope: "workspace", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "h2" } },
+      { type: "resolve", recordId: "mem_batch_1", author: "model", payload: {} },
+    ]);
+    assert.deepEqual(events.map((item) => item.seq), [1, 2, 3]);
+    assert.equal(events[0].prevHash, "");
+    assert.equal(events[1].prevHash, events[0].hash);
+    assert.equal(events[2].prevHash, events[1].hash);
+    assert.equal(events.every((item) => item.hash === hashMemoryEvent(item)), true);
+    assert.equal(readMemoryEvents(cwd).length, 3);
+    assert.deepEqual(loadMemories(cwd).map((record) => [record.id, record.status]), [
+      ["mem_batch_1", "resolved"],
+      ["mem_batch_2", "provisional"],
+    ]);
+    assert.deepEqual(appendMemoryEvents(cwd, []), []);
+    assert.equal(readMemoryEvents(cwd).length, 3);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("批量追加在日志断链后拒绝整批写入", () => {
+  const cwd = tempCwd();
+  try {
+    appendMemoryEvent(cwd, {
+      type: "create",
+      recordId: "mem_batch_ok",
+      author: "user",
+      payload: { kind: "fact", content: "valid", scope: "workspace", status: "active", priority: "normal", sourceEntryIds: [], sourceHash: "ok" },
+    });
+    const log = memoryLogPath(cwd);
+    const broken = event({
+      type: "create",
+      recordId: "mem_batch_bad",
+      seq: 99,
+      hash: "broken",
+      payload: { kind: "fact", content: "broken", scope: "workspace", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "bad" },
+    });
+    appendFileSync(log, `${JSON.stringify(broken)}\n`);
+    assert.throws(() => appendMemoryEvents(cwd, [
+      { type: "create", recordId: "mem_batch_new", author: "model", payload: { kind: "fact", content: "new", scope: "workspace", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "new" } },
+    ]), /拒绝追加/);
+    assert.equal(readMemoryEvents(cwd).length, 1);
+    assert.equal(readFileSync(log, "utf8").includes("mem_batch_new"), false);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
