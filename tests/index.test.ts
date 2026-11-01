@@ -17,7 +17,7 @@ test("入口使用 Pi 原生 /compact，不注册独立的压缩命令", () => {
 
   piCompact(pi as any);
 
-  assert.deepEqual(commands, ["pi-compact-recall", "remember", "memories", "forget"]);
+  assert.deepEqual(commands, ["pi-compact-recall", "remember", "memories", "forget", "pi-compact-status"]);
   assert.deepEqual(tools, [
     "pi_compact_recall",
     "pi_memory_search",

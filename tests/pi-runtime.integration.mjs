@@ -218,7 +218,7 @@ test("Pi SDK：成功后提交窗口，重复事件去重，摘要相同也绑�
     const summaries = sessionSummaryRows(h.cwd);
     assert.equal(summaries.length, 2);
     assert.equal(summaries[1].parentCompactionEntryId, summaries[0].compactionEntryId);
-    assert.ok(summaries.some((item) => item.evidence.some((evidence) => evidence.excerpt.includes("检查 src/example.ts"))));
+    assert.ok(summaries.some((item) => (item.evidenceAdded ?? item.evidence ?? []).some((evidence) => evidence.excerpt.includes("检查 src/example.ts"))));
     // 重放同一成功事件，验证事件去重不依赖内存中的一次性标记。
     await h.session._extensionRunner.emit(savedEvent);
     assert.equal(rows(h.cwd, "windows").length, 2);
@@ -295,7 +295,7 @@ test("Pi SDK：真实工具包装执行记忆隔离、预算、状态查询与�
   let b;
   try {
     const local = await call(a, "pi_memory_propose", { content: "会话私有", scope: "session" });
-    const shared = await call(a, "pi_memory_propose", { content: "内容".repeat(100000) });
+    const shared = await call(a, "pi_memory_propose", { content: "内容".repeat(4000) });
     b = await createHarness({ cwd: a.cwd });
     const hidden = await call(b, "pi_memory_read", { recordId: local.details.recordId });
     assert.equal(hidden.details.count, 0);
