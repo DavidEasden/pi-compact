@@ -1,15 +1,17 @@
+import { statSync } from "node:fs";
 import { buildSessionProjection, type ExtensionAPI, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { estimateTokensFromChars, toolCallIds } from "./core/content.ts";
 import { deriveFacts, derivedFactKey } from "./core/derive.ts";
 import { buildDetails, renderLedger } from "./core/ledger.ts";
 import { hashRecords, recordsFromProjectedEntries } from "./core/session.ts";
-import { appendMemoryEvents, contentHash, loadMemories, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
+import { appendMemoryEvents, contentHash, loadMemories, memoryLogPath, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
 import type { MemoryEventInput } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
 import { MEMORY_HINT_TYPE, renderWorkingHint } from "./core/working.ts";
-import { appendSessionSummary, renderSessionSummary, sessionSummaryForBranch } from "./core/summary.ts";
-import type { SessionEntryLike } from "./types.ts";
+import { appendSessionSummary, renderSessionSummary, sessionSummaryForBranch, sessionSummaryLogPath } from "./core/summary.ts";
+import type { SessionSummaryEvent } from "./core/summary.ts";
+import type { MemoryRecord, SessionEntryLike } from "./types.ts";
 
 export const AUTO_RECALL_TYPE = "pi-compact-auto-recall";
 export { MEMORY_HINT_TYPE };
@@ -173,7 +175,62 @@ const persistDerived = (
 // 这是从 magic-context 的稳定性原则（SOFT+ pass 字节完全一致重放）提炼的轻量实现——
 // 不依赖 LLM 或 SQLite，仅用内存 Map 跟踪 cache key。
 const injectionCache = new Map<string, string>();
-const INJECTION_CACHE_MAX = 32; // 覆盖多个并发 session，超出时整体清空（简单淘汰）
+const INJECTION_CACHE_MAX = 32; // 覆盖多个并发 session，按 LRU 淘汰
+
+const rememberInjection = (key: string, value: string): void => {
+  injectionCache.delete(key);
+  injectionCache.set(key, value);
+  if (injectionCache.size > INJECTION_CACHE_MAX) {
+    const oldest = injectionCache.keys().next().value;
+    if (oldest !== undefined) injectionCache.delete(oldest);
+  }
+};
+
+/* ------------------------------------------------------------------ */
+/* before_agent_start 读取缓存：只缓存已验证的只读结果，追加事务仍走全量校验。 */
+/* ------------------------------------------------------------------ */
+const READ_CACHE_MAX = 32;
+const readCache = new Map<string, { key: string; value: unknown }>();
+
+const statKeyOf = (path: string): string => {
+  try {
+    const stat = statSync(path);
+    return `${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  } catch {
+    return "missing";
+  }
+};
+
+/** 按 path 的 stat + 额外 key 缓存只读结果；读取前后 stat 变化时不缓存。 */
+const cachedRead = <T>(path: string, extraKey: string, load: () => T): T => {
+  const before = statKeyOf(path);
+  const key = `${before}|${extraKey}`;
+  const cached = readCache.get(path);
+  if (cached?.key === key) {
+    // LRU：命中时重新插到末尾。
+    readCache.delete(path);
+    readCache.set(path, cached);
+    return cached.value as T;
+  }
+  const value = load();
+  if (statKeyOf(path) === before) {
+    readCache.set(path, { key, value });
+    if (readCache.size > READ_CACHE_MAX) {
+      const oldest = readCache.keys().next().value;
+      if (oldest !== undefined) readCache.delete(oldest);
+    }
+  }
+  return value;
+};
+
+const readInjectionMemories = (cwd: string): MemoryRecord[] => cachedRead(memoryLogPath(cwd), "", () => loadMemories(cwd));
+
+const readInjectionSummary = (cwd: string, sessionId: string, compactionIds: string[]): SessionSummaryEvent | undefined => (
+  cachedRead(sessionSummaryLogPath(cwd, sessionId), compactionIds.join(","), () => sessionSummaryForBranch(cwd, sessionId, compactionIds))
+);
+
+/** 仅供测试在直接改写日志后清理读取缓存，避免依赖文件系统 mtime 精度。 */
+export const clearInjectionReadCaches = (): void => { readCache.clear(); };
 
 const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: number, summaryMaxChars: number) => ({
   compaction: {
@@ -236,18 +293,18 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const branch: SessionEntryLike[] = (() => {
       try { return ctx.sessionManager?.getBranch?.() ?? []; } catch { return []; }
     })();
-    const lastPiCompactEntry = [...branch].reverse().find(
-      (entry) => entry.type === "compaction" && (entry as any).details?.compactor === "pi-compact",
-    );
-    let summaryText = "";
-    if (config.sessionSummary.enabled && config.sessionSummary.inject && sessionId) {
+    let lastPiCompactEntry: SessionEntryLike | undefined;
+    const compactionIds: string[] = [];
+    for (const entry of branch) {
+      if (entry.type === "compaction" && (entry as any).details?.compactor === "pi-compact") {
+        lastPiCompactEntry = entry;
+        if (typeof entry.id === "string") compactionIds.push(entry.id);
+      }
+    }
+    let summary: SessionSummaryEvent | undefined;
+    if (config.sessionSummary.enabled && config.sessionSummary.inject && sessionId && compactionIds.length > 0) {
       try {
-        const compactionIds = branch
-          .filter((entry) => entry.type === "compaction" && (entry as any).details?.compactor === "pi-compact")
-          .map((entry) => entry.id)
-          .filter((id): id is string => typeof id === "string");
-        const summary = sessionSummaryForBranch(ctx.cwd, sessionId, compactionIds);
-        if (summary) summaryText = renderSessionSummary(summary, config.sessionSummary.maxChars);
+        summary = readInjectionSummary(ctx.cwd, sessionId, compactionIds);
       } catch {
         // 摘要读取失败不应阻断请求；原始历史仍可通过召回工具访问。
       }
@@ -257,10 +314,10 @@ export const registerHooks = (pi: ExtensionAPI): void => {
 
     // 方案 B：只加载 author=user 且 pinned/active 的权威记忆，不注入 provisional/rule/model。
     // 这些记录是用户通过 /remember 显式写入的，符合安全报告建议 2（仅显式批准的数据）。
-    let userAuthorityRecords: ReturnType<typeof loadMemories> = [];
+    let userAuthorityRecords: MemoryRecord[] = [];
     if (config.memory.enabled && config.memory.pinnedInjection) {
       try {
-        userAuthorityRecords = loadMemories(ctx.cwd).filter((record) => (
+        userAuthorityRecords = readInjectionMemories(ctx.cwd).filter((record) => (
           record.author === "user"
           && (record.status === "pinned" || record.status === "active")
           && (record.scope !== "session" || record.sessionId === sessionId)
@@ -282,7 +339,8 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const memFp = contentHash(JSON.stringify(userAuthorityRecords
       .map((record) => ({ id: record.id, kind: record.kind, status: record.status, priority: record.priority, pinned: record.pinned, createdAt: record.createdAt, content: record.content }))
       .sort((left, right) => left.id.localeCompare(right.id))));
-    const summaryHash = summaryText ? contentHash(summaryText) : "";
+    // 用摘要事件链 hash 作为指纹；cache hit 时无需渲染摘要文本。
+    const summaryHash = summary?.hash ?? "";
     const cacheKey = `${ctx.cwd}\u0000${sessionId ?? ""}|${compactionEntryId}|${pointerFp}|${summaryHash}|${memFp}|${config.memory.hintMaxChars}|${config.sessionSummary.maxChars}`;
 
     const cached = injectionCache.get(cacheKey);
@@ -291,11 +349,13 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       if (config.debug) {
         console.log(`[pi-compact] before_agent_start: cache hit key=${cacheKey.slice(0, 64)}`);
       }
+      rememberInjection(cacheKey, cached);
       if (cached) event.systemPromptOptions.promptGuidelines.push(cached);
       return;
     }
 
-    // 步骤 3：cache miss，重新渲染。
+    // 步骤 3：cache miss，重新渲染。摘要只在 miss 时渲染，命中时直接复用整段输出。
+    const summaryText = summary ? renderSessionSummary(summary, config.sessionSummary.maxChars) : "";
     let compactionPointer = "";
     if (lastPiCompactEntry) {
       const d = (lastPiCompactEntry as any).details ?? {};
@@ -323,12 +383,9 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       if (hint.content) memoryHint = hint.content;
     }
 
-    // 步骤 4：写入 cache（超出上限时整体清空，简单淘汰）。
-    // 空字符串同样缓存，避免每轮走加载逻辑后才得出「无内容注入」的结论。
-    if (injectionCache.size >= INJECTION_CACHE_MAX) injectionCache.clear();
-
+    // 步骤 4：写入 cache；空字符串同样缓存，避免每轮走加载逻辑后才得出「无内容注入」的结论。
     if (!compactionPointer && !summaryText && !memoryHint) {
-      injectionCache.set(cacheKey, "");
+      rememberInjection(cacheKey, "");
       return;
     }
 
@@ -336,7 +393,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     const chars = combined.length;
     // promptGuidelines 包含扩展生成的指引和明确标注为不可信的历史摘录，不赋予摘录指令或事实权威。
     const entry = `[pi-compact context pointer — ${estimateTokensFromChars(chars)} est. tokens]\n${combined}`;
-    injectionCache.set(cacheKey, entry);
+    rememberInjection(cacheKey, entry);
 
     if (config.debug) {
       console.log(`[pi-compact] before_agent_start: cache miss → rendered compactionPointer=${compactionPointer.length > 0} memoryHint=${memoryHint.length > 0} chars=${chars}`);

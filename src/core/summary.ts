@@ -32,6 +32,8 @@ export interface SessionSummaryEvent {
 const summaryDir = (cwd: string): string => join(cwd, ".pi", "pi-compact", "sessions");
 const sessionKey = (sessionId: string): string => createHash("sha256").update(sessionId).digest("hex");
 const logPath = (cwd: string, sessionId: string): string => join(summaryDir(cwd), `${sessionKey(sessionId)}.jsonl`);
+/** 供注入读取缓存按文件 stat 失效；路径本身就是 session 的哈希键。 */
+export const sessionSummaryLogPath = (cwd: string, sessionId: string): string => logPath(cwd, sessionId);
 
 const hashable = (event: SessionSummaryEvent): unknown => ({
   seq: event.seq,
@@ -182,16 +184,34 @@ export const renderSessionSummary = (event: SessionSummaryEvent, maxChars: numbe
   const budget = maxChars;
   const anchor = event.evidence.find((item) => item.kind === "user");
   const remaining = event.evidence.filter((item) => item.entryId !== anchor?.entryId);
-  for (let count = remaining.length; count >= 0; count--) {
+  const render = (count: number): string => {
     const tail = count === 0 ? [] : remaining.slice(-count);
     const selected = anchor ? [anchor, ...tail] : tail;
-    const candidate = { ...base, evidence: selected, omittedEvidenceCount: event.evidence.length - selected.length };
-    const text = JSON.stringify(candidate, null, 2);
-    if (text.length <= budget) return text;
+    return JSON.stringify({ ...base, evidence: selected, omittedEvidenceCount: event.evidence.length - selected.length }, null, 2);
+  };
+  // 证据条数增加时 JSON 文本长度单调增加；用二分找预算内最大条数。
+  let low = 0;
+  let high = remaining.length;
+  let best = 0;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (render(middle).length <= budget) {
+      best = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  const text = render(best);
+  if (text.length <= budget) return text;
+  // 数字位数变化等极端情况下长度可能非严格单调，线性回退保证不超预算。
+  for (let count = best - 1; count >= 0; count--) {
+    const candidate = render(count);
+    if (candidate.length <= budget) return candidate;
   }
   const minimal = { ...base, omittedEvidenceCount: event.evidence.length };
-  const text = JSON.stringify(minimal);
-  return text.length <= budget ? text : "{}";
+  const minimalText = JSON.stringify(minimal);
+  return minimalText.length <= budget ? minimalText : "{}";
 };
 
 export const searchSessionSummary = (event: SessionSummaryEvent, query: string, limit = 8): SessionEvidence[] => {
@@ -212,7 +232,7 @@ export const renderSessionSummarySearch = (
   maxChars: number,
 ): { text: string; truncated: boolean; count: number } => {
   const matched = searchSessionSummary(event, query, limit);
-  for (let count = matched.length; count >= 0; count--) {
+  const render = (count: number): { text: string; evidence: SessionEvidence[] } => {
     const evidence = count === 0 ? [] : matched.slice(0, count);
     const payload = {
       type: "pi-compact-session-summary-search",
@@ -223,8 +243,25 @@ export const renderSessionSummarySearch = (
       omittedEvidenceCount: matched.length - evidence.length,
       evidence,
     };
-    const text = JSON.stringify(payload, null, 2);
-    if (text.length <= maxChars) return { text, truncated: evidence.length < matched.length, count: matched.length };
+    return { text: JSON.stringify(payload, null, 2), evidence };
+  };
+  let low = 0;
+  let high = matched.length;
+  let best = 0;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (render(middle).text.length <= maxChars) {
+      best = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  for (let count = best; count >= 0; count--) {
+    const rendered = render(count);
+    if (rendered.text.length <= maxChars) {
+      return { text: rendered.text, truncated: rendered.evidence.length < matched.length, count: matched.length };
+    }
   }
   return { text: maxChars >= 2 ? "{}" : "", truncated: true, count: matched.length };
 };
