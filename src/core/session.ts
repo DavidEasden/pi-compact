@@ -176,7 +176,7 @@ export const searchRecords = (records: HistoryRecord[], query: string, options: 
   const pageLimit = page * size;
   for (const hit of ranked) {
     if (unique.length >= pageLimit) break;
-    const textKey = hit.text.slice(0, 240).replace(/\s+/g, " ").trim();
+    const textKey = hit.text.slice(0, 960).replace(/\s+/g, " ").trim().slice(0, 240);
     if (seenIds.has(hit.entryId)) continue;
     if (textKey && seenText.has(textKey)) continue;
     seenIds.add(hit.entryId);
