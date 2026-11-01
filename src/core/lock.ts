@@ -150,7 +150,14 @@ export const readProcessStartTimeForPlatform = (
 
 export const readProcessStartTime = (pid: number): string | undefined => readProcessStartTimeForPlatform(pid, process.platform);
 
-const selfStartTime = readProcessStartTime(process.pid);
+// 惰性读取：模块加载时不再同步 spawn ps/PowerShell，只有真正写锁时才需要进程身份。
+let selfStartTimeValue: { loaded: boolean; value?: string } = { loaded: false };
+const selfStartTime = (): string | undefined => {
+  if (!selfStartTimeValue.loaded) {
+    selfStartTimeValue = { loaded: true, value: readProcessStartTime(process.pid) };
+  }
+  return selfStartTimeValue.value;
+};
 
 const lockStartTime = (value: unknown): string | undefined => {
   if (typeof value === "string" && value.length > 0) return value;
@@ -241,7 +248,7 @@ const acquireLock = (path: string): void => {
     let fd: number | undefined;
     try {
       fd = openSync(path, "wx");
-      const info: LockInfo = { pid: process.pid, token, ts: Date.now(), startTime: selfStartTime };
+      const info: LockInfo = { pid: process.pid, token, ts: Date.now(), startTime: selfStartTime() };
       writeSync(fd, `${JSON.stringify(info)}\n`);
       heldLocks.set(path, { info, depth: 1 });
       return;
