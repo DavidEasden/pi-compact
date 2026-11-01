@@ -3,6 +3,9 @@
   "version": "0.7.0",
   "description": "不依赖 LLM 的 Pi 自动压缩、精确历史召回与上下文增强扩展",
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "keywords": [
     "pi-package"
   ],
@@ -23,7 +26,8 @@
   "scripts": {
     "test": "node --import tsx --test --test-concurrency=1 tests/*.test.ts tests/*.integration.mjs",
     "test:integration": "node --test tests/*.integration.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "bench": "node --import tsx scripts/bench.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.87.1",
