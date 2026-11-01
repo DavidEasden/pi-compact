@@ -140,23 +140,31 @@ export const searchRecords = (records: HistoryRecord[], query: string, options: 
     if (options.sourceClass && options.sourceClass !== "all" && record.sourceClass !== options.sourceClass) return false;
     return true;
   });
+  // df 只需要统计 query term 是否出现在记录中，与下面的 matched 共用一次 includes；
+  // 不能对每条记录的全文重新分词，否则长历史或大 toolResult 会让搜索退化为秒级。
   const documentFrequency = new Map<string, number>();
-  const tokenSets = candidates.map((record) => new Set(queryTerms(`${record.text}\n${record.files.join(" ")}`)));
-  for (const tokens of tokenSets) for (const token of tokens) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+  const matchedByRecord = new Map<HistoryRecord, string[]>();
+  for (const record of candidates) {
+    const lower = `${record.text}\n${record.files.join(" ")}`.toLocaleLowerCase();
+    const matched = terms.filter((term) => lower.includes(term));
+    matchedByRecord.set(record, matched);
+    for (const term of matched) documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
+  }
   const hits: SearchHit[] = [];
+  const firstById = new Map<string, string>();
   candidates.forEach((record) => {
     if (options.file && !record.files.some((file) => file.includes(options.file!))) return;
     if (options.kind && !record.kinds.includes(options.kind as any)) return;
-    const haystack = `${record.text}\n${record.files.join(" ")}`;
-    const lower = haystack.toLocaleLowerCase();
-    const matched = terms.filter((term) => lower.includes(term));
+    const matched = matchedByRecord.get(record) ?? [];
     if (terms.length > 0 && matched.length === 0) return;
     const fileBoost = options.file || record.files.some((file) => terms.some((term) => file.toLocaleLowerCase().includes(term))) ? 8 : 0;
     const lengthNorm = 1 / Math.log10(10 + record.text.length);
     const derivedWeight = record.sourceClass === "derived" ? 0.2 : 1;
     const score = (matched.reduce((total, term) => total + 1 + 4 / (documentFrequency.get(term) ?? 1), 0) + fileBoost) * lengthNorm * derivedWeight;
     const first = matched[0] ?? options.file ?? "";
-    hits.push({ ...record, score, snippet: snippetAround(haystack, first, 700) });
+    firstById.set(record.entryId, first);
+    // snippet 只为最终分页结果生成，避免为所有命中记录各复制 700 字符。
+    hits.push({ ...record, score, snippet: "" });
   });
   const page = Math.max(1, options.page ?? 1);
   const size = Math.max(1, options.maxResults ?? 8);
@@ -164,15 +172,21 @@ export const searchRecords = (records: HistoryRecord[], query: string, options: 
   const seenIds = new Set<string>();
   const seenText = new Set<string>();
   const unique: SearchHit[] = [];
+  // 只需要凑够当前分页所需的唯一结果，不必为全部命中记录生成去重文本。
+  const pageLimit = page * size;
   for (const hit of ranked) {
-    const textKey = hit.text.replace(/\s+/g, " ").trim().slice(0, 240);
+    if (unique.length >= pageLimit) break;
+    const textKey = hit.text.slice(0, 240).replace(/\s+/g, " ").trim();
     if (seenIds.has(hit.entryId)) continue;
     if (textKey && seenText.has(textKey)) continue;
     seenIds.add(hit.entryId);
     if (textKey) seenText.add(textKey);
     unique.push(hit);
   }
-  return unique.slice((page - 1) * size, page * size);
+  return unique.slice((page - 1) * size, pageLimit).map((hit) => ({
+    ...hit,
+    snippet: snippetAround(`${hit.text}\n${hit.files.join(" ")}`, firstById.get(hit.entryId) ?? options.file ?? "", 700),
+  }));
 };
 
 export const listRecords = (records: HistoryRecord[], options: {

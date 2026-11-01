@@ -259,3 +259,18 @@ test("压缩边界必须保留完整的工具调用和结果配对", () => {
     assert.equal(isSafeCut([user, call, metadata, result, nextAssistant], "state-1"), false);
   }
 });
+
+test("搜索长文本记录时仍按分页返回，并用显式 terms 走同一匹配路径", () => {
+  const longText = `${"noise ".repeat(20000)}needle`;
+  const records = recordsFromEntries([
+    { type: "message", id: "long1", parentId: null, timestamp: "2024-01-01T00:00:00Z", message: { role: "toolResult", content: [{ type: "text", text: longText }] } },
+    { type: "message", id: "u1", parentId: "long1", timestamp: "2024-01-01T00:00:01Z", message: { role: "user", content: "needle 和 alpha" } },
+    { type: "message", id: "u2", parentId: "u1", timestamp: "2024-01-01T00:00:02Z", message: { role: "user", content: "needle 和 beta" } },
+  ]);
+  const first = searchRecords(records, "needle", { maxResults: 1 });
+  const second = searchRecords(records, "needle", { maxResults: 1, page: 2 });
+  assert.equal(first.length, 1);
+  assert.equal(second.length, 1);
+  assert.notEqual(first[0].entryId, second[0].entryId);
+  assert.equal(searchRecords(records, "ignored", { terms: ["needle"] }).length, 3);
+});
