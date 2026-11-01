@@ -93,6 +93,14 @@ export const messageKinds = (message: MessageLike): string[] => {
 /** Pi estimateTokens 启发式：字符数 / 4 向上取整。这不是 provider usage。 */
 export const estimateTokensFromChars = (charCount: number): number => Math.ceil(Math.max(0, charCount) / 4);
 
+const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
+
+/** 混合文本的轻量 token 估算：CJK 约 1 字符/token，其余约 4 字符/token；不是 provider usage。 */
+export const estimateTokensFromText = (text: string): number => {
+  const cjkCount = (text.match(CJK_CHAR) ?? []).length;
+  return Math.ceil(cjkCount + (text.length - cjkCount) / 4);
+};
+
 export const clip = (text: string, maxChars: number): string => {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 48))}\n[…已省略 ${text.length - maxChars} 个字符；可用 entry ID 召回原文]`;

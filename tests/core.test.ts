@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { SessionEntryLike } from "../src/types.ts";
 import test from "node:test";
 import { buildDetails, renderLedger } from "../src/core/ledger.ts";
-import { messageFiles, messageText, snippetAround } from "../src/core/content.ts";
+import { estimateTokensFromText, messageFiles, messageText, snippetAround } from "../src/core/content.ts";
 import { isSafeCut as checkSafeCut } from "../src/hooks.ts";
 import { activeEntryIds, entryToRecord, hashRecords, listRecords, recordsFromEntries, searchRecords } from "../src/core/session.ts";
 
@@ -285,4 +285,12 @@ test("messageFiles 限制递归规模并排除 cwd 目录", () => {
   assert.equal(files.includes("/project"), false);
   assert.equal(files.every((file) => file.startsWith("src/file-")), true);
   assert.deepEqual(messageFiles({ role: "toolResult", cwd: "/project", content: [] } as any), []);
+});
+
+test("混合文本 token 估算对 CJK 字符按字符近似", () => {
+  assert.equal(estimateTokensFromText(""), 0);
+  assert.equal(estimateTokensFromText("abcd"), 1);
+  assert.equal(estimateTokensFromText("中文"), 2);
+  assert.equal(estimateTokensFromText("中文abcd"), 3);
+  assert.equal(estimateTokensFromText("日本語"), 3);
 });
