@@ -158,7 +158,3 @@ export const projectMemories = (events: MemoryEvent[]): MemoryRecord[] => {
   }
   return [...byId.values()].map(cloneRecord);
 };
-
-export const liveMemories = (records: MemoryRecord[]): MemoryRecord[] => (
-  records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional")
-);

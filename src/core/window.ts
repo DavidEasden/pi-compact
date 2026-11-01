@@ -40,11 +40,3 @@ export const buildWindowManifest = (input: {
 };
 
 export const persistWindowManifest = (cwd: string, manifest: WindowManifest) => appendWindowEvent(cwd, manifest);
-
-export const windowHeaderLines = (manifest: WindowManifest): string[] => [
-  `windowId: ${manifest.windowId}`,
-  `parentWindowId: ${manifest.parentWindowId ?? "none"}`,
-  `sourceCount: ${manifest.sourceCount}`,
-  `sourceHash: ${manifest.sourceHash}`,
-  `previousHash: ${manifest.previousHash || "genesis"}`,
-];

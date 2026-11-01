@@ -613,3 +613,52 @@ test("before_agent_start 摘要读取缓存按文件与 compaction 链失效", (
     rmSync(harness.cwd, { recursive: true, force: true });
   }
 });
+
+test("before_agent_start 在 systemPromptOptions 不可用时不抛出", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const ctx = {
+      cwd: harness.cwd,
+      sessionManager: {
+        getBranch: () => [{ type: "compaction", id: "cp1", details: { compactor: "pi-compact", keptEntryId: "u1" } }],
+        getSessionId: () => "session-no-options",
+      },
+    };
+    assert.doesNotThrow(() => handler({}, ctx));
+    assert.doesNotThrow(() => handler({ systemPromptOptions: {} }, ctx));
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("session_compact 在提交哈希不一致时告警且不写摘要", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const user = messageEntry("mismatch-u1", "user", "哈希不一致");
+    const kept = messageEntry("mismatch-u2", "user", "保留", "mismatch-u1");
+    const compacted = {
+      type: "compaction",
+      id: "mismatch-cp1",
+      parentId: "mismatch-u2",
+      firstKeptEntryId: "mismatch-u2",
+      summary: "{}",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      details: { compactor: "pi-compact", sourceHash: "wrong-hash", sourceRecordCount: 1, sourceEntryIds: ["mismatch-u1"] },
+    };
+    const notes: string[] = [];
+    const handler = harness.handlers.get("session_compact")![0];
+    handler({ fromExtension: true, reason: "manual", compactionEntry: compacted }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [user, kept, compacted], getSessionId: () => "mismatch-session" },
+      ui: { notify(message: string, type?: string) { notes.push(`${type ?? "info"}:${message}`); } },
+    });
+    assert.match(notes.join("\n"), /哈希/);
+    assert.equal(readSessionSummaryEvents(harness.cwd, "mismatch-session").length, 0);
+    assert.equal(readWindowEvents(harness.cwd).length, 0);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
