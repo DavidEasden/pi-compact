@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import { appendSessionSummary, readSessionSummaryEvents, renderSessionSummary, renderSessionSummarySearch, searchSessionSummary, sessionSummaryForBranch } from "../src/core/summary.ts";
+import { stableHash } from "../src/core/jsonl.ts";
+import { appendSessionSummary, readSessionSummaryEvents, renderSessionSummary, renderSessionSummarySearch, searchSessionSummary, sessionSummaryForBranch, sessionSummaryLogPath } from "../src/core/summary.ts";
 import type { HistoryRecord } from "../src/types.ts";
 
 const record = (entryId: string, text: string, sourceOrdinal: number, fields: Partial<HistoryRecord> = {}): HistoryRecord => ({
@@ -112,4 +114,66 @@ test("摘要渲染在多个预算下都不超预算并正确标记省略数", as
   const small = JSON.parse(renderSessionSummary(event, 600));
   assert.ok(small.evidence.length < event.evidence.length);
   assert.ok(small.evidence.some((item: { entryId: string }) => item.entryId === "u0"), "应优先保留最早用户请求");
+}));
+
+test("summary v2 增量事件只存新增证据并重建完整累积", async () => withTemp((cwd) => {
+  const first = appendSessionSummary({
+    cwd, sessionId: "session-a", compactionEntryId: "cp1", sourceHash: "h1",
+    records: [record("u1", "第一段", 0), record("a1", "第一段回复", 1, { kinds: ["assistant"] })],
+  });
+  const second = appendSessionSummary({
+    cwd, sessionId: "session-a", compactionEntryId: "cp2", parentCompactionEntryId: "cp1", sourceHash: "h2",
+    records: [record("u2", "第二段", 2), record("a2", "第二段回复", 3, { kinds: ["assistant"] })],
+  });
+  assert.deepEqual(first.evidence.map((item) => item.entryId), ["u1", "a1"]);
+  assert.deepEqual(second.evidence.map((item) => item.entryId), ["u1", "a1", "u2", "a2"]);
+  const lines = readFileSync(sessionSummaryLogPath(cwd, "session-a"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(lines.length, 2);
+  assert.equal(lines[1].version, 2);
+  assert.equal(lines[1].evidence, undefined);
+  assert.deepEqual(lines[1].evidenceAdded.map((item: { entryId: string }) => item.entryId), ["u2", "a2"]);
+  assert.ok(JSON.stringify(lines[1].evidenceAdded).length < JSON.stringify(second.evidence).length);
+  assert.deepEqual(readSessionSummaryEvents(cwd, "session-a").map((event) => event.evidence.map((item) => item.entryId)), [
+    ["u1", "a1"],
+    ["u1", "a1", "u2", "a2"],
+  ]);
+}));
+
+test("summary 读取兼容旧 v1 完整快照行并可继续追加 v2", async () => withTemp((cwd) => {
+  const sessionId = "legacy-session";
+  const evidence = [{ entryId: "u1", ordinal: 0, kind: "user", excerpt: "旧格式证据", files: [] }];
+  const row = {
+    seq: 1,
+    createdAt: "2024-01-01T00:00:00.000Z",
+    sessionIdHash: createHash("sha256").update(sessionId).digest("hex"),
+    compactionEntryId: "cp-legacy",
+    sourceHash: "h",
+    sourceEntryIds: ["u1"],
+    evidence,
+    previousHash: "",
+    hash: "",
+  };
+  row.hash = stableHash({
+    seq: row.seq,
+    createdAt: row.createdAt,
+    sessionIdHash: row.sessionIdHash,
+    compactionEntryId: row.compactionEntryId,
+    parentCompactionEntryId: "",
+    sourceHash: row.sourceHash,
+    sourceEntryIds: row.sourceEntryIds,
+    evidence: row.evidence,
+    previousHash: row.previousHash,
+  });
+  const path = sessionSummaryLogPath(cwd, sessionId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(row)}\n`);
+  const events = readSessionSummaryEvents(cwd, sessionId);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].compactionEntryId, "cp-legacy");
+  assert.deepEqual(events[0].evidence, evidence);
+  const next = appendSessionSummary({
+    cwd, sessionId, compactionEntryId: "cp2", parentCompactionEntryId: "cp-legacy", sourceHash: "h2",
+    records: [record("u2", "新证据", 1)],
+  });
+  assert.deepEqual(next.evidence.map((item) => item.entryId), ["u1", "u2"]);
 }));

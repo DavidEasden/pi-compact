@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { SessionEntryLike } from "../src/types.ts";
 import test from "node:test";
 import { buildDetails, renderLedger } from "../src/core/ledger.ts";
-import { messageFiles, messageText, snippetAround } from "../src/core/content.ts";
+import { estimateTokensFromText, messageFiles, messageText, snippetAround } from "../src/core/content.ts";
 import { isSafeCut as checkSafeCut } from "../src/hooks.ts";
 import { activeEntryIds, entryToRecord, hashRecords, listRecords, recordsFromEntries, searchRecords } from "../src/core/session.ts";
 
@@ -275,4 +275,22 @@ test("搜索长文本记录时仍按分页返回，并用显式 terms 走同一�
   assert.equal(second.length, 1);
   assert.notEqual(first[0].entryId, second[0].entryId);
   assert.equal(searchRecords(records, "ignored", { terms: ["needle"] }).length, 3);
+});
+
+test("messageFiles 限制递归规模并排除 cwd 目录", () => {
+  const rows = Array.from({ length: 20000 }, (_, i) => ({ path: `src/file-${i}.ts`, cwd: "/project" }));
+  const files = messageFiles({ role: "toolResult", toolName: "search", content: [{ type: "text", text: "结果" }], data: { rows } } as any);
+  assert.ok(files.length > 0);
+  assert.ok(files.length <= 128);
+  assert.equal(files.includes("/project"), false);
+  assert.equal(files.every((file) => file.startsWith("src/file-")), true);
+  assert.deepEqual(messageFiles({ role: "toolResult", cwd: "/project", content: [] } as any), []);
+});
+
+test("混合文本 token 估算对 CJK 字符按字符近似", () => {
+  assert.equal(estimateTokensFromText(""), 0);
+  assert.equal(estimateTokensFromText("abcd"), 1);
+  assert.equal(estimateTokensFromText("中文"), 2);
+  assert.equal(estimateTokensFromText("中文abcd"), 3);
+  assert.equal(estimateTokensFromText("日本語"), 3);
 });

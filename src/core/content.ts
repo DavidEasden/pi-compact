@@ -31,26 +31,48 @@ export const messageText = (message: MessageLike): string => {
   return textOf(message.content);
 };
 
-const fileKeys = new Set(["path", "file", "filePath", "filename", "cwd"]);
-const collectFiles = (value: unknown, output: Set<string>, key?: string): void => {
+const FILE_KEYS = new Set(["path", "file", "filePath", "filename"]);
+// 工具输出可能是嵌套很深的 JSON，甚至每条记录都带路径；必须限制遍历规模。
+const MAX_FILES = 128;
+const MAX_NODES = 2000;
+const MAX_DEPTH = 8;
+
+const collectFiles = (
+  value: unknown,
+  output: Set<string>,
+  state: { nodes: number },
+  depth: number,
+  key?: string,
+): void => {
+  if (output.size >= MAX_FILES || state.nodes >= MAX_NODES) return;
+  state.nodes += 1;
   if (typeof value === "string") {
-    if (key && fileKeys.has(key) && value.length < 1000) output.add(value);
+    if (key && FILE_KEYS.has(key) && value.length > 0 && value.length < 1000) output.add(value);
     return;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectFiles(item, output);
+    for (const item of value) {
+      if (output.size >= MAX_FILES || state.nodes >= MAX_NODES) break;
+      collectFiles(item, output, state, depth + 1);
+    }
     return;
   }
-  if (!value || typeof value !== "object") return;
-  for (const [name, item] of Object.entries(value)) collectFiles(item, output, name);
+  if (!value || typeof value !== "object" || depth >= MAX_DEPTH) return;
+  for (const [name, item] of Object.entries(value)) {
+    if (output.size >= MAX_FILES || state.nodes >= MAX_NODES) break;
+    collectFiles(item, output, state, depth + 1, name);
+  }
 };
 
 export const messageFiles = (message: MessageLike): string[] => {
   const output = new Set<string>();
-  collectFiles(message, output);
+  collectFiles(message, output, { nodes: 0 }, 0);
   if (message.role === "bashExecution") {
     const commandPaths = String(message.command ?? "").match(/(?:^|\s)([\w./-]+\.[A-Za-z0-9_-]+)(?=\s|$)/g) ?? [];
-    for (const path of commandPaths) output.add(path.trim());
+    for (const path of commandPaths) {
+      if (output.size >= MAX_FILES) break;
+      output.add(path.trim());
+    }
   }
   return [...output].filter((file) => file !== "." && file !== ".." && !file.startsWith("http"));
 };
@@ -70,6 +92,14 @@ export const messageKinds = (message: MessageLike): string[] => {
 
 /** Pi estimateTokens 启发式：字符数 / 4 向上取整。这不是 provider usage。 */
 export const estimateTokensFromChars = (charCount: number): number => Math.ceil(Math.max(0, charCount) / 4);
+
+const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/gu;
+
+/** 混合文本的轻量 token 估算：CJK 约 1 字符/token，其余约 4 字符/token；不是 provider usage。 */
+export const estimateTokensFromText = (text: string): number => {
+  const cjkCount = (text.match(CJK_CHAR) ?? []).length;
+  return Math.ceil(cjkCount + (text.length - cjkCount) / 4);
+};
 
 export const clip = (text: string, maxChars: number): string => {
   if (text.length <= maxChars) return text;

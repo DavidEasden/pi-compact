@@ -8,6 +8,7 @@ import { DEFAULT_CONFIG, loadConfig, scaffoldConfig } from "../src/config.ts";
 import { appendMemoryEvent, loadMemories, readMemoryEvents, readWindowEvents } from "../src/core/store.ts";
 import { hashRecords, recordsFromEntries } from "../src/core/session.ts";
 import { appendSessionSummary, readSessionSummaryEvents } from "../src/core/summary.ts";
+import { resetRuntimeStats, runtimeStats } from "../src/core/runtime-stats.ts";
 import { isSafeCut, registerHooks } from "../src/hooks.ts";
 import type { SessionEntryLike } from "../src/types.ts";
 
@@ -305,6 +306,7 @@ test("扩展不注册 context hook；普通历史仍只由工具召回", () => {
 test("压缩成功后按 session 与当前压缩来源写入确定性摘要", () => {
   const harness = createHarness();
   try {
+    resetRuntimeStats();
     registerHooks(harness.pi as any);
     appendMemoryEvent(harness.cwd, {
       type: "create",
@@ -341,6 +343,10 @@ test("压缩成功后按 session 与当前压缩来源写入确定性摘要", ()
       sessionManager: { getBranch: () => branch, getSessionId: () => "session-summary-a" },
       ui: { notify() {} },
     });
+    assert.equal(runtimeStats.compact.lastReason, "manual");
+    assert.equal(runtimeStats.compact.lastRecords, 2);
+    assert.equal(typeof runtimeStats.compact.lastDurationMs, "number");
+    assert.equal(typeof runtimeStats.compact.lastCheckpointChars, "number");
     const events = readSessionSummaryEvents(harness.cwd, "session-summary-a");
     assert.equal(events.length, 1);
     assert.equal(events[0].compactionEntryId, "summary-cp1");
@@ -526,6 +532,7 @@ test("before_agent_start 在 enabled=false 时不追加任何内容", () => {
 test("before_agent_start 注入缓存命中，且记忆写入后重新渲染", () => {
   const harness = createHarness();
   try {
+    resetRuntimeStats();
     registerHooks(harness.pi as any);
     const handler = harness.handlers.get("before_agent_start")![0];
     const compactionEntry = {
@@ -540,8 +547,12 @@ test("before_agent_start 注入缓存命中，且记忆写入后重新渲染", (
     };
     const first = { promptGuidelines: [] as string[] };
     handler({ systemPromptOptions: first }, ctx);
+    assert.equal(runtimeStats.injection.misses, 1);
+    assert.ok(runtimeStats.injection.lastChars > 0);
+    assert.ok(runtimeStats.injection.lastTokens > 0);
     const second = { promptGuidelines: [] as string[] };
     handler({ systemPromptOptions: second }, ctx);
+    assert.equal(runtimeStats.injection.hits, 1);
     assert.deepEqual(second.promptGuidelines, first.promptGuidelines, "相同输入应重放相同字节");
 
     appendMemoryEvent(harness.cwd, {

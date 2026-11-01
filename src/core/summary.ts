@@ -35,17 +35,52 @@ const logPath = (cwd: string, sessionId: string): string => join(summaryDir(cwd)
 /** 供注入读取缓存按文件 stat 失效；路径本身就是 session 的哈希键。 */
 export const sessionSummaryLogPath = (cwd: string, sessionId: string): string => logPath(cwd, sessionId);
 
-const hashable = (event: SessionSummaryEvent): unknown => ({
-  seq: event.seq,
-  createdAt: event.createdAt,
-  sessionIdHash: event.sessionIdHash,
-  compactionEntryId: event.compactionEntryId,
-  parentCompactionEntryId: event.parentCompactionEntryId ?? "",
-  sourceHash: event.sourceHash,
-  sourceEntryIds: event.sourceEntryIds,
-  evidence: event.evidence,
-  previousHash: event.previousHash,
-});
+interface StoredSessionSummaryEvent {
+  seq: number;
+  /** v1 行没有 version，evidence 是完整快照；v2 行用 evidenceAdded 增量。 */
+  version?: 2;
+  createdAt: string;
+  sessionIdHash: string;
+  compactionEntryId: string;
+  parentCompactionEntryId?: string;
+  sourceHash: string;
+  sourceEntryIds: string[];
+  evidence?: SessionEvidence[];
+  evidenceAdded?: SessionEvidence[];
+  maxEvidence?: number;
+  previousHash: string;
+  hash: string;
+}
+
+const hashable = (event: StoredSessionSummaryEvent): unknown => {
+  if (event.version === 2) {
+    return {
+      seq: event.seq,
+      version: 2,
+      createdAt: event.createdAt,
+      sessionIdHash: event.sessionIdHash,
+      compactionEntryId: event.compactionEntryId,
+      parentCompactionEntryId: event.parentCompactionEntryId ?? "",
+      sourceHash: event.sourceHash,
+      sourceEntryIds: event.sourceEntryIds,
+      evidenceAdded: event.evidenceAdded ?? [],
+      maxEvidence: event.maxEvidence,
+      previousHash: event.previousHash,
+    };
+  }
+  // v1 的 hash 输入必须与旧写入格式完全一致，才能继续校验已有日志。
+  return {
+    seq: event.seq,
+    createdAt: event.createdAt,
+    sessionIdHash: event.sessionIdHash,
+    compactionEntryId: event.compactionEntryId,
+    parentCompactionEntryId: event.parentCompactionEntryId ?? "",
+    sourceHash: event.sourceHash,
+    sourceEntryIds: event.sourceEntryIds,
+    evidence: event.evidence ?? [],
+    previousHash: event.previousHash,
+  };
+};
 
 const validEvidence = (value: unknown): value is SessionEvidence => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -58,29 +93,69 @@ const validEvidence = (value: unknown): value is SessionEvidence => {
     && item.files.every((file) => typeof file === "string");
 };
 
-const isEvent = (value: unknown): value is SessionSummaryEvent => {
+const isStoredEvent = (value: unknown): value is StoredSessionSummaryEvent => {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const event = value as Record<string, unknown>;
-  return Number.isSafeInteger(event.seq)
-    && typeof event.createdAt === "string"
-    && typeof event.sessionIdHash === "string"
-    && typeof event.compactionEntryId === "string"
-    && (event.parentCompactionEntryId === undefined || typeof event.parentCompactionEntryId === "string")
-    && typeof event.sourceHash === "string"
-    && Array.isArray(event.sourceEntryIds) && event.sourceEntryIds.every((id) => typeof id === "string")
-    && Array.isArray(event.evidence) && event.evidence.every(validEvidence)
-    && typeof event.previousHash === "string"
-    && typeof event.hash === "string";
+  if (event.version !== undefined && event.version !== 2) return false;
+  if (!Number.isSafeInteger(event.seq)
+    || typeof event.createdAt !== "string"
+    || typeof event.sessionIdHash !== "string"
+    || typeof event.compactionEntryId !== "string"
+    || (event.parentCompactionEntryId !== undefined && typeof event.parentCompactionEntryId !== "string")
+    || typeof event.sourceHash !== "string"
+    || !Array.isArray(event.sourceEntryIds) || !event.sourceEntryIds.every((id) => typeof id === "string")
+    || typeof event.previousHash !== "string"
+    || typeof event.hash !== "string") return false;
+  if (event.version === 2) {
+    return Number.isSafeInteger(event.maxEvidence) && (event.maxEvidence as number) >= 1
+      && Array.isArray(event.evidenceAdded) && event.evidenceAdded.every(validEvidence);
+  }
+  return Array.isArray(event.evidence) && event.evidence.every(validEvidence);
 };
+
+const stableEvidence = (items: SessionEvidence[], maxEvidence: number): SessionEvidence[] => {
+  const byId = new Map<string, SessionEvidence>();
+  for (const item of items) if (!byId.has(item.entryId)) byId.set(item.entryId, item);
+  const unique = [...byId.values()];
+  if (unique.length <= maxEvidence) return unique;
+  const anchor = unique.find((item) => item.kind === "user");
+  const tailLimit = maxEvidence - (anchor ? 1 : 0);
+  const recent = tailLimit > 0 ? unique.filter((item) => item.entryId !== anchor?.entryId).slice(-tailLimit) : [];
+  return anchor ? [anchor, ...recent] : recent;
+};
+
+const toEvent = (row: StoredSessionSummaryEvent, evidence: SessionEvidence[]): SessionSummaryEvent => ({
+  seq: row.seq,
+  createdAt: row.createdAt,
+  sessionIdHash: row.sessionIdHash,
+  compactionEntryId: row.compactionEntryId,
+  ...(row.parentCompactionEntryId ? { parentCompactionEntryId: row.parentCompactionEntryId } : {}),
+  sourceHash: row.sourceHash,
+  sourceEntryIds: row.sourceEntryIds,
+  evidence,
+  previousHash: row.previousHash,
+  hash: row.hash,
+});
 
 export const readSessionSummaryEvents = (cwd: string, sessionId: string): SessionSummaryEvent[] => {
   const rows = readJsonl(logPath(cwd, sessionId));
   const accepted: SessionSummaryEvent[] = [];
+  const byCompaction = new Map<string, SessionSummaryEvent>();
   let previousHash = "";
   for (const row of rows) {
-    if (!isEvent(row) || row.seq !== accepted.length + 1 || row.previousHash !== previousHash || row.hash !== stableHash(hashable(row))) break;
+    if (!isStoredEvent(row) || row.seq !== accepted.length + 1 || row.previousHash !== previousHash || row.hash !== stableHash(hashable(row))) break;
     if (row.sessionIdHash !== sessionKey(sessionId)) break;
-    accepted.push(row);
+    let evidence: SessionEvidence[];
+    if (row.version === 2) {
+      const maxEvidence = Math.max(1, row.maxEvidence ?? 1);
+      const parent = row.parentCompactionEntryId ? byCompaction.get(row.parentCompactionEntryId) : undefined;
+      evidence = stableEvidence([...(parent?.evidence ?? []), ...(row.evidenceAdded ?? [])], maxEvidence);
+    } else {
+      evidence = row.evidence ?? [];
+    }
+    const event = toEvent(row, evidence);
+    accepted.push(event);
+    byCompaction.set(event.compactionEntryId, event);
     previousHash = row.hash;
   }
   return accepted;
@@ -104,17 +179,6 @@ const evidenceFromRecords = (records: HistoryRecord[], perExcerptChars: number):
       files: record.files.slice(0, 8),
     };
   });
-
-const stableEvidence = (items: SessionEvidence[], maxEvidence: number): SessionEvidence[] => {
-  const byId = new Map<string, SessionEvidence>();
-  for (const item of items) if (!byId.has(item.entryId)) byId.set(item.entryId, item);
-  const unique = [...byId.values()];
-  if (unique.length <= maxEvidence) return unique;
-  const anchor = unique.find((item) => item.kind === "user");
-  const tailLimit = maxEvidence - (anchor ? 1 : 0);
-  const recent = tailLimit > 0 ? unique.filter((item) => item.entryId !== anchor?.entryId).slice(-tailLimit) : [];
-  return anchor ? [anchor, ...recent] : recent;
-};
 
 export const appendSessionSummary = (input: {
   cwd: string;
@@ -140,23 +204,26 @@ export const appendSessionSummary = (input: {
       ? events.find((event) => event.compactionEntryId === input.parentCompactionEntryId)
       : undefined;
     const maxEvidence = Math.max(1, input.maxEvidence ?? 80);
-    const newEvidence = evidenceFromRecords(input.records, input.excerptChars ?? 360);
-    const evidence = stableEvidence([...(parent?.evidence ?? []), ...newEvidence], maxEvidence);
-    const event: SessionSummaryEvent = {
+    // 本次新增先按同一上限裁剪；读取时再与 parent 证据合并，结果与旧的完整快照一致。
+    const newEvidence = stableEvidence(evidenceFromRecords(input.records, input.excerptChars ?? 360), maxEvidence);
+    const mergedEvidence = stableEvidence([...(parent?.evidence ?? []), ...newEvidence], maxEvidence);
+    const stored: StoredSessionSummaryEvent = {
       seq: events.length + 1,
+      version: 2,
       createdAt: input.createdAt ?? new Date().toISOString(),
       sessionIdHash: sessionKey(input.sessionId),
       compactionEntryId: input.compactionEntryId,
       ...(input.parentCompactionEntryId ? { parentCompactionEntryId: input.parentCompactionEntryId } : {}),
       sourceHash: input.sourceHash,
       sourceEntryIds: [...new Set(input.records.filter((record) => record.sourceClass === "primary").map((record) => record.entryId))],
-      evidence,
+      evidenceAdded: newEvidence,
+      maxEvidence,
       previousHash: events.at(-1)?.hash ?? "",
       hash: "",
     };
-    event.hash = stableHash(hashable(event));
-    appendJsonl(path, event);
-    return event;
+    stored.hash = stableHash(hashable(stored));
+    appendJsonl(path, stored);
+    return toEvent(stored, mergedEvidence);
   });
 };
 

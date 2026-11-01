@@ -8,6 +8,7 @@ import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { deriveFacts } from "../src/core/derive.ts";
 import { MEMORY_TOOL_MAX_CHARS } from "../src/core/memory-output.ts";
+import { boundSourceEntryIds, MEMORY_MAX_CONTENT_CHARS, MEMORY_MAX_SOURCE_ENTRY_IDS } from "../src/core/memory-policy.ts";
 import { projectMemories } from "../src/core/projector.ts";
 import { recordsFromEntries } from "../src/core/session.ts";
 import {
@@ -702,7 +703,10 @@ test("默认 memory search 优先返回 pinned 与用户权威记忆", async () 
 
     const result = await runTool(tools, "pi_memory_search", {}, ctx, "ordered-list");
     const ids = [...result.content[0].text.matchAll(/^- \[([^\]]+)\]/gm)].map((match: RegExpMatchArray) => match[1]);
-    assert.deepEqual(ids, ["mem_user_pin", "mem_user_active", "mem_rule_old"]);
+    assert.deepEqual(ids, ["mem_user_pin", "mem_user_active"]);
+    // 过期的 provisional 从默认列表隐藏，但显式 status 仍可回查。
+    const stale = await runTool(tools, "pi_memory_search", { status: "provisional" }, ctx, "stale-provisional");
+    assert.match(stale.content[0].text, /mem_rule_old/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -887,4 +891,86 @@ test("批量追加在日志断链后拒绝整批写入", () => {
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+test("pi_memory_propose 对同 scope 同正文只写入一次", async () => {
+  const cwd = tempCwd();
+  try {
+    const { tools } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1");
+    const first = await runTool(tools, "pi_memory_propose", { content: "重复提议" }, ctx, "p1");
+    const second = await runTool(tools, "pi_memory_propose", { content: "重复提议" }, ctx, "p2");
+    assert.equal(second.details.deduplicated, true);
+    assert.match(second.content[0].text, new RegExp(first.details.recordId));
+    assert.equal(loadMemories(cwd).filter((record) => record.content === "重复提议").length, 1);
+    await runTool(tools, "pi_memory_propose", { content: "重复提议", scope: "session" }, ctx, "p3");
+    assert.equal(loadMemories(cwd).filter((record) => record.content === "重复提议").length, 2);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("记忆写入拒绝超过上限的正文，并限制 sourceEntryIds", async () => {
+  const cwd = tempCwd();
+  try {
+    const notes: string[] = [];
+    const { tools, commands } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1", notes);
+    const tooLong = "x".repeat(MEMORY_MAX_CONTENT_CHARS + 1);
+    const proposed = await runTool(tools, "pi_memory_propose", { content: tooLong }, ctx, "p1");
+    assert.equal(proposed.details.rejected, true);
+    assert.equal(loadMemories(cwd).length, 0);
+    await commands.get("remember").handler(tooLong, ctx);
+    assert.match(notes.at(-1) ?? "", /超过/);
+    assert.equal(loadMemories(cwd).length, 0);
+
+    const sourceIds = Array.from({ length: 100 }, (_, i) => `entry-${i}`);
+    const bounded = await runTool(tools, "pi_memory_propose", { content: "带很多来源", sourceEntryIds: sourceIds }, ctx, "p2");
+    assert.equal(bounded.details.sourceEntryIdsTruncated, true);
+    const record = loadMemories(cwd).find((item) => item.content === "带很多来源")!;
+    assert.equal(record.sourceEntryIds.length, MEMORY_MAX_SOURCE_ENTRY_IDS);
+
+    const updated = await runTool(tools, "pi_memory_update", { recordId: record.id, action: "edit", content: tooLong }, ctx, "p3");
+    assert.equal(updated.details.rejected, true);
+    assert.equal(loadMemories(cwd).find((item) => item.id === record.id)?.content, "带很多来源");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("过期 provisional 从 /memories 默认列表隐藏，显式 status 可见", async () => {
+  const cwd = tempCwd();
+  try {
+    const notes: string[] = [];
+    const { commands } = registerMemoryHarness();
+    const ctx = memoryCtx(cwd, "s1", notes);
+    appendMemoryEvent(cwd, {
+      type: "create", recordId: "mem_old", author: "model",
+      ts: new Date(Date.now() - 40 * 86_400_000).toISOString(),
+      payload: { kind: "fact", content: "过期提议", scope: "workspace", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "old" },
+    });
+    appendMemoryEvent(cwd, {
+      type: "create", recordId: "mem_new", author: "model",
+      ts: new Date().toISOString(),
+      payload: { kind: "fact", content: "新提议", scope: "workspace", status: "provisional", priority: "normal", sourceEntryIds: [], sourceHash: "new" },
+    });
+    await commands.get("memories").handler("", ctx);
+    assert.match(notes.at(-1) ?? "", /mem_new/);
+    assert.equal((notes.at(-1) ?? "").includes("mem_old"), false);
+    await commands.get("memories").handler("status:provisional", ctx);
+    assert.match(notes.at(-1) ?? "", /mem_old/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("boundSourceEntryIds 去重并限制条数与总字符", () => {
+  const many = Array.from({ length: 100 }, (_, i) => `e${i}`);
+  const bounded = boundSourceEntryIds(["a", "a", "", ...many]);
+  assert.equal(bounded.truncated, true);
+  assert.equal(bounded.ids.length, MEMORY_MAX_SOURCE_ENTRY_IDS);
+  assert.equal(bounded.ids[0], "a");
+  const chars = boundSourceEntryIds(["x".repeat(4096), "y"]);
+  assert.equal(chars.truncated, true);
+  assert.deepEqual(chars.ids, ["x".repeat(4096)]);
 });
