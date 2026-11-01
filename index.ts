@@ -3,6 +3,7 @@ import { scaffoldConfig } from "./src/config.ts";
 import { registerHooks } from "./src/hooks.ts";
 import { registerMemory } from "./src/memory.ts";
 import { registerRecall } from "./src/recall.ts";
+import { registerStatus } from "./src/status.ts";
 import { ensureStore } from "./src/core/store.ts";
 
 export default function piCompact(pi: ExtensionAPI): void {
@@ -13,4 +14,5 @@ export default function piCompact(pi: ExtensionAPI): void {
   registerHooks(pi);
   registerRecall(pi);
   registerMemory(pi);
+  registerStatus(pi);
 }
