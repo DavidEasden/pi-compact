@@ -373,7 +373,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       // 准备阶段只计算。窗口与派生记忆在宿主确认提交之后才持久化。
       // 窗口 ID 此时尚未确认，传入 undefined；session_compact 成功后才写入最终 windowId。
       const ledger = renderLedger(records, event.reason, keptEntryId, config.summaryMaxChars);
-      const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars);
+      const details = buildDetails(records, event.reason, keptEntryId, ledger.omitted, ledger.text.length, config.summaryMaxChars, undefined, ledger.sourceHash);
       details.isSplitTurn = keptEntryId === proposedKeptEntryId ? isSplitTurn : isSplitAt(branch, keptEntryId);
       if (config.debug) {
         console.log(`[pi-compact] ${event.reason}: sourceRecordCount=${records.length} checkpointChars=${ledger.text.length} omitted=${ledger.omitted} estimatedTokensAfter=${details.estimatedTokensAfter} kept=${keptEntryId}`);

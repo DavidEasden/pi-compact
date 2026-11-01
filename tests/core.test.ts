@@ -96,9 +96,11 @@ test("ledger 只写入不含历史正文的可验证 checkpoint", () => {
   assert.equal(checkpoint.compactor, "pi-compact");
   assert.equal(checkpoint.sourceCount, records.length);
   assert.equal(checkpoint.sourceHash, hashRecords(records));
+  assert.equal(result.sourceHash, hashRecords(records));
   assert.equal(result.omitted, records.length);
   assert.equal(result.text.includes("refreshToken"), false);
-  const details = buildDetails(records, "threshold", "tail", result.omitted, result.text.length, 800);
+  const details = buildDetails(records, "threshold", "tail", result.omitted, result.text.length, 800, undefined, result.sourceHash);
+  assert.equal(details.sourceHash, result.sourceHash);
   assert.equal(details.compactor, "pi-compact");
   assert.equal(details.version, 1);
   assert.equal(details.checkpointChars, result.text.length);
