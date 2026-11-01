@@ -5,6 +5,7 @@ import { loadConfig } from "./config.ts";
 import { clip } from "./core/content.ts";
 import { formatMemoryRead, formatMemorySearch } from "./core/memory-output.ts";
 import { searchMemoryRecords, sortMemoryRecords } from "./core/memory-search.ts";
+import { boundSourceEntryIds, contentTooLong, isStaleProvisional, MEMORY_MAX_CONTENT_CHARS } from "./core/memory-policy.ts";
 import { appendMemoryEvent, contentHash, loadMemories, newMemoryId, withMemoryLogLock } from "./core/store.ts";
 import type { MemoryKind, MemoryPriority, MemoryRecord, MemoryScope, MemoryStatus } from "./types.ts";
 
@@ -93,6 +94,7 @@ const formatRecord = (record: MemoryRecord): string => (
 const createUserMemory = (cwd: string, ctx: any, input: MemoryCommandInput, pin: boolean): MemoryRecord | undefined => {
   const content = input.content.trim();
   if (!content) return undefined;
+  if (contentTooLong(content)) throw new Error(`记忆正文超过 ${MEMORY_MAX_CONTENT_CHARS} 字符上限`);
   const recordId = newMemoryId();
   // create(+pin) 是一个完整事务，放在同一把锁内；失败会抛出，不会假报成功。
   return withMemoryLogLock(cwd, (): MemoryRecord | undefined => {
@@ -126,6 +128,7 @@ const supersedeUserMemory = (cwd: string, ctx: any, targetId: string, input: Mem
     const current = visibleMemories(cwd, sessionIdOf(ctx)).find((record) => record.id === targetId);
     if (!current || current.status === "superseded" || current.status === "resolved") return undefined;
     const content = input.content.trim() || current.content;
+    if (contentTooLong(content)) throw new Error(`记忆正文超过 ${MEMORY_MAX_CONTENT_CHARS} 字符上限`);
     appendMemoryEvent(cwd, {
       type: "supersede",
       recordId: targetId,
@@ -201,7 +204,10 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       const input = parseTokens(args);
       let records = visibleMemories(ctx.cwd, sessionIdOf(ctx));
       if (input.status) records = records.filter((record) => record.status === input.status);
-      else records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
+      else records = records.filter((record) => (
+        (record.status === "pinned" || record.status === "active" || record.status === "provisional")
+        && !isStaleProvisional(record)
+      ));
       if (input.kind) records = records.filter((record) => record.kind === input.kind);
       if (input.query) records = searchMemoryRecords(records, input.query);
       else records = sortMemoryRecords(records);
@@ -276,7 +282,10 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       if (explicitStatus) records = records.filter((record) => record.status === explicitStatus);
       if (input.kind && KINDS.has(input.kind as MemoryKind)) records = records.filter((record) => record.kind === input.kind);
       if (input.query?.trim()) records = searchMemoryRecords(records, input.query);
-      else if (!explicitStatus) records = records.filter((record) => record.status === "pinned" || record.status === "active" || record.status === "provisional");
+      else if (!explicitStatus) records = records.filter((record) => (
+        (record.status === "pinned" || record.status === "active" || record.status === "provisional")
+        && !isStaleProvisional(record)
+      ));
       records = sortMemoryRecords(records);
       const offset = input.offset ?? 0;
       const total = records.length;
@@ -354,28 +363,57 @@ export const registerMemory = (pi: ExtensionAPI): void => {
       if (!content) {
         return { content: [{ type: "text", text: "pi-compact: content 不能为空。" }], details: { count: 0 } };
       }
+      if (contentTooLong(content)) {
+        return { content: [{ type: "text", text: `pi-compact: 记忆正文超过 ${MEMORY_MAX_CONTENT_CHARS} 字符上限，未写入。` }], details: { count: 0, rejected: true } };
+      }
       const sessionId = sessionIdOf(ctx);
       const scope = input.scope && SCOPES.has(input.scope as MemoryScope) ? input.scope as MemoryScope : "workspace";
       if (scope === "session" && !sessionId) {
         return { content: [{ type: "text", text: "pi-compact: 当前会话没有 sessionId，不能创建 session 范围记忆。" }], details: { count: 0, rejected: true } };
       }
+      const sourceEntryIds = boundSourceEntryIds(input.sourceEntryIds ?? []);
       const recordId = newMemoryId();
       try {
-        appendMemoryEvent(ctx.cwd, {
-          type: "create",
-          recordId,
-          author: "model",
-          sessionId,
-          payload: {
-            kind: input.kind && KINDS.has(input.kind as MemoryKind) ? input.kind as MemoryKind : "fact",
-            content,
-            scope,
-            status: "provisional",
-            priority: input.priority && PRIORITIES.has(input.priority as MemoryPriority) ? input.priority as MemoryPriority : "normal",
-            sourceEntryIds: input.sourceEntryIds ?? [],
-            sourceHash: contentHash(content),
-            provenance: "model:pi_memory_propose",
-          },
+        return withMemoryLogLock(ctx.cwd, () => {
+          // 同一 scope/session 下相同正文的模型提议只保留一条，避免重复注入候选。
+          const existing = loadMemories(ctx.cwd).find((record) => (
+            record.author === "model"
+            && record.status === "provisional"
+            && record.scope === scope
+            && (scope !== "session" || record.sessionId === sessionId)
+            && record.content === content
+          ));
+          if (existing) {
+            return {
+              content: [{ type: "text", text: `已存在 provisional 记忆 ${existing.id}，本次未重复写入。` }],
+              details: { source: "memory-log", recordId: existing.id, status: "provisional", deduplicated: true },
+            };
+          }
+          appendMemoryEvent(ctx.cwd, {
+            type: "create",
+            recordId,
+            author: "model",
+            sessionId,
+            payload: {
+              kind: input.kind && KINDS.has(input.kind as MemoryKind) ? input.kind as MemoryKind : "fact",
+              content,
+              scope,
+              status: "provisional",
+              priority: input.priority && PRIORITIES.has(input.priority as MemoryPriority) ? input.priority as MemoryPriority : "normal",
+              sourceEntryIds: sourceEntryIds.ids,
+              sourceHash: contentHash(content),
+              provenance: "model:pi_memory_propose",
+            },
+          });
+          return {
+            content: [{ type: "text", text: `已记录 provisional 记忆 ${recordId}。在用户 /remember 确认前，它不是权威事实，也不会被自动 pin。${sourceEntryIds.truncated ? " sourceEntryIds 已按上限截断。" : ""}` }],
+            details: {
+              source: "memory-log",
+              recordId,
+              status: "provisional",
+              ...(sourceEntryIds.truncated ? { sourceEntryIdsTruncated: true } : {}),
+            },
+          };
         });
       } catch (error) {
         return {
@@ -383,10 +421,6 @@ export const registerMemory = (pi: ExtensionAPI): void => {
           details: { count: 0, error: true },
         };
       }
-      return {
-        content: [{ type: "text", text: `已记录 provisional 记忆 ${recordId}。在用户 /remember 确认前，它不是权威事实，也不会被自动 pin。` }],
-        details: { source: "memory-log", recordId, status: "provisional" },
-      };
     },
   } as any);
 
@@ -431,6 +465,9 @@ export const registerMemory = (pi: ExtensionAPI): void => {
           const content = input.content?.trim();
           if (!content) {
             return { content: [{ type: "text", text: "edit 需要提供 content。" }], details: { count: 0 } };
+          }
+          if (contentTooLong(content)) {
+            return { content: [{ type: "text", text: `记忆正文超过 ${MEMORY_MAX_CONTENT_CHARS} 字符上限，未更新。` }], details: { count: 0, rejected: true } };
           }
           appendMemoryEvent(ctx.cwd, {
             type: "supersede",
