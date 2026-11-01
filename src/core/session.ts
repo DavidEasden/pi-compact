@@ -84,10 +84,11 @@ export const recordsFromEntries = (entries: SessionEntryLike[], allowedIds?: Set
   const result: HistoryRecord[] = [];
   let ordinal = 0;
   for (const entry of entries) {
+    // 先按 active lineage 过滤，避免为兄弟分支构造 text/files/kinds。
+    if (allowedIds && (typeof entry.id !== "string" || !allowedIds.has(entry.id))) continue;
     const record = entryToRecord(entry, ordinal);
     if (!record) continue;
     ordinal++;
-    if (allowedIds && !allowedIds.has(record.entryId)) continue;
     result.push(record);
   }
   return result;
@@ -100,16 +101,6 @@ export const activeEntryIds = (sessionManager: any): Set<string> => {
     return new Set<string>(branch.map((entry: any) => entry.id).filter((id: unknown): id is string => typeof id === "string"));
   } catch {
     // 查询 active lineage 失败时宁可不召回，也不扩大到兄弟分支。
-    return new Set<string>();
-  }
-};
-
-export const contextEntryIds = (sessionManager: any): Set<string> => {
-  try {
-    const entries = sessionManager.buildContextEntries?.();
-    if (!Array.isArray(entries)) return new Set<string>();
-    return new Set<string>(entries.map((entry: any) => entry.id).filter((id: unknown): id is string => typeof id === "string"));
-  } catch {
     return new Set<string>();
   }
 };

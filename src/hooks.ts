@@ -9,16 +9,21 @@ import { runtimeStats } from "./core/runtime-stats.ts";
 import { appendMemoryEvents, contentHash, loadMemories, memoryLogPath, readWindowEvents, withMemoryLogLock, withWindowLogLock } from "./core/store.ts";
 import type { MemoryEventInput } from "./core/store.ts";
 import { buildWindowManifest, persistWindowManifest } from "./core/window.ts";
-import { MEMORY_HINT_TYPE, renderWorkingHint } from "./core/working.ts";
+import { renderWorkingHint } from "./core/working.ts";
 import { appendSessionSummary, renderSessionSummary, sessionSummaryForBranch, sessionSummaryLogPath } from "./core/summary.ts";
 import type { SessionSummaryEvent } from "./core/summary.ts";
 import type { MemoryRecord, SessionEntryLike } from "./types.ts";
 
-export const AUTO_RECALL_TYPE = "pi-compact-auto-recall";
-export { MEMORY_HINT_TYPE };
-
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TERMINAL_ASSISTANT_REASONS = new Set(["error", "aborted"]);
+
+/** Pi 版本缺少 promptGuidelines 时跳过注入，而不是让整个 before_agent_start 抛错。 */
+const pushPromptGuideline = (event: any, text: string): boolean => {
+  const guidelines = event?.systemPromptOptions?.promptGuidelines;
+  if (!Array.isArray(guidelines)) return false;
+  guidelines.push(text);
+  return true;
+};
 
 // 在副本中追加候选 compaction，由 Pi 应用保留区内的最后一次 context_edit。
 // 回退可能重新保留旧消息或旧编辑，不能直接切片压缩前的投影。
@@ -78,6 +83,9 @@ export const isSafeCut = (branchEntries: SessionEntryLike[], keptEntryId: string
   }
 };
 
+/** 回退预演上限：极端长会话里逐个全量投影可能阻塞事件循环，超过后按“无安全边界”处理。 */
+const MAX_EARLIER_CUT_PROBES = 200;
+
 /** 向前逐个预演候选边界；只有最终投影安全时才回退，否则取消压缩。 */
 export const findEarlierSafeCut = (branch: SessionEntryLike[], proposedId: string): string | undefined => {
   const proposed = branch.findIndex((entry) => entry.id === proposedId);
@@ -88,7 +96,9 @@ export const findEarlierSafeCut = (branch: SessionEntryLike[], proposedId: strin
   } catch {
     return undefined;
   }
+  let probes = 0;
   for (let index = proposed; index >= 1; index--) {
+    if (++probes > MAX_EARLIER_CUT_PROBES) return undefined;
     const entry = branch[index];
     if (typeof entry?.id === "string" && activeIds.has(entry.id) && isSafeCut(branch, entry.id)) return entry.id;
   }
@@ -306,8 +316,9 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     if (config.sessionSummary.enabled && config.sessionSummary.inject && sessionId && compactionIds.length > 0) {
       try {
         summary = readInjectionSummary(ctx.cwd, sessionId, compactionIds);
-      } catch {
+      } catch (error) {
         // 摘要读取失败不应阻断请求；原始历史仍可通过召回工具访问。
+        if (config.debug) console.log(`[pi-compact] session-summary read failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
@@ -323,8 +334,9 @@ export const registerHooks = (pi: ExtensionAPI): void => {
           && (record.status === "pinned" || record.status === "active")
           && (record.scope !== "session" || record.sessionId === sessionId)
         ));
-      } catch {
+      } catch (error) {
         // 记忆读取失败不应阻断请求。
+        if (config.debug) console.log(`[pi-compact] memory read failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
@@ -352,7 +364,7 @@ export const registerHooks = (pi: ExtensionAPI): void => {
         console.log(`[pi-compact] before_agent_start: cache hit key=${cacheKey.slice(0, 64)}`);
       }
       rememberInjection(cacheKey, cached);
-      if (cached) event.systemPromptOptions.promptGuidelines.push(cached);
+      if (cached) pushPromptGuideline(event, cached);
       return;
     }
 
@@ -408,7 +420,9 @@ export const registerHooks = (pi: ExtensionAPI): void => {
     if (config.debug) {
       console.log(`[pi-compact] before_agent_start: cache miss → rendered compactionPointer=${compactionPointer.length > 0} memoryHint=${memoryHint.length > 0} chars=${chars}`);
     }
-    event.systemPromptOptions.promptGuidelines.push(entry);
+    if (!pushPromptGuideline(event, entry) && config.debug) {
+      console.log("[pi-compact] before_agent_start: systemPromptOptions.promptGuidelines 不可用，已跳过本次注入");
+    }
   });
 
   pi.on("session_before_compact", async (event: any, ctx: any) => {
@@ -455,7 +469,8 @@ export const registerHooks = (pi: ExtensionAPI): void => {
         tokensBefore: event.preparation.tokensBefore,
         details,
       } };
-    } catch {
+    } catch (error) {
+      if (config.debug) console.log(`[pi-compact] compaction preparation failed: ${error instanceof Error ? error.message : String(error)}`);
       ctx.ui?.notify?.("pi-compact: 压缩处理出错，已降级为指针型 checkpoint，未回退到 LLM 摘要。", "warning");
       return fallbackCheckpoint(event.reason, keptEntryId, event.preparation?.tokensBefore ?? 0, config.summaryMaxChars);
     }
@@ -477,7 +492,8 @@ export const registerHooks = (pi: ExtensionAPI): void => {
       if (typeof entry.id !== "string" || typeof entry.firstKeptEntryId !== "string") throw new Error("missing committed compaction identity");
       // 提交后从分支中移除刚写入的 compaction，重建提交前 projection，避免重新读取已被 context_edit 隐藏的 raw 正文。
       records = recordsBeforeCut(branch, entry.firstKeptEntryId, entry.id);
-    } catch {
+    } catch (error) {
+      if (config.debug) console.log(`[pi-compact] committed projection rebuild failed: ${error instanceof Error ? error.message : String(error)}`);
       ctx.ui?.notify?.("pi-compact: 无法重建提交前的上下文投影，窗口日志和派生记忆未写入。", "warning");
       return;
     }
@@ -544,6 +560,9 @@ export const registerHooks = (pi: ExtensionAPI): void => {
           ctx.ui?.notify?.("pi-compact: 压缩已完成，但派生记忆写入失败。", "warning");
         }
       }
+    } else {
+      if (config.debug) console.log(`[pi-compact] commit hash mismatch: expected=${String(details.sourceHash).slice(0, 16)} actual=${hashRecords(records).slice(0, 16)}`);
+      ctx.ui?.notify?.("pi-compact: 压缩已完成，但提交后的记录哈希与准备阶段不一致，窗口/摘要/派生记忆未写入。", "warning");
     }
     runtimeStats.compact = {
       lastReason: event.reason,

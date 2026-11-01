@@ -9,7 +9,12 @@ import { ensureStore } from "./src/core/store.ts";
 export default function piCompact(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     scaffoldConfig(ctx.cwd);
-    ensureStore(ctx.cwd);
+    // 只读工作区无法创建 store 时不应阻止扩展加载；后续写入会给出明确错误。
+    try {
+      ensureStore(ctx.cwd);
+    } catch {
+      // 忽略目录创建失败。
+    }
   });
   registerHooks(pi);
   registerRecall(pi);

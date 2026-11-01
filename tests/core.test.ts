@@ -294,3 +294,11 @@ test("混合文本 token 估算对 CJK 字符按字符近似", () => {
   assert.equal(estimateTokensFromText("中文abcd"), 3);
   assert.equal(estimateTokensFromText("日本語"), 3);
 });
+
+test("recordsFromEntries 先按 allowed lineage 过滤兄弟分支", () => {
+  const allowed = { type: "message", id: "allowed", message: { role: "user", content: "保留" } };
+  const sibling = { type: "message", id: "sibling", message: { role: "toolResult", content: [{ type: "text", text: "x".repeat(100000) }] } };
+  const records = recordsFromEntries([allowed, sibling], new Set(["allowed"]));
+  assert.deepEqual(records.map((record) => record.entryId), ["allowed"]);
+  assert.equal(records[0].sourceOrdinal, 0);
+});
