@@ -276,3 +276,13 @@ test("搜索长文本记录时仍按分页返回，并用显式 terms 走同一�
   assert.notEqual(first[0].entryId, second[0].entryId);
   assert.equal(searchRecords(records, "ignored", { terms: ["needle"] }).length, 3);
 });
+
+test("messageFiles 限制递归规模并排除 cwd 目录", () => {
+  const rows = Array.from({ length: 20000 }, (_, i) => ({ path: `src/file-${i}.ts`, cwd: "/project" }));
+  const files = messageFiles({ role: "toolResult", toolName: "search", content: [{ type: "text", text: "结果" }], data: { rows } } as any);
+  assert.ok(files.length > 0);
+  assert.ok(files.length <= 128);
+  assert.equal(files.includes("/project"), false);
+  assert.equal(files.every((file) => file.startsWith("src/file-")), true);
+  assert.deepEqual(messageFiles({ role: "toolResult", cwd: "/project", content: [] } as any), []);
+});
