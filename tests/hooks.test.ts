@@ -522,3 +522,83 @@ test("before_agent_start 在 enabled=false 时不追加任何内容", () => {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
 });
+
+test("before_agent_start 注入缓存命中，且记忆写入后重新渲染", () => {
+  const harness = createHarness();
+  try {
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const compactionEntry = {
+      type: "compaction",
+      id: "cache-cp1",
+      firstKeptEntryId: "cache-u2",
+      details: { compactor: "pi-compact", sourceHash: "cache-source", keptEntryId: "cache-u2", sourceCount: 1 },
+    };
+    const ctx = {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [compactionEntry], getSessionId: () => "session-cache-a" },
+    };
+    const first = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions: first }, ctx);
+    const second = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions: second }, ctx);
+    assert.deepEqual(second.promptGuidelines, first.promptGuidelines, "相同输入应重放相同字节");
+
+    appendMemoryEvent(harness.cwd, {
+      type: "create",
+      recordId: "mem_cache_user",
+      author: "user",
+      payload: {
+        kind: "fact", content: "缓存失效后必须注入的新记忆", scope: "workspace", status: "active",
+        priority: "normal", sourceEntryIds: [], sourceHash: "cache",
+      },
+    });
+    const third = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions: third }, ctx);
+    assert.match(third.promptGuidelines.join("\n"), /缓存失效后必须注入的新记忆/);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});
+
+test("before_agent_start 摘要读取缓存按文件与 compaction 链失效", () => {
+  const harness = createHarness();
+  try {
+    appendSessionSummary({
+      cwd: harness.cwd,
+      sessionId: "session-cache-b",
+      compactionEntryId: "cache-cp1",
+      sourceHash: "h1",
+      records: recordsFromEntries([messageEntry("cache-u1", "user", "第一段摘要内容")]),
+    });
+    registerHooks(harness.pi as any);
+    const handler = harness.handlers.get("before_agent_start")![0];
+    const cp1 = { type: "compaction", id: "cache-cp1", details: { compactor: "pi-compact" } };
+    const first = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions: first }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [cp1], getSessionId: () => "session-cache-b" },
+    });
+    assert.match(first.promptGuidelines.join("\n"), /第一段摘要内容/);
+
+    appendSessionSummary({
+      cwd: harness.cwd,
+      sessionId: "session-cache-b",
+      compactionEntryId: "cache-cp2",
+      parentCompactionEntryId: "cache-cp1",
+      sourceHash: "h2",
+      records: recordsFromEntries([messageEntry("cache-u2", "user", "第二段摘要内容")]),
+    });
+    const cp2 = { type: "compaction", id: "cache-cp2", details: { compactor: "pi-compact" } };
+    const second = { promptGuidelines: [] as string[] };
+    handler({ systemPromptOptions: second }, {
+      cwd: harness.cwd,
+      sessionManager: { getBranch: () => [cp1, cp2], getSessionId: () => "session-cache-b" },
+    });
+    const text = second.promptGuidelines.join("\n");
+    assert.match(text, /第二段摘要内容/);
+    assert.match(text, /第一段摘要内容/);
+  } finally {
+    rmSync(harness.cwd, { recursive: true, force: true });
+  }
+});

@@ -13,7 +13,7 @@ export const renderLedger = (
   keptEntryId: string,
   maxChars: number,
   options?: { extraHeaderLines?: string[]; windowId?: string },
-): { text: string; omitted: number } => {
+): { text: string; omitted: number; sourceHash: string } => {
   const omitted = new Set(records.map((record) => record.entryId)).size;
   const sourceHash = hashRecords(records);
   // windowId 和 keptEntryId 均为扩展自身生成的标识符，不包含任何历史正文。
@@ -26,7 +26,7 @@ export const renderLedger = (
   if (options?.windowId) payload.windowId = options.windowId;
   const text = JSON.stringify(payload);
   // 不截断 JSON，也不在预算不足或异常时回填历史正文或行为提示词。
-  return { text: text.length <= maxChars ? text : maxChars >= 2 ? "{}" : "", omitted };
+  return { text: text.length <= maxChars ? text : maxChars >= 2 ? "{}" : "", omitted, sourceHash };
 };
 
 export const buildDetails = (
@@ -37,12 +37,14 @@ export const buildDetails = (
   checkpointChars: number,
   summaryMaxChars: number,
   window?: CompactionDetails["window"],
+  /** 已由 renderLedger 算出的 sourceHash；传入时不再对同一批 records 重复哈希。 */
+  sourceHash?: string,
 ): CompactionDetails => ({
   compactor: "pi-compact",
   version: 1,
   reason,
   sourceEntryIds: [...new Set(records.map((record) => record.entryId))],
-  sourceHash: hashRecords(records),
+  sourceHash: sourceHash ?? hashRecords(records),
   sourceRecordCount: records.length,
   keptEntryId,
   omittedRecordCount,

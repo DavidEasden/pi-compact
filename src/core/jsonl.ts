@@ -62,8 +62,21 @@ export const readJsonl = (path: string): unknown[] => {
   return rows;
 };
 
-export const appendJsonl = (path: string, value: unknown): void => {
+export const appendJsonlBatch = (path: string, values: unknown[]): void => {
+  if (values.length === 0) return;
   ensureDir(dirname(path));
   sealPartialLine(path);
-  appendFileSync(path, `${JSON.stringify(value)}\n`);
+  // 单次调用可写入多条事件，但仍按固定大小分块，避免一次性构造超大字符串。
+  let buffer = "";
+  for (const value of values) {
+    const line = `${JSON.stringify(value)}\n`;
+    if (buffer.length > 0 && buffer.length + line.length > 1024 * 1024) {
+      appendFileSync(path, buffer);
+      buffer = "";
+    }
+    buffer += line;
+  }
+  if (buffer.length > 0) appendFileSync(path, buffer);
 };
+
+export const appendJsonl = (path: string, value: unknown): void => appendJsonlBatch(path, [value]);

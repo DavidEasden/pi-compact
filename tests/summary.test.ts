@@ -92,3 +92,24 @@ test("损坏摘要日志只接受可信前缀并拒绝追加", async () => withT
   assert.throws(() => appendSessionSummary({ cwd, sessionId: "session-a", compactionEntryId: "cp2", sourceHash: "h2", records: [] }), /invalid event/);
   assert.equal(readFileSync(log, "utf8").split("\n").length, 3);
 }));
+
+test("摘要渲染在多个预算下都不超预算并正确标记省略数", async () => withTemp((cwd) => {
+  const event = appendSessionSummary({
+    cwd,
+    sessionId: "session-a",
+    compactionEntryId: "cp1",
+    sourceHash: "h",
+    maxEvidence: 20,
+    records: Array.from({ length: 20 }, (_, i) => record(`u${i}`, `用户消息 ${i} ${"内容".repeat(80)}`, i)),
+  });
+  for (const budget of [600, 800, 1200, 2400, 6000]) {
+    const text = renderSessionSummary(event, budget);
+    assert.ok(text.length <= budget, `budget=${budget} text=${text.length}`);
+    const parsed = JSON.parse(text);
+    assert.equal(typeof parsed.omittedEvidenceCount, "number");
+    assert.equal(parsed.omittedEvidenceCount, event.evidence.length - parsed.evidence.length);
+  }
+  const small = JSON.parse(renderSessionSummary(event, 600));
+  assert.ok(small.evidence.length < event.evidence.length);
+  assert.ok(small.evidence.some((item: { entryId: string }) => item.entryId === "u0"), "应优先保留最早用户请求");
+}));
