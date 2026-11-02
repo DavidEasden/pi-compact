@@ -69,7 +69,7 @@ test("Pi SDK：元数据边界的 overflow retry 实际恢复", async () => {
   } finally { h.close(); }
 });
 
-test("Pi 0.87.1：被省略的 toolResult 切点原样提交，恢复后无孤立工具调用", async () => {
+test("Pi 1.4.0：被省略的 toolResult 切点原样提交，恢复后无孤立工具调用", async () => {
   const h = await createHarness({ persistent: true });
   try {
     h.sm.appendMessage(user("执行读取"));
@@ -97,7 +97,7 @@ test("Pi 0.87.1：被省略的 toolResult 切点原样提交，恢复后无孤�
 });
 
 for (const replacement of [null, { content: "撤回工具调用" }]) {
-  test(`Pi 0.87.1：${replacement === null ? "省略" : "替换"}调用后拒绝保留孤立结果，取消无写入`, async () => {
+  test(`Pi 1.4.0：${replacement === null ? "省略" : "替换"}调用后拒绝保留孤立结果，取消无写入`, async () => {
     const h = await createHarness();
     try {
       h.sm.appendMessage(user("旧任务"));
