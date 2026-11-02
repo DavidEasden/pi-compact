@@ -24,7 +24,7 @@ The core of `pi-compact` is long-term memory. Compaction manages window capacity
 
 ## Installation
 
-The current source requires Pi `>=0.87.1`; development and integration tests pin `0.87.1`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.7.0` matches the current source.
+The current source requires Pi `>=0.87.1`; development and integration tests pin `1.4.0`, which requires Node.js `>=22.19.0`. The instructions below assume this repository lives at `github.com/DavidEasden/pi-compact`. The published `v0.7.0` matches the current source.
 
 Pi packages execute extension code, so review the source before installing.
 
@@ -112,7 +112,7 @@ This writes to the global Pi settings by default. Use `-l` to write to the curre
 pi install -l /absolute/path/to/pi-compact
 ```
 
-The extension uses Pi's `@earendil-works/pi-coding-agent` API, verified against Pi `0.87.1` for `context_edit` and post-compaction projections. Pi and `typebox` are peer dependencies provided by the Pi environment; the development dependency pins Pi `0.87.1` for reproducible host integration tests.
+The extension uses Pi's `@earendil-works/pi-coding-agent` API, verified against Pi `1.4.0` for `context_edit`, post-compaction projections, and the current extension lifecycle. Pi and `typebox` are peer dependencies provided by the Pi environment; the development dependency pins Pi `1.4.0` for reproducible host integration tests.
 
 ## Configuration
 
@@ -239,7 +239,13 @@ Memory tools:
 
 Rule-derived memories have `author=rule` and provenance, stay provisional, and are not user-confirmed facts. They use `scope=session` and are visible only in the session that produced them. Beyond files, commands, and test counts, the extractor only picks short user sentences carrying durability markers such as “prefer”, “by default”, “always”, or “in this project”, classifying them as preference, constraint, or decision. It does not analyze assistant narration, does not infer long-term preferences from ordinary requests, and skips suspected credential content. Without a valid session ID nothing is derived. Records stay provisional until the user confirms them and are never injected as authoritative memory; legacy rule-derived workspace provisional records are marked resolved on the next successful compaction, while user-written records are untouched.
 
+Durable-memory writes are bounded. A memory body over `8000` characters is rejected rather than truncated. `sourceEntryIds` are deduplicated and capped at `64` entries / `4096` characters, with truncation reported in the tool result. Model proposals with identical content in the same scope (and session, for `scope:session`) are written once. Provisional records authored by the model or rules leave default lists and search after `30` days; explicit `status:provisional` queries still return them, and user-authored records never expire this way. Memory search and read output is capped at `16000` characters including JSON metadata and escaping; search excerpts are limited to `600` characters per body, and omitted content can be read by ID.
+
 With `debug=true`, the extension logs summary/derivation candidate counts, characters and token estimates, elapsed time, failure categories, and — at Pi's `before_provider_request` boundary — payload and stable-prefix hashes and lengths; assistant usage records the provider-reported `input`/`output`/`cacheRead`/`cacheWrite`. Logs never contain prompt or memory body text. Hash/prefix stability only verifies the provider payload the extension actually observes; `cacheRead`/`cacheWrite` are provider-reported values, and whether they yield real cost savings still depends on the provider and server implementation, which the extension does not guarantee.
+
+### Inspect status
+
+`/pi-compact-status` is a read-only diagnostic command. It reports the effective switches (`enabled`, `memory`, `summary`, `debug`), memory and window log event counts, row counts and file sizes, the current session's summary event and evidence counts, and process-local injection and compaction statistics (cache hits/misses, last injected characters and tokens, last compaction reason, duration, record count, checkpoint characters, and derived-record count). It notifies through the UI, sends nothing to the model, and triggers no model turn.
 
 ### Manual recall
 
@@ -329,7 +335,7 @@ During compaction:
 2. Converts the entries before the boundary from Pi's pre-compaction context projection into ID-bearing audit records. `context_edit` omissions affect the checkpoint's source count and hash; replacements affect the projected record content used for derived-memory inputs. The original raw entry remains available for explicit replay.
 3. Generates a deterministic checkpoint with only `compactor`, `sourceCount`, and `sourceHash`. It copies no history body and is not primary memory.
 4. Stores `sourceEntryIds`, `sourceHash`, `sourceRecordCount`, `keptEntryId`, `omittedRecordCount`, `checkpointChars`, `summaryMaxChars`, `isSplitTurn`, and `estimatedTokensAfter` (character count / 4, rounded up; not provider usage). Pi computes its own context-wide post-compaction estimate; the extension does not invent billed usage.
-5. Previews each candidate compaction with Pi 0.87.1's `buildSessionProjection()`, checking the retained tail after omissions and replacements. Results must follow their calls, and ordinary calls must have results; the replaced prefix does not block compaction. Unsafe boundaries fall back only to earlier candidates in the current compaction window, after previewing each candidate. No safe boundary, failed projection, or an aborted request cancels compaction without falling back to LLM summarization. Pi's `error`/`aborted` assistant states may have calls without results. Once validation passes, checkpoint generation errors degrade to pointer JSON; a changed boundary gets a recomputed `isSplitTurn`.
+5. Previews each candidate compaction with Pi 1.4.0's `buildSessionProjection()`, checking the retained tail after omissions and replacements. Results must follow their calls, and ordinary calls must have results; the replaced prefix does not block compaction. Unsafe boundaries fall back only to earlier candidates in the current compaction window, after previewing each candidate. No safe boundary, failed projection, or an aborted request cancels compaction without falling back to LLM summarization. Pi's `error`/`aborted` assistant states may have calls without results. Once validation passes, checkpoint generation errors degrade to pointer JSON; a changed boundary gets a recomputed `isSplitTurn`.
 6. Only after Pi commits compaction and emits success does the extension generate and append a window manifest under the log lock. Window IDs bind the session and actual compaction entry, so repeated events do not append duplicates. Rule-derived memories are also written after success, along with a session-scoped deterministic work summary that accumulates along the current branch's compaction chain and keeps excerpts, files, and entry IDs under `.pi/pi-compact/sessions/` in a hash-named per-session log. Cancellation and failure leave no window, derived records, or summary. Legacy `details.window` remains readable; new manifests live in `.pi/pi-compact/windows.jsonl`.
 
 Original session entries are the source of historical truth; a structured session summary is a deterministic excerpt index generated from primary records, carrying source entry IDs and the source hash — it makes no semantic inferences and does not verify statements. The user-written memory log is the sole source of authoritative durable memory. The checkpoint stores only counts and a hash; it is not a backup of raw text. Non-text content such as images shows only placeholder information in the text extraction.
@@ -358,6 +364,12 @@ Run the TypeScript type check:
 npm run typecheck
 ```
 
+Run the manual performance benchmark:
+
+```bash
+npm run bench
+```
+
 Inspect published contents:
 
 ```bash
@@ -374,6 +386,7 @@ src/config.ts            Config loading, normalization, and scaffolding
 src/hooks.ts             Compaction projection validation and session hooks
 src/recall.ts            Recall tool and /pi-compact-recall command
 src/memory.ts            Memory commands and memory/new-window tools
+src/status.ts            Read-only /pi-compact-status diagnostics
 src/core/content.ts      Message text, files, thinking separation, and snippet boundaries
 src/core/auto-recall.ts  Legacy gate pure functions, not connected at runtime
 src/core/lock.ts         Synchronous log lock, owner-token reclaim, portable start-time identity
@@ -385,8 +398,11 @@ src/core/store.ts        `.pi/pi-compact/` event logs
 src/core/window.ts       WindowManifest and hash chain
 src/core/summary.ts      Deterministic session-summary extraction, isolated storage, accumulation, and search
 src/core/working.ts      Authoritative-memory hint rendering
+src/core/memory-policy.ts Memory write limits, proposal deduplication, and provisional TTL
+src/core/runtime-stats.ts Process-local injection and compaction counters
 src/core/derive.ts       Non-semantic rule derivation
 src/types.ts             Shared types
+scripts/bench.mjs        Manual performance benchmark
 tests/                   Unit tests
 ```
 
@@ -408,7 +424,7 @@ Verified so far:
 - Log locks refuse token/metadata mismatches and do not reclaim live owners by age. Invalid metadata can be reclaimed after the grace period. Portable start-time identity (Linux `/proc`, Unix `ps`, Windows `Get-Process`) and conservative unverified fallback are unit-tested without changing `process.platform` or recycling real PIDs.
 - Clean dependency installation, TypeScript type checking, and real Pi CLI extension loading.
 
-- Pi 0.87.1 SDK metadata boundaries, full overflow retry, `context_edit` omissions/replacements and candidate projections, cancellation of orphan tool results, parallel/sequential tool-batch continuation, user abort, cancellation without side effects, success-event deduplication, and session persistence/restoration.
+- Pi 1.4.0 SDK metadata boundaries, full overflow retry, `context_edit` omissions/replacements and candidate projections, cancellation of orphan tool results, parallel/sequential tool-batch continuation, user abort, cancellation without side effects, success-event deduplication, and session persistence/restoration.
 - Memory-tool disablement, session isolation, explicit historical status queries, long-content/JSON budgets, and search/read pagination.
 
 Online model API responses and billing, manual TUI interactions, and long-running behavior remain outside these tests.
