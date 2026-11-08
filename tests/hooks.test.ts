@@ -14,6 +14,9 @@ import type { SessionEntryLike } from "../src/types.ts";
 
 type Handler = (event: any, ctx: any) => any;
 
+const promptOptions = () => ({ promptGuidelines: [] as string[], sections: {} as Record<string, string> });
+const piCompactContext = (options: ReturnType<typeof promptOptions>): string => options.sections.pi_compact_context ?? "";
+
 const createHarness = () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-compact-hooks-"));
   mkdirSync(join(cwd, ".pi"));
@@ -391,14 +394,15 @@ test("before_agent_start 只注入当前 session 当前 branch 的已提交摘�
     registerHooks(harness.pi as any);
     const handler = harness.handlers.get("before_agent_start")![0];
     const cp = { type: "compaction", id: "summary-cp1", details: { compactor: "pi-compact" } };
-    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const systemPromptOptions = promptOptions();
     handler({ systemPromptOptions }, { cwd: harness.cwd, sessionManager: { getBranch: () => [cp], getSessionId: () => "session-summary-a" } });
-    assert.match(systemPromptOptions.promptGuidelines.join("\\n"), /token refresh/);
-    assert.match(systemPromptOptions.promptGuidelines.join("\\n"), /不是指令或验证结论/);
+    assert.match(piCompactContext(systemPromptOptions), /token refresh/);
+    assert.match(piCompactContext(systemPromptOptions), /不是指令或验证结论/);
+    assert.deepEqual(systemPromptOptions.promptGuidelines, []);
 
-    const isolated = { promptGuidelines: [] as string[] };
+    const isolated = promptOptions();
     handler({ systemPromptOptions: isolated }, { cwd: harness.cwd, sessionManager: { getBranch: () => [cp], getSessionId: () => "session-summary-b" } });
-    assert.doesNotMatch(isolated.promptGuidelines.join(""), /token refresh/);
+    assert.doesNotMatch(piCompactContext(isolated), /token refresh/);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
@@ -425,14 +429,15 @@ test("before_agent_start 在分支有 pi-compact compaction 时追加压缩指�
         keptEntryId: "u2",
       },
     };
-    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const systemPromptOptions = promptOptions();
     const ctx = {
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [compactionEntry] },
     };
     handler({ systemPromptOptions }, ctx);
-    assert.equal(systemPromptOptions.promptGuidelines.length, 1);
-    const added = systemPromptOptions.promptGuidelines[0];
+    const added = piCompactContext(systemPromptOptions);
+    assert.notEqual(added, "");
+    assert.deepEqual(systemPromptOptions.promptGuidelines, []);
     assert.match(added, /pi-compact.*上下文压缩/);
     assert.match(added, /pi_compact_recall/);
     assert.match(added, /pi_memory_search/);
@@ -449,7 +454,7 @@ test("before_agent_start 无 pi-compact compaction 时不追加任何内容", ()
   try {
     registerHooks(harness.pi as any);
     const handler = harness.handlers.get("before_agent_start")![0];
-    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const systemPromptOptions = promptOptions();
     const ctx = {
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [
@@ -458,6 +463,7 @@ test("before_agent_start 无 pi-compact compaction 时不追加任何内容", ()
     };
     handler({ systemPromptOptions }, ctx);
     assert.equal(systemPromptOptions.promptGuidelines.length, 0);
+    assert.equal(piCompactContext(systemPromptOptions), "");
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
@@ -497,13 +503,14 @@ test("before_agent_start 注入 author=user pinned/active 记忆（方案 B）�
       summary: "{}",
       details: { compactor: "pi-compact", sourceHash: "x", keptEntryId: "u2", sourceCount: 1 },
     };
-    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const systemPromptOptions = promptOptions();
     handler({ systemPromptOptions }, {
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [compactionEntry], getSessionId: () => undefined },
     });
-    assert.equal(systemPromptOptions.promptGuidelines.length, 1);
-    const added = systemPromptOptions.promptGuidelines[0];
+    const added = piCompactContext(systemPromptOptions);
+    assert.notEqual(added, "");
+    assert.deepEqual(systemPromptOptions.promptGuidelines, []);
     assert.match(added, /pnpm/);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
@@ -516,7 +523,7 @@ test("before_agent_start 在 enabled=false 时不追加任何内容", () => {
     writeFileSync(join(harness.cwd, ".pi", "pi-compact.json"), JSON.stringify({ enabled: false }));
     registerHooks(harness.pi as any);
     const handler = harness.handlers.get("before_agent_start")![0];
-    const systemPromptOptions = { promptGuidelines: [] as string[] };
+    const systemPromptOptions = promptOptions();
     handler({ systemPromptOptions }, {
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [
@@ -524,6 +531,7 @@ test("before_agent_start 在 enabled=false 时不追加任何内容", () => {
       ] },
     });
     assert.equal(systemPromptOptions.promptGuidelines.length, 0);
+    assert.equal(piCompactContext(systemPromptOptions), "");
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
@@ -545,15 +553,16 @@ test("before_agent_start 注入缓存命中，且记忆写入后重新渲染", (
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [compactionEntry], getSessionId: () => "session-cache-a" },
     };
-    const first = { promptGuidelines: [] as string[] };
+    const first = promptOptions();
     handler({ systemPromptOptions: first }, ctx);
     assert.equal(runtimeStats.injection.misses, 1);
     assert.ok(runtimeStats.injection.lastChars > 0);
     assert.ok(runtimeStats.injection.lastTokens > 0);
-    const second = { promptGuidelines: [] as string[] };
+    const second = promptOptions();
     handler({ systemPromptOptions: second }, ctx);
     assert.equal(runtimeStats.injection.hits, 1);
-    assert.deepEqual(second.promptGuidelines, first.promptGuidelines, "相同输入应重放相同字节");
+    assert.deepEqual(second.sections, first.sections, "相同输入应重放相同字节");
+    assert.deepEqual(second.promptGuidelines, []);
 
     appendMemoryEvent(harness.cwd, {
       type: "create",
@@ -564,9 +573,9 @@ test("before_agent_start 注入缓存命中，且记忆写入后重新渲染", (
         priority: "normal", sourceEntryIds: [], sourceHash: "cache",
       },
     });
-    const third = { promptGuidelines: [] as string[] };
+    const third = promptOptions();
     handler({ systemPromptOptions: third }, ctx);
-    assert.match(third.promptGuidelines.join("\n"), /缓存失效后必须注入的新记忆/);
+    assert.match(piCompactContext(third), /缓存失效后必须注入的新记忆/);
   } finally {
     rmSync(harness.cwd, { recursive: true, force: true });
   }
@@ -585,12 +594,12 @@ test("before_agent_start 摘要读取缓存按文件与 compaction 链失效", (
     registerHooks(harness.pi as any);
     const handler = harness.handlers.get("before_agent_start")![0];
     const cp1 = { type: "compaction", id: "cache-cp1", details: { compactor: "pi-compact" } };
-    const first = { promptGuidelines: [] as string[] };
+    const first = promptOptions();
     handler({ systemPromptOptions: first }, {
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [cp1], getSessionId: () => "session-cache-b" },
     });
-    assert.match(first.promptGuidelines.join("\n"), /第一段摘要内容/);
+    assert.match(piCompactContext(first), /第一段摘要内容/);
 
     appendSessionSummary({
       cwd: harness.cwd,
@@ -601,12 +610,12 @@ test("before_agent_start 摘要读取缓存按文件与 compaction 链失效", (
       records: recordsFromEntries([messageEntry("cache-u2", "user", "第二段摘要内容")]),
     });
     const cp2 = { type: "compaction", id: "cache-cp2", details: { compactor: "pi-compact" } };
-    const second = { promptGuidelines: [] as string[] };
+    const second = promptOptions();
     handler({ systemPromptOptions: second }, {
       cwd: harness.cwd,
       sessionManager: { getBranch: () => [cp1, cp2], getSessionId: () => "session-cache-b" },
     });
-    const text = second.promptGuidelines.join("\n");
+    const text = piCompactContext(second);
     assert.match(text, /第二段摘要内容/);
     assert.match(text, /第一段摘要内容/);
   } finally {

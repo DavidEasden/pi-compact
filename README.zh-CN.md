@@ -325,7 +325,7 @@ Pi 原生的 `/compact` 命令会调用正常的压缩流程。当 `enabled` 和
 
 ## 历史与记忆的按需查询
 
-当前版本不注册 `context` hook，也不自动注入完整历史正文。`before_agent_start` 可追加静态压缩指针、当前 session 当前分支的结构化工作摘要，以及在 `memory.pinnedInjection` 开启时用户写入的 pinned/active 权威记忆。摘要仅含规则提取的 primary 记录摘录、文件列表和 entry ID；以 JSON 数据形式标明不可信，受 `sessionSummary.maxChars` 限制。provisional、规则派生与模型提议长期记忆永不作为权威记忆注入。历史细节仍可通过 `pi_compact_recall` 原文回查。
+当前版本不注册 `context` hook，也不自动注入完整历史正文。`before_agent_start` 将压缩指针、当前 session 当前分支的结构化工作摘要，以及在 `memory.pinnedInjection` 开启时用户写入的 pinned/active 权威记忆集中放入末尾的 `pi_compact_context` 系统提示 section，避免动态内容改变通用 rules 与其后的静态前缀。摘要仅含规则提取的 primary 记录摘录、文件列表和 entry ID；以 JSON 数据形式标明不可信，受 `sessionSummary.maxChars` 限制。provisional、规则派生与模型提议长期记忆永不作为权威记忆注入。历史细节仍可通过 `pi_compact_recall` 原文回查。该布局有助于保留稳定前缀，但 provider 是否及如何缓存仍由 provider 决定。
 
 模型调用 `pi_compact_recall` 时只搜索当前 branch；active lineage 无法取得时不会扩大到整个 session。用户可在 `/pi-compact-recall` 命令中显式指定 `scope:all` 查看其他 branch。工具返回内容会作为普通工具结果进入模型上下文，UI 命令返回内容只显示在界面中。
 

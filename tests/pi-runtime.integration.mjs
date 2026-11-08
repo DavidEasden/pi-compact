@@ -256,6 +256,9 @@ test("Pi SDK：before_provider_request 观察 provider payload，稳定前缀可
     const systemPrefix = (payload) => payload.messages.filter((message) => message.role === "system" || message.role === "developer");
     assert.deepEqual(systemPrefix(payloads[0]), systemPrefix(payloads[1]));
     assert.match(JSON.stringify(systemPrefix(payloads[0])), /pi-compact context pointer/);
+    const systemSections = systemPrefix(payloads[0]).find((message) => message.role === "system")?.sections;
+    assert.ok(systemSections?.pi_compact_context);
+    assert.equal(Object.keys(systemSections).at(-1), "pi_compact_context", "扩展动态上下文应排在静态系统提示 sections 末尾");
     assert.notDeepEqual(payloads[0].messages, payloads[1].messages, "变化的对话正文不属于稳定前缀");
     const assistantResponses = h.events.filter((event) => event.type === "message_end" && event.message?.role === "assistant");
     assert.equal(assistantResponses.length, 2);
