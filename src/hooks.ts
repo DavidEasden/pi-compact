@@ -1,5 +1,5 @@
 import { statSync } from "node:fs";
-import { buildSessionProjection, type ExtensionAPI, type ProjectedSessionEntry, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ProjectedSessionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { loadConfig } from "./config.ts";
 import { estimateTokensFromChars, estimateTokensFromText, toolCallIds } from "./core/content.ts";
 import { deriveFacts, derivedFactKey } from "./core/derive.ts";
@@ -13,6 +13,12 @@ import { renderWorkingHint } from "./core/working.ts";
 import { appendSessionSummary, renderSessionSummary, sessionSummaryForBranch, sessionSummaryLogPath } from "./core/summary.ts";
 import type { SessionSummaryEvent } from "./core/summary.ts";
 import type { MemoryRecord, SessionEntryLike } from "./types.ts";
+
+// SDK 根入口会静态加载 CLI、UI 和模型模块；优先只加载宿主本身使用的 session-manager 实现。
+const sdkEntry = import.meta.resolve("@earendil-works/pi-coding-agent");
+const projectionModuleUrl = new URL("./core/session-manager.js", sdkEntry).href;
+const projectionModule = await import(projectionModuleUrl).catch(() => import("@earendil-works/pi-coding-agent"));
+const { buildSessionProjection } = projectionModule as typeof import("@earendil-works/pi-coding-agent");
 
 const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
 const TERMINAL_ASSISTANT_REASONS = new Set(["error", "aborted"]);
@@ -204,7 +210,49 @@ const rememberInjection = (key: string, value: string): void => {
 /* before_agent_start 读取缓存：只缓存已验证的只读结果，追加事务仍走全量校验。 */
 /* ------------------------------------------------------------------ */
 const READ_CACHE_MAX = 32;
-const readCache = new Map<string, { key: string; value: unknown }>();
+const READ_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const READ_CACHE_MAX_ENTRY_BYTES = 512 * 1024;
+const readCache = new Map<string, { key: string; value: unknown; sizeBytes: number }>();
+let readCacheBytes = 0;
+
+const estimateRetainedBytes = (root: unknown, ceiling: number): number => {
+  const pending: unknown[] = [root];
+  const seen = new WeakSet<object>();
+  let bytes = 0;
+  while (pending.length > 0 && bytes <= ceiling) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      bytes += 32 + value.length * 2;
+      continue;
+    }
+    if (!value || typeof value !== "object") {
+      bytes += 8;
+      continue;
+    }
+    if (seen.has(value)) continue;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      bytes += 32 + value.length * 8;
+      if (bytes <= ceiling) {
+        for (let index = 0; index < value.length; index++) pending.push(value[index]);
+      }
+      continue;
+    }
+    bytes += 64;
+    for (const key of Object.keys(value)) {
+      bytes += 24 + key.length * 2;
+      if (bytes > ceiling) break;
+      pending.push((value as Record<string, unknown>)[key]);
+    }
+  }
+  return bytes;
+};
+
+const forgetReadCache = (path: string): void => {
+  const cached = readCache.get(path);
+  if (cached) readCacheBytes -= cached.sizeBytes;
+  readCache.delete(path);
+};
 
 const statKeyOf = (path: string): string => {
   try {
@@ -226,13 +274,18 @@ const cachedRead = <T>(path: string, extraKey: string, load: () => T): T => {
     readCache.set(path, cached);
     return cached.value as T;
   }
+  forgetReadCache(path);
   const value = load();
-  if (statKeyOf(path) === before) {
-    readCache.set(path, { key, value });
-    if (readCache.size > READ_CACHE_MAX) {
+  const valueBytes = estimateRetainedBytes(value, READ_CACHE_MAX_ENTRY_BYTES);
+  const sizeBytes = valueBytes + (path.length + key.length) * 2 + 128;
+  if (valueBytes <= READ_CACHE_MAX_ENTRY_BYTES && sizeBytes <= READ_CACHE_MAX_BYTES && statKeyOf(path) === before) {
+    while (readCache.size >= READ_CACHE_MAX || readCacheBytes + sizeBytes > READ_CACHE_MAX_BYTES) {
       const oldest = readCache.keys().next().value;
-      if (oldest !== undefined) readCache.delete(oldest);
+      if (oldest === undefined) break;
+      forgetReadCache(oldest);
     }
+    readCache.set(path, { key, value, sizeBytes });
+    readCacheBytes += sizeBytes;
   }
   return value;
 };
@@ -244,7 +297,7 @@ const readInjectionSummary = (cwd: string, sessionId: string, compactionIds: str
 );
 
 /** 仅供测试在直接改写日志后清理读取缓存，避免依赖文件系统 mtime 精度。 */
-export const clearInjectionReadCaches = (): void => { readCache.clear(); };
+export const clearInjectionReadCaches = (): void => { readCache.clear(); readCacheBytes = 0; };
 
 const fallbackCheckpoint = (reason: string, keptEntryId: string, tokensBefore: number, summaryMaxChars: number) => ({
   compaction: {
